@@ -17,3 +17,6 @@ Thumbs.db
 
 # Data files
 *.csv
+
+# Git worktrees
+.worktrees/
