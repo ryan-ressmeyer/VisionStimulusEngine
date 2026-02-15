@@ -401,7 +401,6 @@ impl SwapchainManager {
 
         match result {
             Ok(future) => {
-                // Wait for the fence to avoid resource conflicts
                 future.wait(None).ok();
                 Ok(())
             }

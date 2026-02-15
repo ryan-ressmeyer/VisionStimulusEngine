@@ -4,8 +4,10 @@
 //! resources and providing a clean API for rendering operations.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use winit::{
@@ -15,11 +17,19 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
+use std::path::Path;
+
 use super::{
     device::{DeviceError, DeviceSelector, GPUPreference},
     frame::{FrameBuilder, FrameError},
     swapchain::{PresentMode, SwapchainConfig, SwapchainError, SwapchainManager},
 };
+use vulkano::sync::GpuFuture;
+
+use crate::drawing::primitives::{default_circle_segments, DrawCommand};
+use crate::drawing::renderer::{Renderer, RendererError};
+use crate::drawing::{Color, GaborParams, TextureHandle};
+use crate::timing::{Clock, FlipInfo, FlipLogger, Timestamp, TimingStats};
 
 /// Errors that can occur in VSEContext
 #[derive(Error, Debug)]
@@ -35,6 +45,10 @@ pub enum VSEError {
     /// Frame-related error
     #[error("Frame error: {0}")]
     Frame(#[from] FrameError),
+
+    /// Renderer error
+    #[error("Renderer error: {0}")]
+    Renderer(#[from] RendererError),
 
     /// Window creation error
     #[error("Window error: {0}")]
@@ -60,6 +74,13 @@ pub struct VSEConfig {
     pub present_mode: PresentMode,
     /// Clear color (RGBA, 0.0-1.0)
     pub clear_color: [f32; 4],
+    /// Enable flip timing and logging
+    pub flip_logging: bool,
+    /// Optional CSV path for automatic flip log export on shutdown
+    pub flip_log_csv_path: Option<PathBuf>,
+    /// Expected refresh rate in Hz (used for missed frame detection).
+    /// If None, auto-detected from first 10 frames.
+    pub expected_refresh_rate: Option<f64>,
 }
 
 impl Default for VSEConfig {
@@ -71,6 +92,9 @@ impl Default for VSEConfig {
             gpu_preference: GPUPreference::Discrete,
             present_mode: PresentMode::Fifo,
             clear_color: [0.0, 0.0, 0.0, 1.0], // Black
+            flip_logging: false,
+            flip_log_csv_path: None,
+            expected_refresh_rate: None,
         }
     }
 }
@@ -142,6 +166,33 @@ impl VSEContextBuilder {
         self
     }
 
+    /// Enable flip timing and logging.
+    ///
+    /// When enabled, every `flip()` call records timing data.
+    pub fn with_flip_logging(mut self, enabled: bool) -> Self {
+        self.config.flip_logging = enabled;
+        self
+    }
+
+    /// Set CSV path for automatic flip log export.
+    ///
+    /// The CSV file is written when the context shuts down.
+    /// Implies `with_flip_logging(true)`.
+    pub fn with_flip_log_csv(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config.flip_log_csv_path = Some(path.into());
+        self.config.flip_logging = true;
+        self
+    }
+
+    /// Set expected refresh rate for missed frame detection.
+    ///
+    /// If not set, the refresh rate is auto-detected from the
+    /// first 10 frames.
+    pub fn with_expected_refresh_rate(mut self, hz: f64) -> Self {
+        self.config.expected_refresh_rate = Some(hz);
+        self
+    }
+
     /// Build the VSEContext
     ///
     /// This creates the event loop but does not yet create the window.
@@ -178,9 +229,18 @@ struct VSEState {
     device: Arc<vulkano::device::Device>,
     queue: Arc<vulkano::device::Queue>,
     swapchain: SwapchainManager,
+    #[allow(dead_code)]
     frame_builder: FrameBuilder,
+    renderer: Renderer,
     should_close: bool,
     minimized: bool,
+    // Timing state
+    clock: Clock,
+    flip_logger: Option<FlipLogger>,
+    frame_number: u64,
+    last_present_time: Option<Timestamp>,
+    expected_frame_duration: Option<Duration>,
+    refresh_detect_samples: Vec<Duration>,
 }
 
 /// Main VisionStimulusEngine context
@@ -203,7 +263,7 @@ struct VSEState {
 ///
 ///     context.run(|vse| {
 ///         vse.clear()?;
-///         vse.flip()?;
+///         let _info = vse.flip()?;
 ///         Ok(())
 ///     })?;
 ///
@@ -265,6 +325,23 @@ impl VSEContext {
 
         let swapchain = SwapchainManager::new(device.clone(), surface, swapchain_config)?;
         let frame_builder = FrameBuilder::new(device.clone(), queue.clone());
+        let renderer = Renderer::new(device.clone(), queue.clone(), swapchain.format())?;
+
+        // Initialize timing
+        let clock = Clock::new();
+        let flip_logger = if config.flip_logging {
+            let capacity = 3600 * 10; // ~10 minutes at 60 Hz
+            Some(match &config.flip_log_csv_path {
+                Some(path) => FlipLogger::with_csv(path.clone(), capacity),
+                None => FlipLogger::new(capacity),
+            })
+        } else {
+            None
+        };
+
+        let expected_frame_duration = config
+            .expected_refresh_rate
+            .map(|hz| Duration::from_micros((1_000_000.0 / hz) as u64));
 
         info!("Vulkan initialization complete");
 
@@ -275,8 +352,15 @@ impl VSEContext {
             queue,
             swapchain,
             frame_builder,
+            renderer,
             should_close: false,
             minimized: false,
+            clock,
+            flip_logger,
+            frame_number: 0,
+            last_present_time: None,
+            expected_frame_duration,
+            refresh_detect_samples: Vec::with_capacity(10),
         })
     }
 
@@ -414,14 +498,17 @@ impl<'a> RenderContext<'a> {
 
     /// Present the current frame to the screen
     ///
-    /// This submits the command buffer and waits for VSync (if enabled).
+    /// This submits the command buffer, waits for VSync (if enabled),
+    /// and returns timing information about the frame.
     ///
     /// # Errors
     ///
     /// Returns `VSEError` if presentation fails.
-    pub fn flip(&mut self) -> Result<(), VSEError> {
+    pub fn flip(&mut self) -> Result<FlipInfo, VSEError> {
         if self.state.minimized {
-            return Ok(());
+            let info = FlipInfo::skipped(self.state.frame_number);
+            self.state.frame_number += 1;
+            return Ok(info);
         }
 
         // Handle swapchain recreation if needed
@@ -435,37 +522,113 @@ impl<'a> RenderContext<'a> {
                 Ok(result) => result,
                 Err(SwapchainError::OutOfDate) => {
                     self.state.swapchain.recreate_from_surface()?;
-                    return Ok(()); // Skip this frame
+                    let info = FlipInfo::skipped(self.state.frame_number);
+                    self.state.frame_number += 1;
+                    return Ok(info);
                 }
                 Err(e) => return Err(e.into()),
             };
 
         // Get the image to render to
         let image = self.state.swapchain.images()[image_index as usize].clone();
+        let extent = self.state.swapchain.extent();
 
-        // Record and execute clear command
-        let frame = self.state.frame_builder.begin_clear(
-            image,
-            image_index,
-            acquire_future,
-            self.config.clear_color,
-        )?;
+        // Record and execute drawing commands via renderer
+        let command_buffer = self
+            .state
+            .renderer
+            .render(image, self.config.clear_color, extent)?;
 
-        let future = self.state.frame_builder.execute(frame)?;
+        let future = acquire_future
+            .then_execute(self.state.queue.clone(), command_buffer)
+            .map_err(|e: vulkano::command_buffer::CommandBufferExecError| {
+                FrameError::ExecutionFailed(e.to_string())
+            })?;
 
-        // Present
+        // --- TIMING: capture submit time ---
+        let submit_time = self.state.clock.now();
+
+        // Present (submits to GPU and waits for fence)
         match self
             .state
             .swapchain
             .present(self.state.queue.clone(), image_index, future)
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
             Err(SwapchainError::OutOfDate) => {
                 // Will recreate on next frame
-                Ok(())
+                let info = FlipInfo::skipped(self.state.frame_number);
+                self.state.frame_number += 1;
+                return Ok(info);
             }
-            Err(e) => Err(e.into()),
+            Err(e) => return Err(e.into()),
         }
+
+        // --- TIMING: capture present complete time ---
+        let present_complete_time = self.state.clock.now();
+
+        // Compute inter-frame duration
+        let frame_duration = self
+            .state
+            .last_present_time
+            .map(|prev| present_complete_time.duration_since(prev));
+
+        // Auto-detect refresh rate if needed
+        if self.state.expected_frame_duration.is_none() {
+            if let Some(dur) = frame_duration {
+                self.state.refresh_detect_samples.push(dur);
+                if self.state.refresh_detect_samples.len() >= 10 {
+                    let total: Duration = self.state.refresh_detect_samples.iter().copied().sum();
+                    let avg = total / self.state.refresh_detect_samples.len() as u32;
+                    self.state.expected_frame_duration = Some(avg);
+                    info!(
+                        "Auto-detected refresh rate: {:.1} Hz (frame duration: {} us)",
+                        1_000_000.0 / avg.as_micros() as f64,
+                        avg.as_micros()
+                    );
+                }
+            }
+        }
+
+        let expected = self
+            .state
+            .expected_frame_duration
+            .unwrap_or(Duration::from_micros(16_667)); // 60 Hz fallback
+
+        // Missed frame detection
+        let (missed, missed_count) = match frame_duration {
+            Some(dur) => {
+                let ratio = dur.as_micros() as f64 / expected.as_micros() as f64;
+                if ratio > 1.5 {
+                    (true, (ratio.round() as u32).saturating_sub(1))
+                } else {
+                    (false, 0)
+                }
+            }
+            None => (false, 0),
+        };
+
+        let flip_info = FlipInfo {
+            frame_number: self.state.frame_number,
+            submit_time,
+            present_complete_time,
+            frame_duration,
+            expected_frame_duration: expected,
+            missed,
+            missed_count,
+            skipped: false,
+        };
+
+        // Record to logger
+        if let Some(logger) = &mut self.state.flip_logger {
+            logger.record(flip_info.clone());
+        }
+
+        // Update state for next frame
+        self.state.last_present_time = Some(present_complete_time);
+        self.state.frame_number += 1;
+
+        Ok(flip_info)
     }
 
     /// Check if the window should close
@@ -507,5 +670,130 @@ impl<'a> RenderContext<'a> {
     /// Get the GPU name
     pub fn gpu_name(&self) -> &str {
         self.state.device_selector.device_name()
+    }
+
+    /// Get the flip logger (if timing is enabled).
+    pub fn flip_logger(&self) -> Option<&FlipLogger> {
+        self.state.flip_logger.as_ref()
+    }
+
+    /// Get computed timing statistics from all recorded frames.
+    /// Returns None if timing is disabled or fewer than 2 frames recorded.
+    pub fn timing_stats(&self) -> Option<TimingStats> {
+        self.state
+            .flip_logger
+            .as_ref()
+            .and_then(|logger| TimingStats::compute(logger.records()))
+    }
+
+    /// Print a timing report to stdout.
+    /// No-op if timing is not enabled or fewer than 2 frames recorded.
+    pub fn print_timing_report(&self) {
+        if let Some(stats) = self.timing_stats() {
+            stats.print_report();
+        }
+    }
+
+    /// Get the timing clock (for correlating with external events).
+    pub fn clock(&self) -> &Clock {
+        &self.state.clock
+    }
+
+    /// Get the current frame number (before the next flip).
+    pub fn frame_number(&self) -> u64 {
+        self.state.frame_number
+    }
+
+    // === Drawing primitives ===
+
+    /// Draw a filled rectangle.
+    ///
+    /// Coordinates are in pixels with (0, 0) at the top-left of the window.
+    pub fn draw_rect(&mut self, left: f32, top: f32, right: f32, bottom: f32, color: Color) {
+        self.state.renderer.push(DrawCommand::Rect {
+            left,
+            top,
+            right,
+            bottom,
+            color,
+        });
+    }
+
+    /// Draw a filled circle.
+    pub fn draw_circle(&mut self, cx: f32, cy: f32, radius: f32, color: Color) {
+        let segments = default_circle_segments(radius);
+        self.state.renderer.push(DrawCommand::Circle {
+            cx,
+            cy,
+            radius,
+            color,
+            segments,
+        });
+    }
+
+    /// Draw a line.
+    pub fn draw_line(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, width: f32, color: Color) {
+        self.state.renderer.push(DrawCommand::Line {
+            x1,
+            y1,
+            x2,
+            y2,
+            width,
+            color,
+        });
+    }
+
+    /// Draw a texture at the specified rectangle.
+    pub fn draw_texture(
+        &mut self,
+        texture: TextureHandle,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+    ) {
+        self.state.renderer.push(DrawCommand::Texture {
+            texture_id: texture.id,
+            left,
+            top,
+            right,
+            bottom,
+        });
+    }
+
+    /// Set the clear color using a Color value.
+    pub fn set_clear(&mut self, color: Color) {
+        self.config.clear_color = color.to_array();
+    }
+
+    // === Texture management ===
+
+    /// Load a texture from a file.
+    pub fn load_image(&mut self, path: impl AsRef<Path>) -> Result<TextureHandle, VSEError> {
+        Ok(self.state.renderer.load_image(path)?)
+    }
+
+    /// Create a texture from raw RGBA pixel data.
+    pub fn load_texture_rgba(
+        &mut self,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> Result<TextureHandle, VSEError> {
+        Ok(self.state.renderer.load_texture_rgba(width, height, data)?)
+    }
+
+    /// Create a Gabor patch texture from parameters.
+    pub fn create_gabor(&mut self, params: &GaborParams) -> Result<TextureHandle, VSEError> {
+        let pixels = params.generate();
+        Ok(self
+            .state
+            .renderer
+            .load_texture_rgba(params.size, params.size, &pixels)?)
+    }
+
+    /// Unload a texture and free its GPU resources.
+    pub fn unload_texture(&mut self, handle: TextureHandle) {
+        self.state.renderer.unload_texture(handle);
     }
 }

@@ -389,6 +389,9 @@ fn main() -> Result<()> {
 **Goal:** Draw simple primitives
 
 - [ ] Implement rectangle drawing
+- [ ] Implement circle drawing
+- [ ] Implement line drawing
+- [ ] Implement gabor patch drawing
 - [ ] Implement texture loading and rendering
 - [ ] Add color management
 - [ ] Complete calibration square example

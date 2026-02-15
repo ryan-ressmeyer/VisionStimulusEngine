@@ -14,3 +14,6 @@ Thumbs.db
 
 # Compiled shaders (will be generated)
 *.spv
+
+# Data files
+*.csv
