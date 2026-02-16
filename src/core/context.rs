@@ -838,4 +838,21 @@ impl<'a> RenderContext<'a> {
     pub fn unload_texture(&mut self, handle: TextureHandle) {
         self.state.renderer.unload_texture(handle);
     }
+
+    /// Capture a snapshot of the full host machine state.
+    ///
+    /// Returns a [`HostInfo`](crate::host::HostInfo) struct containing OS, CPU, memory, GPU,
+    /// display, swapchain, pipeline config, build metadata, runtime
+    /// environment, and EDID monitor data.
+    ///
+    /// This is an on-demand operation — call it when you need a snapshot.
+    /// The EDID capture shells out to `xrandr`, which may take ~50ms.
+    pub fn capture_host_info(&self) -> crate::host::HostInfo {
+        crate::host::capture::capture_host_info(
+            self.state.device_selector.physical_device(),
+            &self.state.window,
+            &self.state.swapchain,
+            self.config,
+        )
+    }
 }

@@ -189,10 +189,7 @@ impl std::fmt::Display for HostInfo {
         writeln!(
             f,
             "CPU: {} ({} cores, {} threads, {} MHz)",
-            self.cpu.brand,
-            self.cpu.physical_cores,
-            self.cpu.logical_cores,
-            self.cpu.frequency_mhz
+            self.cpu.brand, self.cpu.physical_cores, self.cpu.logical_cores, self.cpu.frequency_mhz
         )?;
         writeln!(
             f,
@@ -218,10 +215,7 @@ impl std::fmt::Display for HostInfo {
         writeln!(
             f,
             "Monitor: {}",
-            self.display
-                .monitor_name
-                .as_deref()
-                .unwrap_or("unknown")
+            self.display.monitor_name.as_deref().unwrap_or("unknown")
         )?;
         if let Some(rate) = self.display.refresh_rate_millihertz {
             writeln!(f, "Refresh rate: {:.3} Hz", rate as f64 / 1000.0)?;

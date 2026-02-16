@@ -85,3 +85,10 @@ fn test_builder_chaining() {
         .with_gpu_preference(GPUPreference::Integrated);
     // All methods should chain without issues
 }
+
+/// Test that HostInfo struct is accessible from prelude
+#[test]
+fn test_host_info_in_prelude() {
+    let build = vision_stimulus_engine::host::BuildInfo::from_compile_time();
+    assert!(!build.vse_version.is_empty());
+}

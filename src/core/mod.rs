@@ -10,7 +10,7 @@ mod frame;
 mod swapchain;
 
 // Public API exports
-pub use context::{RenderContext, VSEContext, VSEContextBuilder, VSEError};
+pub use context::{RenderContext, VSEConfig, VSEContext, VSEContextBuilder, VSEError};
 pub use device::{DeviceError, DeviceSelector, GPUPreference};
 pub use frame::{Frame, FrameError};
 pub use swapchain::{PresentMode, SwapchainConfig, SwapchainError, SwapchainManager};

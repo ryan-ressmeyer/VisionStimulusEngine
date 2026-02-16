@@ -225,8 +225,7 @@ DP-0 connected primary 3840x2160+0+0 (normal left inverted right x axis y axis) 
 
     #[test]
     fn test_extract_edid_hex_no_edid() {
-        let xrandr_output =
-            "DP-0 connected primary 3840x2160+0+0\n   3840x2160     60.00*+\n";
+        let xrandr_output = "DP-0 connected primary 3840x2160+0+0\n   3840x2160     60.00*+\n";
         let hex = extract_edid_hex(xrandr_output);
         assert!(hex.is_none());
     }
