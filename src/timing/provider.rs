@@ -105,22 +105,17 @@ impl GoogleDisplayTimingProvider {
 
         // Build minimal ash::Instance with just get_device_proc_addr loaded
         let ash_instance = ash::Instance::load_with(
-            |name| {
-                std::mem::transmute(get_device_proc_addr(vk_device_handle, name.as_ptr()))
-            },
+            |name| std::mem::transmute(get_device_proc_addr(vk_device_handle, name.as_ptr())),
             vk_instance_handle,
         );
 
         // Build minimal ash::Device from the same function loader
         let ash_device = ash::Device::load_with(
-            |name| {
-                std::mem::transmute(get_device_proc_addr(vk_device_handle, name.as_ptr()))
-            },
+            |name| std::mem::transmute(get_device_proc_addr(vk_device_handle, name.as_ptr())),
             vk_device_handle,
         );
 
-        let display_timing =
-            ash::google::display_timing::Device::new(&ash_instance, &ash_device);
+        let display_timing = ash::google::display_timing::Device::new(&ash_instance, &ash_device);
 
         Self {
             display_timing,

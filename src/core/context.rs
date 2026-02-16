@@ -334,18 +334,15 @@ impl VSEContext {
         // Initialize timing
         let clock = Clock::new();
 
-        let timing_provider: Box<dyn TimingProvider> =
-            if device_selector.supports_google_display_timing() {
-                info!("Timing backend: GoogleDisplayTiming (VK_GOOGLE_display_timing)");
-                Box::new(unsafe {
-                    GoogleDisplayTimingProvider::new(&device, swapchain.swapchain())
-                })
-            } else {
-                warn!(
-                    "VK_GOOGLE_display_timing not available. Using CPU estimation for timing."
-                );
-                Box::new(CpuTimingProvider::new())
-            };
+        let timing_provider: Box<dyn TimingProvider> = if device_selector
+            .supports_google_display_timing()
+        {
+            info!("Timing backend: GoogleDisplayTiming (VK_GOOGLE_display_timing)");
+            Box::new(unsafe { GoogleDisplayTimingProvider::new(&device, swapchain.swapchain()) })
+        } else {
+            warn!("VK_GOOGLE_display_timing not available. Using CPU estimation for timing.");
+            Box::new(CpuTimingProvider::new())
+        };
 
         let flip_logger = if config.flip_logging {
             let capacity = 3600 * 10; // ~10 minutes at 60 Hz
@@ -619,8 +616,7 @@ impl<'a> RenderContext<'a> {
                 // Fall back to auto-detect from frame timings
                 self.state.refresh_detect_samples.push(dur);
                 if self.state.refresh_detect_samples.len() >= 10 {
-                    let total: Duration =
-                        self.state.refresh_detect_samples.iter().copied().sum();
+                    let total: Duration = self.state.refresh_detect_samples.iter().copied().sum();
                     let avg = total / self.state.refresh_detect_samples.len() as u32;
                     self.state.expected_frame_duration = Some(avg);
                     info!(
