@@ -371,6 +371,13 @@ impl DeviceSelector {
         &self.physical_device.properties().device_name
     }
 
+    /// Check if the physical device supports VK_GOOGLE_display_timing
+    pub fn supports_google_display_timing(&self) -> bool {
+        self.physical_device
+            .supported_extensions()
+            .google_display_timing
+    }
+
     /// Create a logical device with the necessary queues
     ///
     /// # Returns
@@ -385,6 +392,7 @@ impl DeviceSelector {
         let device_extensions = DeviceExtensions {
             khr_swapchain: true,
             khr_dynamic_rendering: true,
+            google_display_timing: self.supports_google_display_timing(),
             ..DeviceExtensions::empty()
         };
 
