@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cy + half,
         );
 
-        vse.flip()?;
+        vse.flip(None)?;
         Ok(())
     })?;
 

@@ -38,7 +38,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     context.run(move |vse| {
         vse.clear()?;
-        let info = vse.flip()?;
+        let info = vse.flip(None)?;
+
+        // Print timing source on first frame
+        if info.frame_number == 0 {
+            println!("Timing source: {}", vse.timing_source());
+        }
 
         // Print periodic updates
         if info.frame_number % 300 == 0 && info.frame_number > 0 {

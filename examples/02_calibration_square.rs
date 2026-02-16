@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         vse.draw_rect(cx - half, cy - half, cx + half, cy + half, color);
 
-        let info = vse.flip()?;
+        let info = vse.flip(None)?;
 
         // Toggle every 60 frames (~1 second at 60 Hz)
         frame_count += 1;

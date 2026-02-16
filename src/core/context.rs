@@ -31,7 +31,7 @@ use crate::drawing::renderer::{Renderer, RendererError};
 use crate::drawing::{Color, GaborParams, TextureHandle};
 use crate::timing::{
     Clock, CpuTimingProvider, FlipInfo, FlipLogger, GoogleDisplayTimingProvider, Timestamp,
-    TimingProvider, TimingStats,
+    TimingProvider, TimingSource, TimingStats,
 };
 
 /// Errors that can occur in VSEContext
@@ -267,7 +267,7 @@ struct VSEState {
 ///
 ///     context.run(|vse| {
 ///         vse.clear()?;
-///         let _info = vse.flip()?;
+///         let _info = vse.flip(None)?;
 ///         Ok(())
 ///     })?;
 ///
@@ -517,13 +517,16 @@ impl<'a> RenderContext<'a> {
 
     /// Present the current frame to the screen
     ///
-    /// This submits the command buffer, waits for VSync (if enabled),
-    /// and returns timing information about the frame.
+    /// Optionally accepts a target presentation time. When provided:
+    /// - With `GoogleDisplayTiming`: schedules the present via the driver
+    /// - With `CpuEstimate`: spin-waits until the target time
+    ///
+    /// Pass `None` for immediate presentation (VSync-locked).
     ///
     /// # Errors
     ///
     /// Returns `VSEError` if presentation fails.
-    pub fn flip(&mut self) -> Result<FlipInfo, VSEError> {
+    pub fn flip(&mut self, target_time: Option<Timestamp>) -> Result<FlipInfo, VSEError> {
         if self.state.minimized {
             let info = FlipInfo::skipped(self.state.frame_number);
             self.state.frame_number += 1;
@@ -563,6 +566,13 @@ impl<'a> RenderContext<'a> {
             .map_err(|e: vulkano::command_buffer::CommandBufferExecError| {
                 FrameError::ExecutionFailed(e.to_string())
             })?;
+
+        // If target time specified, wait/schedule
+        if let Some(target) = target_time {
+            self.state
+                .timing_provider
+                .wait_for_target(target, &self.state.clock);
+        }
 
         // --- TIMING: capture submit time ---
         let submit_time = self.state.clock.now();
@@ -701,6 +711,11 @@ impl<'a> RenderContext<'a> {
     /// Get the GPU name
     pub fn gpu_name(&self) -> &str {
         self.state.device_selector.device_name()
+    }
+
+    /// Get the active timing source.
+    pub fn timing_source(&self) -> TimingSource {
+        self.state.timing_provider.source()
     }
 
     /// Get the flip logger (if timing is enabled).

@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vse.clear()?;
 
         // Present frame (waits for VSync)
-        let _info = vse.flip()?;
+        let _info = vse.flip(None)?;
 
         frame_count += 1;
 
