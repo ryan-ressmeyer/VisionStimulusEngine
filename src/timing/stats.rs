@@ -52,10 +52,15 @@ impl TimingStats {
             return None;
         }
 
-        // Collect frame durations (skip records without duration, i.e. first frame)
+        // Compute inter-frame durations from consecutive present_time values
         let durations_us: Vec<f64> = records
-            .iter()
-            .filter_map(|r| r.frame_duration.map(|d| d.as_micros() as f64))
+            .windows(2)
+            .map(|pair| {
+                pair[1]
+                    .present_time
+                    .duration_since(pair[0].present_time)
+                    .as_micros() as f64
+            })
             .collect();
 
         if durations_us.is_empty() {
@@ -95,8 +100,8 @@ impl TimingStats {
         let total_missed_slots: u64 = records.iter().map(|r| r.missed_count as u64).sum();
 
         // Total duration
-        let first_time = records.first().unwrap().present_complete_time;
-        let last_time = records.last().unwrap().present_complete_time;
+        let first_time = records.first().unwrap().present_time;
+        let last_time = records.last().unwrap().present_time;
         let total_duration = last_time.duration_since(first_time);
         let total_duration_secs = total_duration.as_secs_f64();
 
@@ -144,22 +149,17 @@ impl TimingStats {
 mod tests {
     use super::*;
     use crate::timing::clock::Timestamp;
+    use crate::timing::timing_source::TimingSource;
     use std::time::Duration;
 
     fn make_records(durations_us: &[u64]) -> Vec<FlipInfo> {
         let expected = Duration::from_micros(16_667);
         let mut records = Vec::new();
-        let mut time_us: u64 = 0;
+        let mut cumulative_us: u64 = 0;
 
         for (i, &dur) in durations_us.iter().enumerate() {
-            let submit = Timestamp::from_micros(time_us);
-            let present = Timestamp::from_micros(time_us + dur);
-
-            let frame_duration = if i == 0 {
-                None
-            } else {
-                Some(Duration::from_micros(dur))
-            };
+            let present = Timestamp::from_micros(cumulative_us);
+            let submit = Timestamp::from_micros(cumulative_us.saturating_sub(500));
 
             let ratio = dur as f64 / expected.as_micros() as f64;
             let missed = i > 0 && ratio > 1.5;
@@ -171,16 +171,15 @@ mod tests {
 
             records.push(FlipInfo {
                 frame_number: i as u64,
+                timing_source: TimingSource::CpuEstimate,
                 submit_time: submit,
-                present_complete_time: present,
-                frame_duration,
-                expected_frame_duration: expected,
+                present_time: present,
                 missed,
                 missed_count,
                 skipped: false,
             });
 
-            time_us += dur;
+            cumulative_us += dur;
         }
 
         records
@@ -208,7 +207,7 @@ mod tests {
     #[test]
     fn test_stats_with_jitter() {
         // 21 durations: alternating 16_500 and 16_834
-        // First frame has no duration, so 20 measured durations (10 each) -> mean = 16_667
+        // 20 inter-frame intervals (windows of 2) -> mean = 16_667
         let durations: Vec<u64> = (0..21)
             .map(|i| if i % 2 == 0 { 16_500 } else { 16_834 })
             .collect();

@@ -70,32 +70,25 @@ impl FlipLogger {
     /// Export all records to CSV.
     ///
     /// CSV columns:
-    /// frame_number, submit_time_us, present_complete_time_us,
-    /// frame_duration_us, expected_frame_duration_us, missed, missed_count
+    /// frame_number, timing_source, submit_time_us, present_time_us, missed, missed_count
     pub fn export_csv(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
         let mut file = std::fs::File::create(path)?;
 
         // Header
         writeln!(
             file,
-            "frame_number,submit_time_us,present_complete_time_us,frame_duration_us,expected_frame_duration_us,missed,missed_count"
+            "frame_number,timing_source,submit_time_us,present_time_us,missed,missed_count"
         )?;
 
         // Data rows
         for record in &self.records {
-            let frame_duration_str = match record.frame_duration_us() {
-                Some(us) => us.to_string(),
-                None => String::new(),
-            };
-
             writeln!(
                 file,
-                "{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{}",
                 record.frame_number,
+                record.timing_source,
                 record.submit_time.as_micros(),
-                record.present_complete_time.as_micros(),
-                frame_duration_str,
-                record.expected_frame_duration.as_micros(),
+                record.present_time.as_micros(),
                 record.missed,
                 record.missed_count,
             )?;
@@ -128,15 +121,14 @@ impl Drop for FlipLogger {
 mod tests {
     use super::*;
     use crate::timing::clock::Timestamp;
-    use std::time::Duration;
+    use crate::timing::timing_source::TimingSource;
 
-    fn make_info(frame_number: u64, missed: bool, frame_duration_us: Option<u64>) -> FlipInfo {
+    fn make_info(frame_number: u64, missed: bool) -> FlipInfo {
         FlipInfo {
             frame_number,
+            timing_source: TimingSource::CpuEstimate,
             submit_time: Timestamp::from_micros(frame_number * 16_000),
-            present_complete_time: Timestamp::from_micros(frame_number * 16_000 + 16_667),
-            frame_duration: frame_duration_us.map(Duration::from_micros),
-            expected_frame_duration: Duration::from_micros(16_667),
+            present_time: Timestamp::from_micros(frame_number * 16_000 + 16_667),
             missed,
             missed_count: if missed { 1 } else { 0 },
             skipped: false,
@@ -155,9 +147,9 @@ mod tests {
     #[test]
     fn test_logger_record_and_retrieve() {
         let mut logger = FlipLogger::new(100);
-        logger.record(make_info(0, false, None));
-        logger.record(make_info(1, false, Some(16_667)));
-        logger.record(make_info(2, false, Some(16_700)));
+        logger.record(make_info(0, false));
+        logger.record(make_info(1, false));
+        logger.record(make_info(2, false));
 
         assert_eq!(logger.frame_count(), 3);
         assert_eq!(logger.records().len(), 3);
@@ -167,9 +159,9 @@ mod tests {
     #[test]
     fn test_logger_skipped_not_recorded() {
         let mut logger = FlipLogger::new(100);
-        logger.record(make_info(0, false, None));
+        logger.record(make_info(0, false));
         logger.record(FlipInfo::skipped(1));
-        logger.record(make_info(2, false, Some(16_667)));
+        logger.record(make_info(2, false));
 
         assert_eq!(logger.frame_count(), 2);
     }
@@ -177,10 +169,10 @@ mod tests {
     #[test]
     fn test_logger_missed_count() {
         let mut logger = FlipLogger::new(100);
-        logger.record(make_info(0, false, None));
-        logger.record(make_info(1, false, Some(16_667)));
-        logger.record(make_info(2, true, Some(33_334)));
-        logger.record(make_info(3, false, Some(16_667)));
+        logger.record(make_info(0, false));
+        logger.record(make_info(1, false));
+        logger.record(make_info(2, true));
+        logger.record(make_info(3, false));
 
         assert_eq!(logger.missed_frame_count(), 1);
     }
@@ -188,9 +180,9 @@ mod tests {
     #[test]
     fn test_csv_export() {
         let mut logger = FlipLogger::new(100);
-        logger.record(make_info(0, false, None));
-        logger.record(make_info(1, false, Some(16_667)));
-        logger.record(make_info(2, true, Some(33_334)));
+        logger.record(make_info(0, false));
+        logger.record(make_info(1, false));
+        logger.record(make_info(2, true));
 
         let dir = std::env::temp_dir().join("vse_test_csv_export.csv");
         logger.export_csv(&dir).unwrap();
@@ -204,11 +196,12 @@ mod tests {
         // Check header
         assert_eq!(
             lines[0],
-            "frame_number,submit_time_us,present_complete_time_us,frame_duration_us,expected_frame_duration_us,missed,missed_count"
+            "frame_number,timing_source,submit_time_us,present_time_us,missed,missed_count"
         );
 
-        // First data row: frame_duration should be empty
-        assert!(lines[1].contains("0,0,16667,,16667,false,0"));
+        // First data row
+        assert!(lines[1].starts_with("0,CpuEstimate,"));
+        assert!(lines[1].ends_with(",false,0"));
 
         // Third data row: missed = true
         assert!(lines[3].contains("true,1"));
@@ -225,10 +218,9 @@ mod tests {
 
         let header = contents.lines().next().unwrap();
         assert!(header.contains("frame_number"));
+        assert!(header.contains("timing_source"));
         assert!(header.contains("submit_time_us"));
-        assert!(header.contains("present_complete_time_us"));
-        assert!(header.contains("frame_duration_us"));
-        assert!(header.contains("expected_frame_duration_us"));
+        assert!(header.contains("present_time_us"));
         assert!(header.contains("missed"));
         assert!(header.contains("missed_count"));
     }
@@ -237,8 +229,8 @@ mod tests {
     fn test_logger_flush() {
         let dir = std::env::temp_dir().join("vse_test_flush.csv");
         let mut logger = FlipLogger::with_csv(dir.clone(), 100);
-        logger.record(make_info(0, false, None));
-        logger.record(make_info(1, false, Some(16_667)));
+        logger.record(make_info(0, false));
+        logger.record(make_info(1, false));
 
         logger.flush().unwrap();
 

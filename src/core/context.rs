@@ -29,7 +29,7 @@ use vulkano::sync::GpuFuture;
 use crate::drawing::primitives::{default_circle_segments, DrawCommand};
 use crate::drawing::renderer::{Renderer, RendererError};
 use crate::drawing::{Color, GaborParams, TextureHandle};
-use crate::timing::{Clock, FlipInfo, FlipLogger, Timestamp, TimingStats};
+use crate::timing::{Clock, FlipInfo, FlipLogger, Timestamp, TimingSource, TimingStats};
 
 /// Errors that can occur in VSEContext
 #[derive(Error, Debug)]
@@ -564,14 +564,14 @@ impl<'a> RenderContext<'a> {
             Err(e) => return Err(e.into()),
         }
 
-        // --- TIMING: capture present complete time ---
-        let present_complete_time = self.state.clock.now();
+        // --- TIMING: capture present time ---
+        let present_time = self.state.clock.now();
 
         // Compute inter-frame duration
         let frame_duration = self
             .state
             .last_present_time
-            .map(|prev| present_complete_time.duration_since(prev));
+            .map(|prev| present_time.duration_since(prev));
 
         // Auto-detect refresh rate if needed
         if self.state.expected_frame_duration.is_none() {
@@ -610,10 +610,9 @@ impl<'a> RenderContext<'a> {
 
         let flip_info = FlipInfo {
             frame_number: self.state.frame_number,
+            timing_source: TimingSource::CpuEstimate,
             submit_time,
-            present_complete_time,
-            frame_duration,
-            expected_frame_duration: expected,
+            present_time,
             missed,
             missed_count,
             skipped: false,
@@ -625,7 +624,7 @@ impl<'a> RenderContext<'a> {
         }
 
         // Update state for next frame
-        self.state.last_present_time = Some(present_complete_time);
+        self.state.last_present_time = Some(present_time);
         self.state.frame_number += 1;
 
         Ok(flip_info)

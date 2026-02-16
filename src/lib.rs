@@ -29,5 +29,5 @@ pub mod prelude {
         SwapchainManager, VSEContext, VSEContextBuilder, VSEError,
     };
     pub use crate::drawing::{Color, GaborParams, TextureHandle};
-    pub use crate::timing::{FlipInfo, FlipLogger, TimingStats};
+    pub use crate::timing::{FlipInfo, FlipLogger, Timestamp, TimingSource, TimingStats};
 }

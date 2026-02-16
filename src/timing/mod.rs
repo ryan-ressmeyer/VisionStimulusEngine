@@ -8,8 +8,10 @@ mod clock;
 mod flip_info;
 mod flip_logger;
 mod stats;
+mod timing_source;
 
 pub use clock::{Clock, Timestamp};
 pub use flip_info::FlipInfo;
 pub use flip_logger::FlipLogger;
 pub use stats::TimingStats;
+pub use timing_source::TimingSource;

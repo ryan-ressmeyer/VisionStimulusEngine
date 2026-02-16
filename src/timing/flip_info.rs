@@ -1,8 +1,7 @@
 //! FlipInfo - timing receipt returned by every flip() call.
 
-use std::time::Duration;
-
 use super::clock::Timestamp;
+use super::timing_source::TimingSource;
 
 /// Information about a single frame flip (presentation).
 ///
@@ -13,35 +12,30 @@ use super::clock::Timestamp;
 ///
 /// ```text
 /// CPU timeline:
-///   [submit_time]----[present_complete_time]
-///         |                    |
-///         v                    v
-///   Command buffer       Fence signals
-///   submitted to GPU     (GPU done, frame
-///                         queued for display)
+///   [submit_time]----[present_time]
+///         |                |
+///         v                v
+///   Command buffer    Present timestamp
+///   submitted to GPU  (source depends on TimingSource)
 /// ```
 ///
-/// `present_complete_time` is the closest CPU-side approximation of
-/// when the frame reaches the display.
+/// The meaning of `present_time` depends on `timing_source`:
+/// - `CpuEstimate`: CPU clock reading after fence signal
+/// - `GoogleDisplayTiming`: driver-reported actual present time
+/// - `ExtPresentTiming`: hardware scanout timestamp (future)
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FlipInfo {
     /// Monotonically increasing frame number (0-indexed from first flip)
     pub frame_number: u64,
 
+    /// Which timing backend provided this data
+    pub timing_source: TimingSource,
+
     /// Timestamp just before command buffer submission
     pub submit_time: Timestamp,
 
-    /// Timestamp after fence signal (GPU finished, frame queued for display)
-    pub present_complete_time: Timestamp,
-
-    /// Duration of this frame (time since previous flip's present_complete_time).
-    /// None for the very first frame.
-    #[serde(skip)]
-    pub frame_duration: Option<Duration>,
-
-    /// Expected frame duration based on display refresh rate.
-    #[serde(skip)]
-    pub expected_frame_duration: Duration,
+    /// Present timestamp (meaning depends on timing_source)
+    pub present_time: Timestamp,
 
     /// Whether this frame was likely missed (frame_duration > 1.5 * expected)
     pub missed: bool,
@@ -60,19 +54,13 @@ impl FlipInfo {
     pub fn skipped(frame_number: u64) -> Self {
         Self {
             frame_number,
+            timing_source: TimingSource::CpuEstimate,
             submit_time: Timestamp::from_micros(0),
-            present_complete_time: Timestamp::from_micros(0),
-            frame_duration: None,
-            expected_frame_duration: Duration::from_micros(16_667),
+            present_time: Timestamp::from_micros(0),
             missed: false,
             missed_count: 0,
             skipped: true,
         }
-    }
-
-    /// Get frame duration in microseconds, if available.
-    pub fn frame_duration_us(&self) -> Option<u64> {
-        self.frame_duration.map(|d| d.as_micros() as u64)
     }
 }
 
@@ -87,17 +75,16 @@ mod tests {
         assert!(info.skipped);
         assert!(!info.missed);
         assert_eq!(info.missed_count, 0);
-        assert!(info.frame_duration.is_none());
+        assert_eq!(info.timing_source, TimingSource::CpuEstimate);
     }
 
     #[test]
     fn test_flip_info_clone() {
         let info = FlipInfo {
             frame_number: 10,
+            timing_source: TimingSource::CpuEstimate,
             submit_time: Timestamp::from_micros(1000),
-            present_complete_time: Timestamp::from_micros(2000),
-            frame_duration: Some(Duration::from_micros(16_667)),
-            expected_frame_duration: Duration::from_micros(16_667),
+            present_time: Timestamp::from_micros(2000),
             missed: false,
             missed_count: 0,
             skipped: false,
@@ -105,23 +92,6 @@ mod tests {
         let cloned = info.clone();
         assert_eq!(cloned.frame_number, 10);
         assert_eq!(cloned.submit_time, info.submit_time);
-    }
-
-    #[test]
-    fn test_frame_duration_us() {
-        let info = FlipInfo {
-            frame_number: 0,
-            submit_time: Timestamp::from_micros(0),
-            present_complete_time: Timestamp::from_micros(16_667),
-            frame_duration: Some(Duration::from_micros(16_667)),
-            expected_frame_duration: Duration::from_micros(16_667),
-            missed: false,
-            missed_count: 0,
-            skipped: false,
-        };
-        assert_eq!(info.frame_duration_us(), Some(16_667));
-
-        let skipped = FlipInfo::skipped(0);
-        assert_eq!(skipped.frame_duration_us(), None);
+        assert_eq!(cloned.timing_source, TimingSource::CpuEstimate);
     }
 }

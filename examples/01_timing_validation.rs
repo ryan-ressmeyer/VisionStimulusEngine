@@ -56,12 +56,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Log missed frames immediately
         if info.missed {
             println!(
-                "*** MISSED FRAME {} (duration: {:.2} ms, expected: {:.2} ms, missed_count: {})",
+                "*** MISSED FRAME {} (present_time: {:.2} ms, missed_count: {})",
                 info.frame_number,
-                info.frame_duration
-                    .map(|d| d.as_micros() as f64 / 1000.0)
-                    .unwrap_or(0.0),
-                info.expected_frame_duration.as_micros() as f64 / 1000.0,
+                info.present_time.as_millis_f64(),
                 info.missed_count,
             );
         }
