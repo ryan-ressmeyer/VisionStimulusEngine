@@ -70,7 +70,12 @@ pub fn capture_runtime_env() -> RuntimeEnv {
 
     let nice_value = get_process_nice_value();
 
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+
     RuntimeEnv {
+        username,
         display_server,
         env_display: std::env::var("DISPLAY").ok(),
         env_wayland_display: std::env::var("WAYLAND_DISPLAY").ok(),

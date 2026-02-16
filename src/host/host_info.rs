@@ -157,6 +157,7 @@ impl BuildInfo {
 /// Runtime environment information
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeEnv {
+    pub username: String,
     pub display_server: String,
     pub env_display: Option<String>,
     pub env_wayland_display: Option<String>,
@@ -242,6 +243,7 @@ impl std::fmt::Display for HostInfo {
             "Build: {} ({})",
             self.build.build_profile, self.build.rustc_version
         )?;
+        writeln!(f, "User: {}", self.runtime.username)?;
         writeln!(f, "Display server: {}", self.runtime.display_server)?;
         if let Some(edid) = &self.edid {
             writeln!(f)?;
