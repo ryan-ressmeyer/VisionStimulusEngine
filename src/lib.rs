@@ -20,6 +20,7 @@
 // Re-export core types for easy access
 pub mod core;
 pub mod drawing;
+pub mod host;
 pub mod timing;
 
 // Re-export commonly used types
@@ -29,5 +30,6 @@ pub mod prelude {
         SwapchainManager, VSEContext, VSEContextBuilder, VSEError,
     };
     pub use crate::drawing::{Color, GaborParams, TextureHandle};
+    pub use crate::host::HostInfo;
     pub use crate::timing::{FlipInfo, FlipLogger, Timestamp, TimingSource, TimingStats};
 }
