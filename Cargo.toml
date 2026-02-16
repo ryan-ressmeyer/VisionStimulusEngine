@@ -55,6 +55,10 @@ path = "examples/02_calibration_square.rs"
 name = "03_gabor_demo"
 path = "examples/03_gabor_demo.rs"
 
+[[example]]
+name = "04_scheduled_flip"
+path = "examples/04_scheduled_flip.rs"
+
 [[bench]]
 name = "frame_timing"
 harness = false
