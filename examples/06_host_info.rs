@@ -22,8 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", info);
 
             // Save to JSON
-            let json =
-                serde_json::to_string_pretty(&info).expect("Failed to serialize host info");
+            let json = serde_json::to_string_pretty(&info).expect("Failed to serialize host info");
             std::fs::write("host_info.json", &json).expect("Failed to write host_info.json");
             println!("\nSaved to host_info.json");
         }
