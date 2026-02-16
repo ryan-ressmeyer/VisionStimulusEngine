@@ -29,7 +29,10 @@ use vulkano::sync::GpuFuture;
 use crate::drawing::primitives::{default_circle_segments, DrawCommand};
 use crate::drawing::renderer::{Renderer, RendererError};
 use crate::drawing::{Color, GaborParams, TextureHandle};
-use crate::timing::{Clock, FlipInfo, FlipLogger, Timestamp, TimingSource, TimingStats};
+use crate::timing::{
+    Clock, CpuTimingProvider, FlipInfo, FlipLogger, GoogleDisplayTimingProvider, Timestamp,
+    TimingProvider, TimingStats,
+};
 
 /// Errors that can occur in VSEContext
 #[derive(Error, Debug)]
@@ -236,6 +239,7 @@ struct VSEState {
     minimized: bool,
     // Timing state
     clock: Clock,
+    timing_provider: Box<dyn TimingProvider>,
     flip_logger: Option<FlipLogger>,
     frame_number: u64,
     last_present_time: Option<Timestamp>,
@@ -329,6 +333,20 @@ impl VSEContext {
 
         // Initialize timing
         let clock = Clock::new();
+
+        let timing_provider: Box<dyn TimingProvider> =
+            if device_selector.supports_google_display_timing() {
+                info!("Timing backend: GoogleDisplayTiming (VK_GOOGLE_display_timing)");
+                Box::new(unsafe {
+                    GoogleDisplayTimingProvider::new(&device, swapchain.swapchain())
+                })
+            } else {
+                warn!(
+                    "VK_GOOGLE_display_timing not available. Using CPU estimation for timing."
+                );
+                Box::new(CpuTimingProvider::new())
+            };
+
         let flip_logger = if config.flip_logging {
             let capacity = 3600 * 10; // ~10 minutes at 60 Hz
             Some(match &config.flip_log_csv_path {
@@ -356,6 +374,7 @@ impl VSEContext {
             should_close: false,
             minimized: false,
             clock,
+            timing_provider,
             flip_logger,
             frame_number: 0,
             last_present_time: None,
@@ -564,8 +583,11 @@ impl<'a> RenderContext<'a> {
             Err(e) => return Err(e.into()),
         }
 
-        // --- TIMING: capture present time ---
-        let present_time = self.state.clock.now();
+        // --- TIMING: capture present time via provider ---
+        let present_time = self
+            .state
+            .timing_provider
+            .record_present_time(&self.state.clock);
 
         // Compute inter-frame duration
         let frame_duration = self
@@ -575,10 +597,20 @@ impl<'a> RenderContext<'a> {
 
         // Auto-detect refresh rate if needed
         if self.state.expected_frame_duration.is_none() {
-            if let Some(dur) = frame_duration {
+            // First try the provider (e.g., GoogleDisplayTiming has driver info)
+            if let Some(dur) = self.state.timing_provider.refresh_cycle_duration() {
+                self.state.expected_frame_duration = Some(dur);
+                info!(
+                    "Refresh cycle duration from provider: {} us ({:.1} Hz)",
+                    dur.as_micros(),
+                    1_000_000.0 / dur.as_micros() as f64
+                );
+            } else if let Some(dur) = frame_duration {
+                // Fall back to auto-detect from frame timings
                 self.state.refresh_detect_samples.push(dur);
                 if self.state.refresh_detect_samples.len() >= 10 {
-                    let total: Duration = self.state.refresh_detect_samples.iter().copied().sum();
+                    let total: Duration =
+                        self.state.refresh_detect_samples.iter().copied().sum();
                     let avg = total / self.state.refresh_detect_samples.len() as u32;
                     self.state.expected_frame_duration = Some(avg);
                     info!(
@@ -610,7 +642,7 @@ impl<'a> RenderContext<'a> {
 
         let flip_info = FlipInfo {
             frame_number: self.state.frame_number,
-            timing_source: TimingSource::CpuEstimate,
+            timing_source: self.state.timing_provider.source(),
             submit_time,
             present_time,
             missed,
