@@ -4,6 +4,7 @@
 //! for reproducibility and audit trails in vision science experiments.
 
 pub(crate) mod capture;
+pub(crate) mod edid;
 mod host_info;
 
 pub use host_info::{
