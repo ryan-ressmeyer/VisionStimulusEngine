@@ -7,8 +7,9 @@ use std::sync::Arc;
 use thiserror::Error;
 use vulkano::{
     command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
-        PrimaryAutoCommandBuffer, RenderingAttachmentInfo, RenderingInfo,
+        allocator::{CommandBufferAllocator, StandardCommandBufferAllocator},
+        AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer,
+        RenderingAttachmentInfo, RenderingInfo,
     },
     device::{Device, Queue},
     format::ClearValue,
@@ -72,7 +73,7 @@ impl Frame {
 pub struct FrameBuilder {
     device: Arc<Device>,
     queue: Arc<Queue>,
-    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+    command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
     memory_allocator: Arc<StandardMemoryAllocator>,
 }
 
@@ -143,7 +144,7 @@ impl FrameBuilder {
 
         // Create command buffer builder
         let mut builder = AutoCommandBufferBuilder::primary(
-            &*self.command_buffer_allocator,
+            self.command_buffer_allocator.clone(),
             self.queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )

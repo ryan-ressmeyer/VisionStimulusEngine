@@ -9,7 +9,8 @@ use tracing::{debug, info};
 use vulkano::{
     device::{
         physical::{PhysicalDevice, PhysicalDeviceType},
-        Device, DeviceCreateInfo, DeviceExtensions, Features, Queue, QueueCreateInfo, QueueFlags,
+        Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo,
+        QueueFlags,
     },
     instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions},
     swapchain::Surface,
@@ -149,7 +150,8 @@ impl DeviceSelector {
         info!("Vulkan library loaded successfully");
 
         // Get required extensions for windowing
-        let required_extensions = Surface::required_extensions(window.as_ref());
+        let required_extensions = Surface::required_extensions(window.as_ref())
+            .map_err(|e| DeviceError::InstanceCreationFailed(e.to_string()))?;
 
         let instance = Instance::new(
             library,
@@ -386,9 +388,9 @@ impl DeviceSelector {
             ..DeviceExtensions::empty()
         };
 
-        let features = Features {
+        let features = DeviceFeatures {
             dynamic_rendering: true,
-            ..Features::empty()
+            ..DeviceFeatures::empty()
         };
 
         let (device, mut queues) = Device::new(

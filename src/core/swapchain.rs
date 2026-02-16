@@ -188,8 +188,7 @@ impl SwapchainManager {
         let present_modes = device
             .physical_device()
             .surface_present_modes(surface, Default::default())
-            .map_err(|e| SwapchainError::CreationFailed(e.to_string()))?
-            .collect::<Vec<_>>();
+            .map_err(|e| SwapchainError::CreationFailed(e.to_string()))?;
 
         // Choose format (prefer sRGB for correct color)
         let (image_format, _color_space) = surface_formats

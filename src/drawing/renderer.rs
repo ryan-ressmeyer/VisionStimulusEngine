@@ -6,12 +6,14 @@ use thiserror::Error;
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage},
     command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
-        CommandBufferUsage as CmdBufUsage, CopyBufferToImageInfo, PrimaryAutoCommandBuffer,
-        PrimaryCommandBufferAbstract, RenderingAttachmentInfo, RenderingInfo,
+        allocator::{CommandBufferAllocator, StandardCommandBufferAllocator},
+        AutoCommandBufferBuilder, CommandBufferUsage as CmdBufUsage, CopyBufferToImageInfo,
+        PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract, RenderingAttachmentInfo,
+        RenderingInfo,
     },
     descriptor_set::{
-        allocator::StandardDescriptorSetAllocator, PersistentDescriptorSet, WriteDescriptorSet,
+        allocator::{DescriptorSetAllocator, StandardDescriptorSetAllocator},
+        DescriptorSet, WriteDescriptorSet,
     },
     device::{Device, Queue},
     format::{ClearValue, Format},
@@ -108,7 +110,7 @@ struct TextureResources {
     image_view: Arc<ImageView>,
     #[allow(dead_code)]
     sampler: Arc<Sampler>,
-    descriptor_set: Arc<PersistentDescriptorSet>,
+    descriptor_set: Arc<DescriptorSet>,
     #[allow(dead_code)]
     width: u32,
     #[allow(dead_code)]
@@ -120,9 +122,9 @@ struct TextureResources {
 pub(crate) struct Renderer {
     device: Arc<Device>,
     queue: Arc<Queue>,
-    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+    command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
     memory_allocator: Arc<StandardMemoryAllocator>,
-    descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
+    descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
 
     flat_color_pipeline: Arc<GraphicsPipeline>,
     textured_pipeline: Arc<GraphicsPipeline>,
@@ -140,15 +142,13 @@ impl Renderer {
         queue: Arc<Queue>,
         swapchain_format: Format,
     ) -> Result<Self, RendererError> {
-        let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
-            device.clone(),
-            Default::default(),
-        ));
+        let command_buffer_allocator: Arc<dyn CommandBufferAllocator> = Arc::new(
+            StandardCommandBufferAllocator::new(device.clone(), Default::default()),
+        );
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
-        let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
-            device.clone(),
-            Default::default(),
-        ));
+        let descriptor_set_allocator: Arc<dyn DescriptorSetAllocator> = Arc::new(
+            StandardDescriptorSetAllocator::new(device.clone(), Default::default()),
+        );
 
         let flat_color_pipeline = Self::create_flat_color_pipeline(&device, swapchain_format)?;
         let textured_pipeline = Self::create_textured_pipeline(&device, swapchain_format)?;
@@ -183,7 +183,7 @@ impl Renderer {
             .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
 
         let mut builder = AutoCommandBufferBuilder::primary(
-            &*self.command_buffer_allocator,
+            self.command_buffer_allocator.clone(),
             self.queue.queue_family_index(),
             CmdBufUsage::OneTimeSubmit,
         )
@@ -243,9 +243,13 @@ impl Renderer {
                 )
                 .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
                 .bind_vertex_buffers(0, vertex_buffer)
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                .draw(vertex_count, 1, 0, 0)
                 .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+            // SAFETY: vertex data matches the pipeline's vertex input state
+            unsafe {
+                builder
+                    .draw(vertex_count, 1, 0, 0)
+                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+            }
         }
 
         // Textured draws
@@ -305,9 +309,13 @@ impl Renderer {
                 )
                 .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
                 .bind_vertex_buffers(0, vertex_buffer)
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                .draw(6, 1, 0, 0)
                 .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+            // SAFETY: vertex/descriptor data matches the pipeline's input state
+            unsafe {
+                builder
+                    .draw(6, 1, 0, 0)
+                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+            }
         }
 
         builder
@@ -374,7 +382,7 @@ impl Renderer {
 
         // Upload via command buffer
         let mut upload_builder = AutoCommandBufferBuilder::primary(
-            &*self.command_buffer_allocator,
+            self.command_buffer_allocator.clone(),
             self.queue.queue_family_index(),
             CmdBufUsage::OneTimeSubmit,
         )
@@ -428,8 +436,8 @@ impl Renderer {
                 RendererError::DescriptorSetFailed("No descriptor set layout".to_string())
             })?;
 
-        let descriptor_set = PersistentDescriptorSet::new(
-            &*self.descriptor_set_allocator,
+        let descriptor_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
             layout.clone(),
             [WriteDescriptorSet::image_view_sampler(
                 0,
@@ -533,7 +541,7 @@ impl Renderer {
         let fs_entry = fs.entry_point("main").unwrap();
 
         let vertex_input_state = Vertex2D::per_vertex()
-            .definition(&vs_entry.info().input_interface)
+            .definition(&vs_entry)
             .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
 
         let stages = [
@@ -596,7 +604,7 @@ impl Renderer {
         let fs_entry = fs.entry_point("main").unwrap();
 
         let vertex_input_state = TexturedVertex::per_vertex()
-            .definition(&vs_entry.info().input_interface)
+            .definition(&vs_entry)
             .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
 
         let stages = [
