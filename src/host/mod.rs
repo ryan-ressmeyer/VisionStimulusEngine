@@ -3,6 +3,7 @@
 //! Provides comprehensive snapshots of the host system state
 //! for reproducibility and audit trails in vision science experiments.
 
+pub(crate) mod capture;
 mod host_info;
 
 pub use host_info::{
