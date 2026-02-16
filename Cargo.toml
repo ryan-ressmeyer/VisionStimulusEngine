@@ -65,6 +65,10 @@ path = "examples/03_gabor_demo.rs"
 name = "04_scheduled_flip"
 path = "examples/04_scheduled_flip.rs"
 
+[[example]]
+name = "06_host_info"
+path = "examples/06_host_info.rs"
+
 [[bench]]
 name = "frame_timing"
 harness = false
