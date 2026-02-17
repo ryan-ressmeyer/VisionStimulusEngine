@@ -17,4 +17,4 @@ pub use gabor::GaborParams;
 pub use stimuli::{GratingParams, NoiseParams, NoiseType, WaveType};
 pub use texture::TextureHandle;
 
-pub use vertex::{TexturedVertex, Vertex2D};
+pub use vertex::{DotInstance, TexturedVertex, Vertex2D};

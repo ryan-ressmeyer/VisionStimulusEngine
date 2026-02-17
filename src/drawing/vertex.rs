@@ -29,6 +29,17 @@ pub struct TexturedVertex {
     pub uv: [f32; 2],
 }
 
+/// Per-instance data for dot rendering.
+///
+/// Each instance represents one dot at a pixel position.
+/// Used with instanced rendering for efficient RDK display.
+#[derive(Clone, Copy, Debug, Default, BufferContents, Vertex)]
+#[repr(C)]
+pub struct DotInstance {
+    #[format(R32G32_SFLOAT)]
+    pub position: [f32; 2],
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,5 +66,16 @@ mod tests {
     #[test]
     fn test_textured_vertex_size() {
         assert_eq!(std::mem::size_of::<TexturedVertex>(), 16);
+    }
+
+    #[test]
+    fn test_dot_instance_default() {
+        let d = DotInstance::default();
+        assert_eq!(d.position, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_dot_instance_size() {
+        assert_eq!(std::mem::size_of::<DotInstance>(), 8);
     }
 }
