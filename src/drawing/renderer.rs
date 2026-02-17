@@ -48,8 +48,9 @@ use vulkano::{
 use super::primitives::{
     circle_vertices, line_vertices, rect_vertices, textured_quad_vertices, DrawCommand,
 };
+use super::stimuli::WaveType;
 use super::texture::TextureHandle;
-use super::vertex::{TexturedVertex, Vertex2D};
+use super::vertex::{DotInstance, TexturedVertex, Vertex2D};
 
 mod flat_color_vs {
     vulkano_shaders::shader! {
@@ -358,6 +359,80 @@ impl Renderer {
                 .bind_vertex_buffers(0, vertex_buffer)
                 .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
             // SAFETY: vertex/descriptor data matches the pipeline's input state
+            unsafe {
+                builder
+                    .draw(6, 1, 0, 0)
+                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+            }
+        }
+
+        // Grating and Gabor draws
+        let parametric_commands: Vec<_> = self
+            .draw_commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                DrawCommand::Grating {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    params,
+                } => Some((true, *left, *top, *right, *bottom, params.frequency, params.orientation, params.phase, params.contrast, params.background, 0.0f32, match params.wave { WaveType::Sine => 0u32, WaveType::Square => 1u32 })),
+                DrawCommand::Gabor {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    params,
+                } => Some((false, *left, *top, *right, *bottom, params.frequency, params.orientation, params.phase, params.contrast, params.background, params.sigma, 0u32)),
+                _ => None,
+            })
+            .collect();
+
+        for (is_grating, left, top, right, bottom, frequency, orientation, phase, contrast, background, sigma, wave_type) in parametric_commands {
+            let quad = textured_quad_vertices(left, top, right, bottom);
+            let vertex_buffer = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                quad.into_iter(),
+            )
+            .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
+
+            let pipeline = if is_grating {
+                &self.grating_pipeline
+            } else {
+                &self.gabor_pipeline
+            };
+
+            builder
+                .bind_pipeline_graphics(pipeline.clone())
+                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                .push_constants(
+                    pipeline.layout().clone(),
+                    0,
+                    parametric_vs::PushConstants {
+                        viewport_size: [viewport_extent[0] as f32, viewport_extent[1] as f32].into(),
+                        rect: [left, top, right, bottom],
+                        frequency,
+                        orientation,
+                        phase,
+                        contrast,
+                        background,
+                        sigma,
+                        wave_type,
+                    },
+                )
+                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                .bind_vertex_buffers(0, vertex_buffer)
+                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
             unsafe {
                 builder
                     .draw(6, 1, 0, 0)
