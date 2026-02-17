@@ -7,11 +7,13 @@ mod color;
 mod gabor;
 pub(crate) mod primitives;
 pub(crate) mod renderer;
+mod stimuli;
 mod texture;
 mod vertex;
 
 pub use color::Color;
 pub use gabor::GaborParams;
+pub use stimuli::{GratingParams, NoiseParams, NoiseType, WaveType};
 pub use texture::TextureHandle;
 
 pub use vertex::{TexturedVertex, Vertex2D};

@@ -29,7 +29,7 @@ pub mod prelude {
         DeviceSelector, Frame, GPUPreference, PresentMode, RenderContext, SwapchainConfig,
         SwapchainManager, VSEContext, VSEContextBuilder, VSEError,
     };
-    pub use crate::drawing::{Color, GaborParams, TextureHandle};
+    pub use crate::drawing::{Color, GaborParams, GratingParams, NoiseParams, NoiseType, TextureHandle, WaveType};
     pub use crate::host::HostInfo;
     pub use crate::timing::{FlipInfo, FlipLogger, Timestamp, TimingSource, TimingStats};
 }
