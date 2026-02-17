@@ -16,6 +16,7 @@
 ///       y' = -x*sin(orientation) + y*cos(orientation)
 ///       (x, y) are relative to patch center
 /// ```
+#[derive(Clone)]
 pub struct GaborParams {
     /// Size of the patch in pixels (square texture).
     pub size: u32,

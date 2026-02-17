@@ -28,7 +28,7 @@ use vulkano::sync::GpuFuture;
 
 use crate::drawing::primitives::{default_circle_segments, DrawCommand};
 use crate::drawing::renderer::{Renderer, RendererError};
-use crate::drawing::{Color, GaborParams, TextureHandle};
+use crate::drawing::{Color, GaborParams, GratingParams, NoiseParams, TextureHandle};
 use crate::timing::{
     Clock, CpuTimingProvider, FlipInfo, FlipLogger, GoogleDisplayTimingProvider, Timestamp,
     TimingProvider, TimingSource, TimingStats,
@@ -837,6 +837,96 @@ impl<'a> RenderContext<'a> {
     /// Unload a texture and free its GPU resources.
     pub fn unload_texture(&mut self, handle: TextureHandle) {
         self.state.renderer.unload_texture(handle);
+    }
+
+    // === Advanced stimuli ===
+
+    /// Draw a sinusoidal or square-wave grating.
+    ///
+    /// The grating fills the rectangle defined by (left, top, right, bottom)
+    /// in pixel coordinates. Parameters control spatial frequency, orientation,
+    /// phase, contrast, and waveform type.
+    pub fn draw_grating(
+        &mut self,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        params: &GratingParams,
+    ) {
+        self.state.renderer.push(DrawCommand::Grating {
+            left,
+            top,
+            right,
+            bottom,
+            params: params.clone(),
+        });
+    }
+
+    /// Draw a Gabor patch (grating windowed by a Gaussian envelope).
+    ///
+    /// Unlike `create_gabor()` which generates a CPU texture, this computes
+    /// the Gabor mathematically on the GPU each frame, allowing real-time
+    /// parameter animation.
+    pub fn draw_gabor_shader(
+        &mut self,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        params: &GaborParams,
+    ) {
+        self.state.renderer.push(DrawCommand::Gabor {
+            left,
+            top,
+            right,
+            bottom,
+            params: params.clone(),
+        });
+    }
+
+    /// Draw a noise pattern.
+    ///
+    /// Generates a noise texture on CPU from the given parameters and
+    /// displays it in the specified rectangle. For animated noise, change
+    /// `params.seed` each frame.
+    pub fn draw_noise(
+        &mut self,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        params: &NoiseParams,
+    ) -> Result<(), VSEError> {
+        let pixels = crate::drawing::noise::generate_noise(params);
+        let handle = self
+            .state
+            .renderer
+            .load_texture_rgba(params.width, params.height, &pixels)?;
+        self.state.renderer.push(DrawCommand::Noise {
+            left,
+            top,
+            right,
+            bottom,
+            texture_id: handle.id,
+        });
+        Ok(())
+    }
+
+    /// Draw filled circular dots at the specified positions.
+    ///
+    /// This is the rendering primitive for Random Dot Kinematograms.
+    /// Positions are in pixel coordinates. Each dot is rendered as a
+    /// filled circle with an anti-aliased edge.
+    pub fn draw_dots(&mut self, positions: &[(f32, f32)], radius: f32, color: Color) {
+        if positions.is_empty() {
+            return;
+        }
+        self.state.renderer.push(DrawCommand::Dots {
+            positions: positions.iter().map(|&(x, y)| [x, y]).collect(),
+            radius,
+            color,
+        });
     }
 
     /// Capture a snapshot of the full host machine state.
