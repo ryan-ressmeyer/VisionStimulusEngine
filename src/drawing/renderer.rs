@@ -384,19 +384,62 @@ impl Renderer {
                     right,
                     bottom,
                     params,
-                } => Some((true, *left, *top, *right, *bottom, params.frequency, params.orientation, params.phase, params.contrast, params.background, 0.0f32, match params.wave { WaveType::Sine => 0u32, WaveType::Square => 1u32 })),
+                } => Some((
+                    true,
+                    *left,
+                    *top,
+                    *right,
+                    *bottom,
+                    params.frequency,
+                    params.orientation,
+                    params.phase,
+                    params.contrast,
+                    params.background,
+                    0.0f32,
+                    match params.wave {
+                        WaveType::Sine => 0u32,
+                        WaveType::Square => 1u32,
+                    },
+                )),
                 DrawCommand::Gabor {
                     left,
                     top,
                     right,
                     bottom,
                     params,
-                } => Some((false, *left, *top, *right, *bottom, params.frequency, params.orientation, params.phase, params.contrast, params.background, params.sigma, 0u32)),
+                } => Some((
+                    false,
+                    *left,
+                    *top,
+                    *right,
+                    *bottom,
+                    params.frequency,
+                    params.orientation,
+                    params.phase,
+                    params.contrast,
+                    params.background,
+                    params.sigma,
+                    0u32,
+                )),
                 _ => None,
             })
             .collect();
 
-        for (is_grating, left, top, right, bottom, frequency, orientation, phase, contrast, background, sigma, wave_type) in parametric_commands {
+        for (
+            is_grating,
+            left,
+            top,
+            right,
+            bottom,
+            frequency,
+            orientation,
+            phase,
+            contrast,
+            background,
+            sigma,
+            wave_type,
+        ) in parametric_commands
+        {
             let quad = textured_quad_vertices(left, top, right, bottom);
             let vertex_buffer = Buffer::from_iter(
                 self.memory_allocator.clone(),
@@ -426,7 +469,8 @@ impl Renderer {
                     pipeline.layout().clone(),
                     0,
                     parametric_vs::PushConstants {
-                        viewport_size: [viewport_extent[0] as f32, viewport_extent[1] as f32].into(),
+                        viewport_size: [viewport_extent[0] as f32, viewport_extent[1] as f32]
+                            .into(),
                         rect: [left, top, right, bottom],
                         frequency,
                         orientation,
@@ -468,12 +512,24 @@ impl Renderer {
 
             // Unit quad: 6 vertices for two triangles covering [-1, 1]
             let quad_data: Vec<DotInstance> = vec![
-                DotInstance { position: [-1.0, -1.0] },
-                DotInstance { position: [-1.0, 1.0] },
-                DotInstance { position: [1.0, 1.0] },
-                DotInstance { position: [-1.0, -1.0] },
-                DotInstance { position: [1.0, 1.0] },
-                DotInstance { position: [1.0, -1.0] },
+                DotInstance {
+                    position: [-1.0, -1.0],
+                },
+                DotInstance {
+                    position: [-1.0, 1.0],
+                },
+                DotInstance {
+                    position: [1.0, 1.0],
+                },
+                DotInstance {
+                    position: [-1.0, -1.0],
+                },
+                DotInstance {
+                    position: [1.0, 1.0],
+                },
+                DotInstance {
+                    position: [1.0, -1.0],
+                },
             ];
 
             let quad_buffer = Buffer::from_iter(
