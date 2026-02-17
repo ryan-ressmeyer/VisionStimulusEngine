@@ -1,5 +1,7 @@
 use super::color::Color;
+use super::stimuli::GratingParams;
 use super::vertex::{TexturedVertex, Vertex2D};
+use crate::drawing::GaborParams;
 
 /// A queued draw command, processed during flip().
 pub(crate) enum DrawCommand {
@@ -38,6 +40,40 @@ pub(crate) enum DrawCommand {
         top: f32,
         right: f32,
         bottom: f32,
+    },
+
+    /// GPU-computed sinusoidal or square-wave grating.
+    Grating {
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        params: GratingParams,
+    },
+
+    /// GPU-computed Gabor patch (grating x Gaussian envelope).
+    Gabor {
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        params: GaborParams,
+    },
+
+    /// CPU-generated noise uploaded as texture.
+    Noise {
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        texture_id: u64,
+    },
+
+    /// Instanced dot rendering.
+    Dots {
+        positions: Vec<[f32; 2]>,
+        radius: f32,
+        color: Color,
     },
 }
 

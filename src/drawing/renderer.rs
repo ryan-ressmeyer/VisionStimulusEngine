@@ -519,9 +519,11 @@ impl Renderer {
                     }
                     vertices.extend_from_slice(&line_vertices(*x1, *y1, *x2, *y2, *width, *color));
                 }
-                DrawCommand::Texture { .. } => {
-                    // Handled separately
-                }
+                DrawCommand::Texture { .. } => {}
+                DrawCommand::Grating { .. } => {}
+                DrawCommand::Gabor { .. } => {}
+                DrawCommand::Noise { .. } => {}
+                DrawCommand::Dots { .. } => {}
             }
         }
 
