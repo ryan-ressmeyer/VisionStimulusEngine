@@ -5,6 +5,7 @@
 
 mod color;
 mod gabor;
+pub(crate) mod noise;
 pub(crate) mod primitives;
 pub(crate) mod renderer;
 mod stimuli;
