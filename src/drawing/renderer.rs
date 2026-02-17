@@ -300,12 +300,19 @@ impl Renderer {
             }
         }
 
-        // Textured draws
+        // Textured draws (Texture and Noise both use the textured pipeline)
         let texture_commands: Vec<_> = self
             .draw_commands
             .iter()
             .filter_map(|cmd| match cmd {
                 DrawCommand::Texture {
+                    texture_id,
+                    left,
+                    top,
+                    right,
+                    bottom,
+                } => Some((*texture_id, *left, *top, *right, *bottom)),
+                DrawCommand::Noise {
                     texture_id,
                     left,
                     top,
@@ -436,6 +443,95 @@ impl Renderer {
             unsafe {
                 builder
                     .draw(6, 1, 0, 0)
+                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+            }
+        }
+
+        // Dot draws (instanced rendering)
+        let dot_commands: Vec<_> = self
+            .draw_commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                DrawCommand::Dots {
+                    positions,
+                    radius,
+                    color,
+                } => Some((positions.clone(), *radius, *color)),
+                _ => None,
+            })
+            .collect();
+
+        for (positions, radius, color) in dot_commands {
+            if positions.is_empty() {
+                continue;
+            }
+
+            // Unit quad: 6 vertices for two triangles covering [-1, 1]
+            let quad_data: Vec<DotInstance> = vec![
+                DotInstance { position: [-1.0, -1.0] },
+                DotInstance { position: [-1.0, 1.0] },
+                DotInstance { position: [1.0, 1.0] },
+                DotInstance { position: [-1.0, -1.0] },
+                DotInstance { position: [1.0, 1.0] },
+                DotInstance { position: [1.0, -1.0] },
+            ];
+
+            let quad_buffer = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                quad_data.into_iter(),
+            )
+            .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
+
+            let instance_data: Vec<DotInstance> = positions
+                .iter()
+                .map(|&pos| DotInstance { position: pos })
+                .collect();
+            let instance_count = instance_data.len() as u32;
+
+            let instance_buffer = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                instance_data.into_iter(),
+            )
+            .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
+
+            let c = color.to_array();
+            builder
+                .bind_pipeline_graphics(self.dot_pipeline.clone())
+                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                .push_constants(
+                    self.dot_pipeline.layout().clone(),
+                    0,
+                    dot_vs::PushConstants {
+                        viewport_size: [viewport_extent[0] as f32, viewport_extent[1] as f32],
+                        dot_radius: radius,
+                        _pad: 0.0,
+                        dot_color: c,
+                    },
+                )
+                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                .bind_vertex_buffers(0, (quad_buffer, instance_buffer))
+                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+            unsafe {
+                builder
+                    .draw(6, instance_count, 0, 0)
                     .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
             }
         }
