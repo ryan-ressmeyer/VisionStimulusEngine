@@ -73,6 +73,10 @@ name = "04_scheduled_flip"
 path = "examples/04_scheduled_flip.rs"
 
 [[example]]
+name = "05_advanced_stimuli"
+path = "examples/05_advanced_stimuli.rs"
+
+[[example]]
 name = "06_host_info"
 path = "examples/06_host_info.rs"
 
