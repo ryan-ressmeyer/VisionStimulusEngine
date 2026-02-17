@@ -11,8 +11,7 @@ VisionStimulusEngine (VSE) is a vision science stimulus presentation system writ
 1. **Incremental Learning Curve**: Provide high-level interfaces for beginners while exposing lower-level Vulkan API calls for advanced users
 2. **Millisecond-Accurate Timing**: Imperative for vision science experiments measuring neural responses
 3. **Full Reproducibility**: Critical for image-computable models of neural responses
-4. **Hardware Integration**: Bridge to National Instruments and other hardware systems for synchronizing stimulus presentation with neural recordings and behavioral responses
-5. **Psychtoolbox API Compatibility**: Where possible, mirror Psychtoolbox API design to ease transition for vision scientists
+4. **Psychtoolbox API Compatibility**: Where possible, mirror Psychtoolbox API design to ease transition for vision scientists
 
 ### Target Users
 
@@ -74,12 +73,6 @@ The architecture should support multiple abstraction levels:
 - **High-level**: Simple stimulus generation functions (similar to Psychtoolbox)
 - **Mid-level**: Configurable rendering pipelines with sensible defaults
 - **Low-level**: Direct Vulkan API access for advanced optimization
-
-### Hardware Synchronization
-Design interfaces for:
-- National Instruments DAQ systems
-- TTL pulse generation for neural recording synchronization
-- Behavioral response device integration
 
 ### Reproducibility
 - Deterministic random number generation with seed control

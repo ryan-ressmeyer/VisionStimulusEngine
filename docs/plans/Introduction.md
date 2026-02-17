@@ -6,6 +6,4 @@ I am a vision scientist studying how the primate brain processes visual informat
 
 3. Allow for full reproducibility of programatically generated, rich visual stimuli. Reproducibility is critical for image-computable models of neural responses. 
 
-4. Provide a bridge to National Instruments (or other) hardware systems for synchronizing visual stimulus presentation with neural recordings and recording of behavioral responses. 
-
-5. Where possible, adhere to a similar API design to Psychtoolbox, which is widely used in the vision science community. This will make it easier for users who are familiar with Psychtoolbox to transition to VSE and to use it in their experiments. By providing a familiar interface, we hope to encourage more vision scientists to adopt VSE and to take advantage of its advanced features.
+4. Where possible, adhere to a similar API design to Psychtoolbox, which is widely used in the vision science community. This will make it easier for users who are familiar with Psychtoolbox to transition to VSE and to use it in their experiments. By providing a familiar interface, we hope to encourage more vision scientists to adopt VSE and to take advantage of its advanced features.

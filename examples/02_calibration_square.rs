@@ -2,7 +2,7 @@
 //!
 //! Displays a 100x100 pixel square that alternates between white and
 //! black every 60 frames. Logs exact flip timestamps to CSV for
-//! external validation with a photodiode or oscilloscope.
+//! external timing validation.
 //!
 //! # Running
 //!

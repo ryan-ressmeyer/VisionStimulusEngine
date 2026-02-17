@@ -18,7 +18,7 @@ Rust provides:
 - Excellent ecosystem (Vulkano, winit, tokio) for graphics and async I/O
 - Cross-platform support with predictable behavior
 
-## Five Foundational Pillars
+## Four Foundational Pillars
 
 ### 1. Core Infrastructure (Vulkano Wrappers)
 
@@ -92,7 +92,7 @@ src/
 
 ### 3. The "PTB-Lite" High-Level API
 
-To satisfy Goal 5 (Psychtoolbox API compatibility), VSE needs a layer that feels like familiar `Screen()` commands.
+To satisfy Goal 4 (Psychtoolbox API compatibility), VSE needs a layer that feels like familiar `Screen()` commands.
 
 #### API Mapping:
 
@@ -179,39 +179,6 @@ src/
     // ... etc
 ```
 
-### 5. Hardware Integration & I/O
-
-To bridge to National Instruments (Goal 4), VSE needs low-latency signaling of "The stimulus is now visible."
-
-#### Components:
-
-**Digital Out (Triggering)**
-- Send TTL pulse via serial port or DAQ card
-- Triggered immediately following successful `vkQueuePresentKHR`
-- Support for National Instruments DAQmx API
-- Generic interface for other hardware backends
-
-**Photodiode Support**
-- Standard "trigger square" in screen corner
-- Flips between black and white to synchronize with external hardware
-- Configurable position, size, and timing
-
-**Async Input Handling**
-- Use Rust's `tokio` or `crossbeam` for non-blocking input
-- Keyboard, button boxes, gamepads
-- Timestamp all inputs with high-resolution clock
-- Separate thread to avoid blocking render loop
-
-#### Proposed Module Structure:
-```
-src/
-  hardware/
-    trigger.rs        // TTL pulse generation
-    photodiode.rs     // Photodiode square management
-    ni_daq.rs         // National Instruments DAQ interface
-    input.rs          // Async input handling
-```
-
 ## Project Directory Structure
 
 ```
@@ -259,13 +226,6 @@ VisionStimulusEngine/
 │   │   ├── noise.rs
 │   │   └── plaids.rs
 │   │
-│   ├── hardware/           // Hardware I/O
-│   │   ├── mod.rs
-│   │   ├── trigger.rs
-│   │   ├── photodiode.rs
-│   │   ├── ni_daq.rs
-│   │   └── input.rs
-│   │
 │   └── utils/              // Utilities
 │       ├── mod.rs
 │       ├── color.rs        // Color space conversions, gamma
@@ -285,13 +245,11 @@ VisionStimulusEngine/
 │   ├── 01_calibration_square.rs   // First milestone
 │   ├── 02_simple_grating.rs
 │   ├── 03_gabor_patch.rs
-│   ├── 04_random_dots.rs
-│   └── 05_hardware_sync.rs
+│   └── 04_random_dots.rs
 │
 ├── tests/                  // Integration tests
 │   ├── timing_tests.rs     // Timing precision validation
-│   ├── rendering_tests.rs  // Rendering correctness
-│   └── hardware_tests.rs   // Hardware I/O tests
+│   └── rendering_tests.rs  // Rendering correctness
 │
 └── benches/                // Performance benchmarks
     ├── frame_timing.rs
@@ -406,16 +364,7 @@ fn main() -> Result<()> {
 - [ ] Add uniform buffer management
 - [ ] Implement parameter validation
 
-### Phase 5: Hardware Integration
-
-**Goal:** Synchronize with external hardware
-
-- [ ] Implement photodiode trigger square
-- [ ] Add TTL pulse generation (generic interface)
-- [ ] Implement NI-DAQ backend (if hardware available)
-- [ ] Add async input handling
-
-### Phase 6: Advanced Stimuli 
+### Phase 5: Advanced Stimuli
 
 **Goal:** Complex stimulus generation
 
@@ -424,7 +373,7 @@ fn main() -> Result<()> {
 - [ ] Add plaid patterns
 - [ ] Optimize performance for thousands of elements
 
-### Phase 7: Polish & Documentation 
+### Phase 6: Polish & Documentation
 
 **Goal:** Production-ready release
 
@@ -488,9 +437,6 @@ vulkano-shaders = "0.34"
 # Windowing
 winit = "0.29"
 
-# Async runtime for I/O
-tokio = { version = "1", features = ["full"] }
-
 # Math
 nalgebra = "0.32"
 glam = "0.24"
@@ -515,10 +461,6 @@ chrono = "0.4"
 
 ```toml
 [dependencies]
-# Hardware I/O (optional)
-ni-daqmx = { version = "0.1", optional = true }
-serialport = { version = "4.2", optional = true }
-
 # Advanced logging
 tracing = "0.1"
 tracing-subscriber = "0.3"
@@ -534,7 +476,6 @@ tracing-subscriber = "0.3"
 ### Integration Tests
 - Test full window creation and rendering pipeline
 - Test timing precision over extended runs
-- Test hardware trigger functionality (with mock hardware)
 
 ### Benchmarks
 - Frame generation performance
