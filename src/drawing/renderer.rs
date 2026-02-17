@@ -30,7 +30,10 @@ use vulkano::{
             multisample::MultisampleState,
             rasterization::RasterizationState,
             subpass::PipelineRenderingCreateInfo,
-            vertex_input::{Vertex as VertexTrait, VertexDefinition},
+            vertex_input::{
+                Vertex as VertexTrait, VertexDefinition, VertexInputAttributeDescription,
+                VertexInputBindingDescription, VertexInputRate, VertexInputState,
+            },
             viewport::{Viewport, ViewportState},
             GraphicsPipelineCreateInfo,
         },
@@ -73,6 +76,41 @@ mod textured_fs {
     vulkano_shaders::shader! {
         ty: "fragment",
         path: "src/shaders/textured.frag",
+    }
+}
+
+mod parametric_vs {
+    vulkano_shaders::shader! {
+        ty: "vertex",
+        path: "src/shaders/parametric.vert",
+    }
+}
+
+mod grating_fs {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        path: "src/shaders/grating.frag",
+    }
+}
+
+mod gabor_fs {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        path: "src/shaders/gabor.frag",
+    }
+}
+
+mod dot_vs {
+    vulkano_shaders::shader! {
+        ty: "vertex",
+        path: "src/shaders/dot.vert",
+    }
+}
+
+mod dot_fs {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        path: "src/shaders/dot.frag",
     }
 }
 
@@ -128,6 +166,9 @@ pub(crate) struct Renderer {
 
     flat_color_pipeline: Arc<GraphicsPipeline>,
     textured_pipeline: Arc<GraphicsPipeline>,
+    grating_pipeline: Arc<GraphicsPipeline>,
+    gabor_pipeline: Arc<GraphicsPipeline>,
+    dot_pipeline: Arc<GraphicsPipeline>,
 
     textures: HashMap<u64, TextureResources>,
     next_texture_id: u64,
@@ -152,6 +193,9 @@ impl Renderer {
 
         let flat_color_pipeline = Self::create_flat_color_pipeline(&device, swapchain_format)?;
         let textured_pipeline = Self::create_textured_pipeline(&device, swapchain_format)?;
+        let grating_pipeline = Self::create_grating_pipeline(&device, swapchain_format)?;
+        let gabor_pipeline = Self::create_gabor_pipeline(&device, swapchain_format)?;
+        let dot_pipeline = Self::create_dot_pipeline(&device, swapchain_format)?;
 
         Ok(Self {
             device,
@@ -161,6 +205,9 @@ impl Renderer {
             descriptor_set_allocator,
             flat_color_pipeline,
             textured_pipeline,
+            grating_pipeline,
+            gabor_pipeline,
+            dot_pipeline,
             textures: HashMap::new(),
             next_texture_id: 0,
             draw_commands: Vec::new(),
@@ -608,6 +655,228 @@ impl Renderer {
         let vertex_input_state = TexturedVertex::per_vertex()
             .definition(&vs_entry)
             .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
+
+        let stages = [
+            PipelineShaderStageCreateInfo::new(vs_entry),
+            PipelineShaderStageCreateInfo::new(fs_entry),
+        ];
+
+        let layout = PipelineLayout::new(
+            device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+                .into_pipeline_layout_create_info(device.clone())
+                .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?,
+        )
+        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
+
+        GraphicsPipeline::new(
+            device.clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: stages.into_iter().collect(),
+                vertex_input_state: Some(vertex_input_state),
+                input_assembly_state: Some(InputAssemblyState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                }),
+                viewport_state: Some(ViewportState::default()),
+                rasterization_state: Some(RasterizationState::default()),
+                multisample_state: Some(MultisampleState::default()),
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    1,
+                    ColorBlendAttachmentState {
+                        blend: Some(AttachmentBlend::alpha()),
+                        ..Default::default()
+                    },
+                )),
+                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+                subpass: Some(
+                    PipelineRenderingCreateInfo {
+                        color_attachment_formats: vec![Some(swapchain_format)],
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..GraphicsPipelineCreateInfo::layout(layout)
+            },
+        )
+        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))
+    }
+
+    fn create_grating_pipeline(
+        device: &Arc<Device>,
+        swapchain_format: Format,
+    ) -> Result<Arc<GraphicsPipeline>, RendererError> {
+        let vs = parametric_vs::load(device.clone())
+            .map_err(|e| RendererError::ShaderLoadFailed(e.to_string()))?;
+        let fs = grating_fs::load(device.clone())
+            .map_err(|e| RendererError::ShaderLoadFailed(e.to_string()))?;
+
+        let vs_entry = vs.entry_point("main").unwrap();
+        let fs_entry = fs.entry_point("main").unwrap();
+
+        let vertex_input_state = TexturedVertex::per_vertex()
+            .definition(&vs_entry)
+            .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
+
+        let stages = [
+            PipelineShaderStageCreateInfo::new(vs_entry),
+            PipelineShaderStageCreateInfo::new(fs_entry),
+        ];
+
+        let layout = PipelineLayout::new(
+            device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+                .into_pipeline_layout_create_info(device.clone())
+                .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?,
+        )
+        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
+
+        GraphicsPipeline::new(
+            device.clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: stages.into_iter().collect(),
+                vertex_input_state: Some(vertex_input_state),
+                input_assembly_state: Some(InputAssemblyState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                }),
+                viewport_state: Some(ViewportState::default()),
+                rasterization_state: Some(RasterizationState::default()),
+                multisample_state: Some(MultisampleState::default()),
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    1,
+                    ColorBlendAttachmentState {
+                        blend: Some(AttachmentBlend::alpha()),
+                        ..Default::default()
+                    },
+                )),
+                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+                subpass: Some(
+                    PipelineRenderingCreateInfo {
+                        color_attachment_formats: vec![Some(swapchain_format)],
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..GraphicsPipelineCreateInfo::layout(layout)
+            },
+        )
+        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))
+    }
+
+    fn create_gabor_pipeline(
+        device: &Arc<Device>,
+        swapchain_format: Format,
+    ) -> Result<Arc<GraphicsPipeline>, RendererError> {
+        let vs = parametric_vs::load(device.clone())
+            .map_err(|e| RendererError::ShaderLoadFailed(e.to_string()))?;
+        let fs = gabor_fs::load(device.clone())
+            .map_err(|e| RendererError::ShaderLoadFailed(e.to_string()))?;
+
+        let vs_entry = vs.entry_point("main").unwrap();
+        let fs_entry = fs.entry_point("main").unwrap();
+
+        let vertex_input_state = TexturedVertex::per_vertex()
+            .definition(&vs_entry)
+            .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
+
+        let stages = [
+            PipelineShaderStageCreateInfo::new(vs_entry),
+            PipelineShaderStageCreateInfo::new(fs_entry),
+        ];
+
+        let layout = PipelineLayout::new(
+            device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+                .into_pipeline_layout_create_info(device.clone())
+                .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?,
+        )
+        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
+
+        GraphicsPipeline::new(
+            device.clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: stages.into_iter().collect(),
+                vertex_input_state: Some(vertex_input_state),
+                input_assembly_state: Some(InputAssemblyState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                }),
+                viewport_state: Some(ViewportState::default()),
+                rasterization_state: Some(RasterizationState::default()),
+                multisample_state: Some(MultisampleState::default()),
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    1,
+                    ColorBlendAttachmentState {
+                        blend: Some(AttachmentBlend::alpha()),
+                        ..Default::default()
+                    },
+                )),
+                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+                subpass: Some(
+                    PipelineRenderingCreateInfo {
+                        color_attachment_formats: vec![Some(swapchain_format)],
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..GraphicsPipelineCreateInfo::layout(layout)
+            },
+        )
+        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))
+    }
+
+    fn create_dot_pipeline(
+        device: &Arc<Device>,
+        swapchain_format: Format,
+    ) -> Result<Arc<GraphicsPipeline>, RendererError> {
+        let vs = dot_vs::load(device.clone())
+            .map_err(|e| RendererError::ShaderLoadFailed(e.to_string()))?;
+        let fs = dot_fs::load(device.clone())
+            .map_err(|e| RendererError::ShaderLoadFailed(e.to_string()))?;
+
+        let vs_entry = vs.entry_point("main").unwrap();
+        let fs_entry = fs.entry_point("main").unwrap();
+
+        // Manual vertex input: binding 0 = per-vertex quad, binding 1 = per-instance dot position
+        let mut vertex_input_state = VertexInputState::default();
+        vertex_input_state.bindings.insert(
+            0,
+            VertexInputBindingDescription {
+                stride: 8,
+                input_rate: VertexInputRate::Vertex,
+                ..Default::default()
+            },
+        );
+        vertex_input_state.bindings.insert(
+            1,
+            VertexInputBindingDescription {
+                stride: 8,
+                input_rate: VertexInputRate::Instance { divisor: 1 },
+                ..Default::default()
+            },
+        );
+        vertex_input_state.attributes.insert(
+            0,
+            VertexInputAttributeDescription {
+                binding: 0,
+                format: Format::R32G32_SFLOAT,
+                offset: 0,
+                ..Default::default()
+            },
+        );
+        vertex_input_state.attributes.insert(
+            1,
+            VertexInputAttributeDescription {
+                binding: 1,
+                format: Format::R32G32_SFLOAT,
+                offset: 0,
+                ..Default::default()
+            },
+        );
 
         let stages = [
             PipelineShaderStageCreateInfo::new(vs_entry),
