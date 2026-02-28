@@ -94,7 +94,7 @@ fn test_host_info_in_prelude() {
 }
 
 use vision_stimulus_engine::core::{
-    InputEvent, MonitorInfo, MonitorSelection, MouseButton, VideoModeInfo, WindowMode,
+    InputEvent, KeyCode, MonitorInfo, MonitorSelection, MouseButton, VideoModeInfo, WindowMode,
 };
 
 #[test]
@@ -146,4 +146,46 @@ fn test_monitor_info_fields() {
     };
     assert_eq!(info.name.as_deref(), Some("Test Monitor"));
     assert_eq!(info.width, 2560);
+}
+
+#[test]
+fn test_builder_with_window_mode() {
+    let _builder = VSEContext::builder()
+        .with_window_mode(WindowMode::ExclusiveFullscreen);
+}
+
+#[test]
+fn test_builder_with_monitor() {
+    let _builder = VSEContext::builder()
+        .with_monitor(MonitorSelection::Index(1));
+}
+
+#[test]
+fn test_builder_with_cursor_visible() {
+    let _builder = VSEContext::builder()
+        .with_cursor_visible(false);
+}
+
+#[test]
+fn test_builder_fullscreen_chain() {
+    let _builder = VSEContext::builder()
+        .with_window_mode(WindowMode::BorderlessFullscreen)
+        .with_monitor(MonitorSelection::Name("ASUS".into()))
+        .with_cursor_visible(false)
+        .with_window_size(1920, 1080);
+}
+
+#[test]
+fn test_keycode_reexport() {
+    let _key = KeyCode::Escape;
+    let _space = KeyCode::Space;
+    let _a = KeyCode::KeyA;
+}
+
+#[test]
+fn test_mouse_button_equality() {
+    assert_eq!(MouseButton::Left, MouseButton::Left);
+    assert_ne!(MouseButton::Left, MouseButton::Right);
+    assert_eq!(MouseButton::Other(5), MouseButton::Other(5));
+    assert_ne!(MouseButton::Other(5), MouseButton::Other(6));
 }

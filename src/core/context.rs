@@ -19,6 +19,7 @@ use winit::{
 
 use std::path::Path;
 
+use super::input::{InputEvent, InputState, MonitorInfo, MonitorSelection, MouseButton, VideoModeInfo, WindowMode};
 use super::{
     device::{DeviceError, DeviceSelector, GPUPreference},
     frame::{FrameBuilder, FrameError},
@@ -84,6 +85,12 @@ pub struct VSEConfig {
     /// Expected refresh rate in Hz (used for missed frame detection).
     /// If None, auto-detected from first 10 frames.
     pub expected_refresh_rate: Option<f64>,
+    /// Window display mode (windowed, borderless fullscreen, exclusive fullscreen).
+    pub window_mode: WindowMode,
+    /// Which monitor to use for fullscreen modes.
+    pub monitor_selection: MonitorSelection,
+    /// Whether the cursor is visible. None means auto (hidden in fullscreen, visible in windowed).
+    pub cursor_visible: Option<bool>,
 }
 
 impl Default for VSEConfig {
@@ -98,6 +105,9 @@ impl Default for VSEConfig {
             flip_logging: false,
             flip_log_csv_path: None,
             expected_refresh_rate: None,
+            window_mode: WindowMode::default(),
+            monitor_selection: MonitorSelection::default(),
+            cursor_visible: None,
         }
     }
 }
@@ -193,6 +203,35 @@ impl VSEContextBuilder {
     /// first 10 frames.
     pub fn with_expected_refresh_rate(mut self, hz: f64) -> Self {
         self.config.expected_refresh_rate = Some(hz);
+        self
+    }
+
+    /// Set the window display mode.
+    ///
+    /// - `Windowed`: Standard resizable window (default)
+    /// - `BorderlessFullscreen`: Borderless window covering the monitor
+    /// - `ExclusiveFullscreen`: Exclusive fullscreen for lowest latency
+    pub fn with_window_mode(mut self, mode: WindowMode) -> Self {
+        self.config.window_mode = mode;
+        self
+    }
+
+    /// Select which monitor to use for fullscreen modes.
+    ///
+    /// - `Primary`: Use the primary monitor (default)
+    /// - `Index(n)`: Select by 0-based index
+    /// - `Name(s)`: Select by case-insensitive name substring match
+    pub fn with_monitor(mut self, selection: MonitorSelection) -> Self {
+        self.config.monitor_selection = selection;
+        self
+    }
+
+    /// Set whether the mouse cursor is visible.
+    ///
+    /// By default the cursor is hidden in fullscreen modes and visible
+    /// in windowed mode. This override applies regardless of window mode.
+    pub fn with_cursor_visible(mut self, visible: bool) -> Self {
+        self.config.cursor_visible = Some(visible);
         self
     }
 
