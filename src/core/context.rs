@@ -14,7 +14,7 @@ use winit::{
     dpi::PhysicalSize,
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop, EventLoopWindowTarget},
-    window::{Window, WindowBuilder},
+    window::{Fullscreen, Window, WindowBuilder},
 };
 
 use std::path::Path;
@@ -340,17 +340,109 @@ impl VSEContext {
         elwt: &EventLoopWindowTarget<()>,
         config: &VSEConfig,
     ) -> Result<VSEState, VSEError> {
+        // --- Resolve target monitor ---
+        let target_monitor = match &config.monitor_selection {
+            MonitorSelection::Primary => elwt.primary_monitor(),
+            MonitorSelection::Index(idx) => {
+                let monitors: Vec<_> = elwt.available_monitors().collect();
+                if *idx < monitors.len() {
+                    Some(monitors[*idx].clone())
+                } else {
+                    warn!(
+                        "Monitor index {} out of range ({}  available), falling back to primary",
+                        idx,
+                        monitors.len()
+                    );
+                    elwt.primary_monitor()
+                }
+            }
+            MonitorSelection::Name(name) => {
+                let name_lower = name.to_lowercase();
+                let found = elwt.available_monitors().find(|m| {
+                    m.name()
+                        .map(|n| n.to_lowercase().contains(&name_lower))
+                        .unwrap_or(false)
+                });
+                if found.is_none() {
+                    warn!(
+                        "No monitor matching '{}' found, falling back to primary",
+                        name
+                    );
+                }
+                found.or_else(|| elwt.primary_monitor())
+            }
+        };
+
+        // --- Build fullscreen setting ---
+        let fullscreen = match config.window_mode {
+            WindowMode::Windowed => None,
+            WindowMode::BorderlessFullscreen => {
+                Some(Fullscreen::Borderless(target_monitor.clone()))
+            }
+            WindowMode::ExclusiveFullscreen => {
+                if let Some(ref monitor) = target_monitor {
+                    // Find best video mode: match configured resolution if possible,
+                    // then pick highest refresh rate, fall back to native resolution.
+                    let modes: Vec<_> = monitor.video_modes().collect();
+
+                    let best = modes
+                        .iter()
+                        .filter(|m| {
+                            m.size().width == config.window_width
+                                && m.size().height == config.window_height
+                        })
+                        .max_by(|a, b| a.refresh_rate_millihertz().cmp(&b.refresh_rate_millihertz()))
+                        .or_else(|| {
+                            // Fall back to native resolution (highest refresh rate)
+                            modes.iter().max_by(|a, b| {
+                                let area_a = a.size().width * a.size().height;
+                                let area_b = b.size().width * b.size().height;
+                                area_a
+                                    .cmp(&area_b)
+                                    .then(a.refresh_rate_millihertz().cmp(&b.refresh_rate_millihertz()))
+                            })
+                        });
+
+                    match best {
+                        Some(mode) => {
+                            info!(
+                                "Exclusive fullscreen: {}x{} @ {:.1} Hz",
+                                mode.size().width,
+                                mode.size().height,
+                                mode.refresh_rate_millihertz() as f64 / 1000.0
+                            );
+                            Some(Fullscreen::Exclusive(mode.clone()))
+                        }
+                        None => {
+                            warn!("No video modes found, falling back to borderless fullscreen");
+                            Some(Fullscreen::Borderless(target_monitor.clone()))
+                        }
+                    }
+                } else {
+                    warn!("No monitor found for exclusive fullscreen, falling back to borderless");
+                    Some(Fullscreen::Borderless(None))
+                }
+            }
+        };
+
         let window = WindowBuilder::new()
             .with_title(&config.window_title)
             .with_inner_size(PhysicalSize::new(config.window_width, config.window_height))
+            .with_fullscreen(fullscreen)
             .build(elwt)
             .map_err(|e| VSEError::Window(e.to_string()))?;
 
         let window = Arc::new(window);
 
+        // Apply cursor visibility: auto-hide in fullscreen, visible in windowed, overridable
+        let cursor_visible = config.cursor_visible.unwrap_or_else(|| {
+            matches!(config.window_mode, WindowMode::Windowed)
+        });
+        window.set_cursor_visible(cursor_visible);
+
         info!(
-            "Window created: {}x{}",
-            config.window_width, config.window_height
+            "Window created: {}x{} mode={:?} cursor_visible={}",
+            config.window_width, config.window_height, config.window_mode, cursor_visible
         );
 
         // Initialize Vulkan
