@@ -92,3 +92,58 @@ fn test_host_info_in_prelude() {
     let build = vision_stimulus_engine::host::BuildInfo::from_compile_time();
     assert!(!build.vse_version.is_empty());
 }
+
+use vision_stimulus_engine::core::{
+    InputEvent, MonitorInfo, MonitorSelection, MouseButton, VideoModeInfo, WindowMode,
+};
+
+#[test]
+fn test_window_mode_default() {
+    let mode = WindowMode::default();
+    assert!(matches!(mode, WindowMode::Windowed));
+}
+
+#[test]
+fn test_monitor_selection_default() {
+    let sel = MonitorSelection::default();
+    assert!(matches!(sel, MonitorSelection::Primary));
+}
+
+#[test]
+fn test_mouse_button_variants() {
+    let left = MouseButton::Left;
+    let right = MouseButton::Right;
+    let middle = MouseButton::Middle;
+    let other = MouseButton::Other(4);
+    // Ensure they're distinct via Debug
+    assert_ne!(format!("{:?}", left), format!("{:?}", right));
+    assert_ne!(format!("{:?}", middle), format!("{:?}", other));
+}
+
+#[test]
+fn test_video_mode_info_fields() {
+    let mode = VideoModeInfo {
+        width: 1920,
+        height: 1080,
+        refresh_rate_hz: 144.0,
+        bit_depth: 32,
+    };
+    assert_eq!(mode.width, 1920);
+    assert_eq!(mode.refresh_rate_hz, 144.0);
+}
+
+#[test]
+fn test_monitor_info_fields() {
+    let info = MonitorInfo {
+        name: Some("Test Monitor".into()),
+        index: 0,
+        width: 2560,
+        height: 1440,
+        refresh_rate_hz: Some(165.0),
+        scale_factor: 1.0,
+        position: (0, 0),
+        video_modes: vec![],
+    };
+    assert_eq!(info.name.as_deref(), Some("Test Monitor"));
+    assert_eq!(info.width, 2560);
+}
