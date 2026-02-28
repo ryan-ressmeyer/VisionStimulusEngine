@@ -94,7 +94,7 @@ fn test_host_info_in_prelude() {
 }
 
 use vision_stimulus_engine::core::{
-    InputEvent, KeyCode, MonitorInfo, MonitorSelection, MouseButton, VideoModeInfo, WindowMode,
+    KeyCode, MonitorInfo, MonitorSelection, MouseButton, VideoModeInfo, WindowMode,
 };
 
 #[test]
@@ -150,20 +150,17 @@ fn test_monitor_info_fields() {
 
 #[test]
 fn test_builder_with_window_mode() {
-    let _builder = VSEContext::builder()
-        .with_window_mode(WindowMode::ExclusiveFullscreen);
+    let _builder = VSEContext::builder().with_window_mode(WindowMode::ExclusiveFullscreen);
 }
 
 #[test]
 fn test_builder_with_monitor() {
-    let _builder = VSEContext::builder()
-        .with_monitor(MonitorSelection::Index(1));
+    let _builder = VSEContext::builder().with_monitor(MonitorSelection::Index(1));
 }
 
 #[test]
 fn test_builder_with_cursor_visible() {
-    let _builder = VSEContext::builder()
-        .with_cursor_visible(false);
+    let _builder = VSEContext::builder().with_cursor_visible(false);
 }
 
 #[test]
