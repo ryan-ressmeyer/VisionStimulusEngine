@@ -1231,4 +1231,141 @@ impl<'a> RenderContext<'a> {
     pub fn cursor_visible(&self) -> bool {
         self.state.cursor_visible
     }
+
+    // === Monitor & video mode queries ===
+
+    /// Get information about all available monitors.
+    pub fn available_monitors(&self) -> Vec<MonitorInfo> {
+        self.state
+            .window
+            .available_monitors()
+            .enumerate()
+            .map(|(i, handle)| monitor_handle_to_info(i, &handle))
+            .collect()
+    }
+
+    /// Get information about the primary monitor, if available.
+    pub fn primary_monitor(&self) -> Option<MonitorInfo> {
+        self.state
+            .window
+            .primary_monitor()
+            .map(|handle| monitor_handle_to_info(0, &handle))
+    }
+
+    /// Get all video modes for a monitor by index.
+    pub fn video_modes(&self, monitor_index: usize) -> Vec<VideoModeInfo> {
+        let monitors: Vec<_> = self.state.window.available_monitors().collect();
+        monitors
+            .get(monitor_index)
+            .map(|handle| {
+                handle
+                    .video_modes()
+                    .map(|m| VideoModeInfo {
+                        width: m.size().width,
+                        height: m.size().height,
+                        refresh_rate_hz: m.refresh_rate_millihertz() as f64 / 1000.0,
+                        bit_depth: m.bit_depth(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get all video modes for the current monitor (the monitor the window is on).
+    pub fn current_monitor_video_modes(&self) -> Vec<VideoModeInfo> {
+        self.state
+            .window
+            .current_monitor()
+            .map(|handle| {
+                handle
+                    .video_modes()
+                    .map(|m| VideoModeInfo {
+                        width: m.size().width,
+                        height: m.size().height,
+                        refresh_rate_hz: m.refresh_rate_millihertz() as f64 / 1000.0,
+                        bit_depth: m.bit_depth(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get the current window display mode.
+    pub fn window_mode(&self) -> WindowMode {
+        self.state.window_mode
+    }
+
+    /// Change the window display mode at runtime.
+    ///
+    /// Switches between windowed, borderless fullscreen, and exclusive fullscreen.
+    /// Cursor visibility is automatically updated unless previously overridden
+    /// via [`set_cursor_visible`](Self::set_cursor_visible).
+    pub fn set_window_mode(&mut self, mode: WindowMode) {
+        let fullscreen = match mode {
+            WindowMode::Windowed => None,
+            WindowMode::BorderlessFullscreen => {
+                Some(Fullscreen::Borderless(self.state.window.current_monitor()))
+            }
+            WindowMode::ExclusiveFullscreen => {
+                if let Some(monitor) = self.state.window.current_monitor() {
+                    let best = monitor
+                        .video_modes()
+                        .max_by(|a, b| {
+                            let area_a = a.size().width * a.size().height;
+                            let area_b = b.size().width * b.size().height;
+                            area_a
+                                .cmp(&area_b)
+                                .then(a.refresh_rate_millihertz().cmp(&b.refresh_rate_millihertz()))
+                        });
+                    match best {
+                        Some(vm) => Some(Fullscreen::Exclusive(vm)),
+                        None => Some(Fullscreen::Borderless(Some(monitor))),
+                    }
+                } else {
+                    Some(Fullscreen::Borderless(None))
+                }
+            }
+        };
+        self.state.window.set_fullscreen(fullscreen);
+        self.state.window_mode = mode;
+
+        // Auto-update cursor visibility if not explicitly overridden by config
+        if self.config.cursor_visible.is_none() {
+            let visible = matches!(mode, WindowMode::Windowed);
+            self.state.cursor_visible = visible;
+            self.state.window.set_cursor_visible(visible);
+        }
+    }
+}
+
+/// Convert a winit MonitorHandle to our MonitorInfo type.
+fn monitor_handle_to_info(index: usize, handle: &winit::monitor::MonitorHandle) -> MonitorInfo {
+    let size = handle.size();
+    let position = handle.position();
+    let video_modes: Vec<VideoModeInfo> = handle
+        .video_modes()
+        .map(|m| VideoModeInfo {
+            width: m.size().width,
+            height: m.size().height,
+            refresh_rate_hz: m.refresh_rate_millihertz() as f64 / 1000.0,
+            bit_depth: m.bit_depth(),
+        })
+        .collect();
+
+    // Get refresh rate from the highest-res, highest-refresh video mode
+    let refresh_rate_hz = video_modes
+        .iter()
+        .map(|m| m.refresh_rate_hz)
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    MonitorInfo {
+        name: handle.name(),
+        index,
+        width: size.width,
+        height: size.height,
+        refresh_rate_hz,
+        scale_factor: handle.scale_factor(),
+        position: (position.x, position.y),
+        video_modes,
+    }
 }
