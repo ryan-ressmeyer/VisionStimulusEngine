@@ -11,9 +11,10 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use winit::{
-    dpi::PhysicalSize,
-    event::{Event, WindowEvent},
+    dpi::{LogicalPosition, PhysicalSize},
+    event::{ElementState, Event, MouseScrollDelta, WindowEvent},
     event_loop::{ControlFlow, EventLoop, EventLoopWindowTarget},
+    keyboard::PhysicalKey,
     window::{Fullscreen, Window, WindowBuilder},
 };
 
@@ -276,6 +277,9 @@ struct VSEState {
     renderer: Renderer,
     should_close: bool,
     minimized: bool,
+    input: InputState,
+    cursor_visible: bool,
+    window_mode: WindowMode,
     // Timing state
     clock: Clock,
     timing_provider: Box<dyn TimingProvider>,
@@ -435,9 +439,9 @@ impl VSEContext {
         let window = Arc::new(window);
 
         // Apply cursor visibility: auto-hide in fullscreen, visible in windowed, overridable
-        let cursor_visible = config.cursor_visible.unwrap_or_else(|| {
-            matches!(config.window_mode, WindowMode::Windowed)
-        });
+        let cursor_visible = config
+            .cursor_visible
+            .unwrap_or(matches!(config.window_mode, WindowMode::Windowed));
         window.set_cursor_visible(cursor_visible);
 
         info!(
@@ -501,6 +505,9 @@ impl VSEContext {
             renderer,
             should_close: false,
             minimized: false,
+            input: InputState::new(),
+            cursor_visible,
+            window_mode: config.window_mode,
             clock,
             timing_provider,
             flip_logger,
@@ -582,10 +589,89 @@ impl VSEContext {
                                     s.swapchain.mark_needs_recreation();
                                 }
                             }
+                            WindowEvent::KeyboardInput { event, .. } => {
+                                if let PhysicalKey::Code(key_code) = event.physical_key {
+                                    let timestamp = s.clock.now();
+                                    let logical_key = event.logical_key.clone();
+                                    match event.state {
+                                        ElementState::Pressed => {
+                                            let repeat = s.input.keys_down.contains(&key_code);
+                                            s.input.keys_down.insert(key_code);
+                                            if !repeat {
+                                                s.input.keys_just_pressed.insert(key_code);
+                                            }
+                                            s.input.events.push(InputEvent::KeyDown {
+                                                key_code,
+                                                logical_key,
+                                                timestamp,
+                                                repeat,
+                                            });
+                                        }
+                                        ElementState::Released => {
+                                            s.input.keys_down.remove(&key_code);
+                                            s.input.keys_just_released.insert(key_code);
+                                            s.input.events.push(InputEvent::KeyUp {
+                                                key_code,
+                                                logical_key,
+                                                timestamp,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            WindowEvent::CursorMoved { position, .. } => {
+                                let timestamp = s.clock.now();
+                                s.input.mouse_position = (position.x, position.y);
+                                s.input.events.push(InputEvent::MouseMove {
+                                    x: position.x,
+                                    y: position.y,
+                                    timestamp,
+                                });
+                            }
+                            WindowEvent::MouseInput { state: btn_state, button, .. } => {
+                                let timestamp = s.clock.now();
+                                let btn: MouseButton = button.into();
+                                let (mx, my) = s.input.mouse_position;
+                                match btn_state {
+                                    ElementState::Pressed => {
+                                        s.input.buttons_down.insert(btn);
+                                        s.input.buttons_just_pressed.insert(btn);
+                                        s.input.events.push(InputEvent::MouseDown {
+                                            button: btn,
+                                            x: mx,
+                                            y: my,
+                                            timestamp,
+                                        });
+                                    }
+                                    ElementState::Released => {
+                                        s.input.buttons_down.remove(&btn);
+                                        s.input.events.push(InputEvent::MouseUp {
+                                            button: btn,
+                                            x: mx,
+                                            y: my,
+                                            timestamp,
+                                        });
+                                    }
+                                }
+                            }
+                            WindowEvent::MouseWheel { delta, .. } => {
+                                let timestamp = s.clock.now();
+                                let (dx, dy) = match delta {
+                                    MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64),
+                                    MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
+                                };
+                                s.input.events.push(InputEvent::MouseWheel {
+                                    delta_x: dx,
+                                    delta_y: dy,
+                                    timestamp,
+                                });
+                            }
                             WindowEvent::RedrawRequested => {
                                 if s.minimized {
                                     return;
                                 }
+
+                                s.input.begin_frame();
 
                                 let mut render_ctx = RenderContext {
                                     state: s,
@@ -795,6 +881,9 @@ impl<'a> RenderContext<'a> {
         // Update state for next frame
         self.state.last_present_time = Some(present_time);
         self.state.frame_number += 1;
+
+        // Clear input event queue after the frame
+        self.state.input.clear_events();
 
         Ok(flip_info)
     }
