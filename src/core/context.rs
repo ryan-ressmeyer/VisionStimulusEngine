@@ -20,7 +20,10 @@ use winit::{
 
 use std::path::Path;
 
-use super::input::{InputEvent, InputState, MonitorInfo, MonitorSelection, MouseButton, VideoModeInfo, WindowMode};
+use super::input::{
+    InputEvent, InputState, KeyCode, MonitorInfo, MonitorSelection, MouseButton, VideoModeInfo,
+    WindowMode,
+};
 use super::{
     device::{DeviceError, DeviceSelector, GPUPreference},
     frame::{FrameBuilder, FrameError},
@@ -1164,5 +1167,68 @@ impl<'a> RenderContext<'a> {
             &self.state.swapchain,
             self.config,
         )
+    }
+
+    // === Input polling (frame-aligned) ===
+
+    /// Returns `true` if the key is currently held down.
+    pub fn key_pressed(&self, key: KeyCode) -> bool {
+        self.state.input.keys_down.contains(&key)
+    }
+
+    /// Returns `true` if the key was pressed this frame (not held from previous frame).
+    pub fn key_just_pressed(&self, key: KeyCode) -> bool {
+        self.state.input.keys_just_pressed.contains(&key)
+    }
+
+    /// Returns `true` if the key was released this frame.
+    pub fn key_just_released(&self, key: KeyCode) -> bool {
+        self.state.input.keys_just_released.contains(&key)
+    }
+
+    /// Get the current mouse position in window-relative pixels.
+    pub fn mouse_position(&self) -> (f64, f64) {
+        self.state.input.mouse_position
+    }
+
+    /// Returns `true` if the mouse button is currently held down.
+    pub fn mouse_button_pressed(&self, button: MouseButton) -> bool {
+        self.state.input.buttons_down.contains(&button)
+    }
+
+    /// Returns `true` if the mouse button was pressed this frame.
+    pub fn mouse_button_just_pressed(&self, button: MouseButton) -> bool {
+        self.state.input.buttons_just_pressed.contains(&button)
+    }
+
+    // === Event queue (timing-precise) ===
+
+    /// Get all input events since the last `flip()`.
+    ///
+    /// Each event carries a precise timestamp from the VSE `Clock`,
+    /// suitable for reaction-time measurement relative to `FlipInfo` timestamps.
+    pub fn input_events(&self) -> &[InputEvent] {
+        &self.state.input.events
+    }
+
+    // === Cursor control ===
+
+    /// Set whether the mouse cursor is visible.
+    pub fn set_cursor_visible(&mut self, visible: bool) {
+        self.state.cursor_visible = visible;
+        self.state.window.set_cursor_visible(visible);
+    }
+
+    /// Move the cursor to the specified position (logical pixels).
+    pub fn set_cursor_position(&self, x: f64, y: f64) {
+        let _ = self
+            .state
+            .window
+            .set_cursor_position(LogicalPosition::new(x, y));
+    }
+
+    /// Returns whether the cursor is currently visible.
+    pub fn cursor_visible(&self) -> bool {
+        self.state.cursor_visible
     }
 }
