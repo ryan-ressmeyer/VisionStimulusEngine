@@ -398,15 +398,19 @@ impl VSEContext {
                             m.size().width == config.window_width
                                 && m.size().height == config.window_height
                         })
-                        .max_by(|a, b| a.refresh_rate_millihertz().cmp(&b.refresh_rate_millihertz()))
+                        .max_by(|a, b| {
+                            a.refresh_rate_millihertz()
+                                .cmp(&b.refresh_rate_millihertz())
+                        })
                         .or_else(|| {
                             // Fall back to native resolution (highest refresh rate)
                             modes.iter().max_by(|a, b| {
                                 let area_a = a.size().width * a.size().height;
                                 let area_b = b.size().width * b.size().height;
-                                area_a
-                                    .cmp(&area_b)
-                                    .then(a.refresh_rate_millihertz().cmp(&b.refresh_rate_millihertz()))
+                                area_a.cmp(&area_b).then(
+                                    a.refresh_rate_millihertz()
+                                        .cmp(&b.refresh_rate_millihertz()),
+                                )
                             })
                         });
 
@@ -631,7 +635,11 @@ impl VSEContext {
                                     timestamp,
                                 });
                             }
-                            WindowEvent::MouseInput { state: btn_state, button, .. } => {
+                            WindowEvent::MouseInput {
+                                state: btn_state,
+                                button,
+                                ..
+                            } => {
                                 let timestamp = s.clock.now();
                                 let btn: MouseButton = button.into();
                                 let (mx, my) = s.input.mouse_position;
@@ -1308,15 +1316,14 @@ impl<'a> RenderContext<'a> {
             }
             WindowMode::ExclusiveFullscreen => {
                 if let Some(monitor) = self.state.window.current_monitor() {
-                    let best = monitor
-                        .video_modes()
-                        .max_by(|a, b| {
-                            let area_a = a.size().width * a.size().height;
-                            let area_b = b.size().width * b.size().height;
-                            area_a
-                                .cmp(&area_b)
-                                .then(a.refresh_rate_millihertz().cmp(&b.refresh_rate_millihertz()))
-                        });
+                    let best = monitor.video_modes().max_by(|a, b| {
+                        let area_a = a.size().width * a.size().height;
+                        let area_b = b.size().width * b.size().height;
+                        area_a.cmp(&area_b).then(
+                            a.refresh_rate_millihertz()
+                                .cmp(&b.refresh_rate_millihertz()),
+                        )
+                    });
                     match best {
                         Some(vm) => Some(Fullscreen::Exclusive(vm)),
                         None => Some(Fullscreen::Borderless(Some(monitor))),
