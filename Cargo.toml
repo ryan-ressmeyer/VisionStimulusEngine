@@ -80,6 +80,10 @@ path = "examples/05_advanced_stimuli.rs"
 name = "06_host_info"
 path = "examples/06_host_info.rs"
 
+[[example]]
+name = "07_fullscreen_input"
+path = "examples/07_fullscreen_input.rs"
+
 [[bench]]
 name = "frame_timing"
 harness = false
