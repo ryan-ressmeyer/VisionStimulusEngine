@@ -262,7 +262,12 @@ impl VSEContextBuilder {
     /// Override the video mode selected in DirectDisplay mode.
     ///
     /// Default: highest refresh rate at native resolution.
-    pub fn with_direct_display_video_mode(mut self, width: u32, height: u32, refresh_hz: f64) -> Self {
+    pub fn with_direct_display_video_mode(
+        mut self,
+        width: u32,
+        height: u32,
+        refresh_hz: f64,
+    ) -> Self {
         self.config.direct_display_video_mode = Some((width, height, refresh_hz));
         self
     }
@@ -599,8 +604,7 @@ impl VSEContext {
         };
 
         let (device_selector, instance) =
-            DeviceSelector::with_direct_display(config.gpu_preference)
-                .map_err(VSEError::Device)?;
+            DeviceSelector::with_direct_display(config.gpu_preference).map_err(VSEError::Device)?;
 
         let phys_dev = device_selector.physical_device().handle();
 
@@ -636,14 +640,13 @@ impl VSEContext {
 
         let clock = Clock::new();
 
-        let timing_provider: Box<dyn TimingProvider> =
-            if device_selector.supports_google_display_timing() {
-                Box::new(unsafe {
-                    GoogleDisplayTimingProvider::new(&device, swapchain.swapchain())
-                })
-            } else {
-                Box::new(CpuTimingProvider::new())
-            };
+        let timing_provider: Box<dyn TimingProvider> = if device_selector
+            .supports_google_display_timing()
+        {
+            Box::new(unsafe { GoogleDisplayTimingProvider::new(&device, swapchain.swapchain()) })
+        } else {
+            Box::new(CpuTimingProvider::new())
+        };
 
         let flip_logger = if config.flip_logging {
             let capacity = 3600 * 10;
@@ -1481,10 +1484,13 @@ impl<'a> RenderContext<'a> {
     ///
     /// # Example
     /// ```no_run
+    /// # use vision_stimulus_engine::prelude::*;
+    /// # fn example(vse: &mut RenderContext) {
     /// let backend = vse.display_backend();
     /// if backend.has_compositor() {
     ///     println!("Warning: frames pass through {}", backend.description());
     /// }
+    /// # }
     /// ```
     pub fn display_backend(&self) -> DisplayBackend {
         // Direct display mode: no window, check the stored acquisition method

@@ -40,9 +40,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut frame_count: u64 = 0;
 
     context.run(move |vse| {
-        // Print monitor info on first frame
+        // Print backend and monitor info on first frame
         if frame_count == 0 {
-            println!("\nConnected monitors:");
+            let backend = vse.display_backend();
+            println!("Display backend: {}", backend.description());
+            if backend.has_compositor() {
+                println!(
+                    "  Note: frames pass through an OS compositor — \
+                     timing jitter is possible. Direct display mode \
+                     (future VSE feature) bypasses this."
+                );
+            }
+            println!();
+            println!("Connected monitors:");
             for monitor in vse.available_monitors() {
                 println!(
                     "  [{}] {} - {}x{} @ {:.0} Hz (scale: {:.1}x)",
@@ -56,7 +66,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("    Video modes:");
                 let mut seen = std::collections::HashSet::new();
                 for mode in &monitor.video_modes {
-                    let key = (mode.width, mode.height, (mode.refresh_rate_hz * 10.0) as u32);
+                    let key = (
+                        mode.width,
+                        mode.height,
+                        (mode.refresh_rate_hz * 10.0) as u32,
+                    );
                     if seen.insert(key) {
                         println!(
                             "      {}x{} @ {:.1} Hz ({}-bit)",

@@ -6,13 +6,13 @@
 
 mod context;
 mod device;
+#[cfg(target_os = "linux")]
+pub(crate) mod direct_display;
+#[cfg(target_os = "linux")]
+pub(crate) mod evdev_input;
 mod frame;
 pub(crate) mod input;
 mod swapchain;
-#[cfg(target_os = "linux")]
-pub(crate) mod evdev_input;
-#[cfg(target_os = "linux")]
-pub(crate) mod direct_display;
 
 // Public API exports
 pub use context::{RenderContext, VSEConfig, VSEContext, VSEContextBuilder, VSEError};

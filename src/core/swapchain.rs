@@ -345,17 +345,19 @@ impl SwapchainManager {
         Ok(())
     }
 
-    /// Recreate the swapchain with current dimensions from surface
-    pub fn recreate_from_surface(&mut self) -> Result<(), SwapchainError> {
+    /// Recreate the swapchain with current dimensions from surface.
+    ///
+    /// `window_size` is used as the fallback extent when the Vulkan surface
+    /// does not report a `current_extent` (common on Wayland for new surfaces
+    /// and immediately after going fullscreen). Pass `window.inner_size()`.
+    pub fn recreate_from_surface(&mut self, window_size: [u32; 2]) -> Result<(), SwapchainError> {
         let surface_capabilities = self
             .device
             .physical_device()
             .surface_capabilities(&self.surface, Default::default())
             .map_err(|e| SwapchainError::CreationFailed(e.to_string()))?;
 
-        let extent = surface_capabilities
-            .current_extent
-            .unwrap_or([self.config.width, self.config.height]);
+        let extent = surface_capabilities.current_extent.unwrap_or(window_size);
 
         // Don't recreate if dimensions are zero (window minimized)
         if extent[0] == 0 || extent[1] == 0 {

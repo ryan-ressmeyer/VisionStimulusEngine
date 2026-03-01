@@ -37,22 +37,21 @@ struct ProbeFailure {
 // ─── Shared ash setup helper ────────────────────────────────────────────────
 
 /// Construct an ash Entry + ash Instance backed by vulkano's already-loaded library.
-fn make_ash_objects(
-    instance: &Arc<Instance>,
-) -> Result<(ash::Entry, ash::Instance), String> {
+fn make_ash_objects(instance: &Arc<Instance>) -> Result<(ash::Entry, ash::Instance), String> {
     // Re-open libvulkan via ash (it's already in memory from vulkano).
-    let entry = unsafe { ash::Entry::load() }
-        .map_err(|e| format!("ash::Entry::load failed: {}", e))?;
+    let entry =
+        unsafe { ash::Entry::load() }.map_err(|e| format!("ash::Entry::load failed: {}", e))?;
 
     // Construct an ash::Instance whose function pointers come from vulkano's loader.
     let vk_instance = instance.handle();
     let ash_instance = unsafe {
         ash::Instance::load_with(
             |name| {
-                std::mem::transmute(instance.library().get_instance_proc_addr(
-                    vk_instance,
-                    name.as_ptr(),
-                ))
+                std::mem::transmute(
+                    instance
+                        .library()
+                        .get_instance_proc_addr(vk_instance, name.as_ptr()),
+                )
             },
             vk_instance,
         )
@@ -63,13 +62,15 @@ fn make_ash_objects(
 // ─── Helper: wrap raw VkSurfaceKHR ──────────────────────────────────────────
 
 /// Wrap a raw `ash::vk::SurfaceKHR` into a `vulkano::swapchain::Surface`.
-fn wrap_surface(
-    instance: &Arc<Instance>,
-    surface_handle: ash::vk::SurfaceKHR,
-) -> Arc<Surface> {
+fn wrap_surface(instance: &Arc<Instance>, surface_handle: ash::vk::SurfaceKHR) -> Arc<Surface> {
     // Surface::from_handle returns Self directly (not Result).
     Arc::new(unsafe {
-        Surface::from_handle(Arc::clone(instance), surface_handle, SurfaceApi::DisplayPlane, None)
+        Surface::from_handle(
+            Arc::clone(instance),
+            surface_handle,
+            SurfaceApi::DisplayPlane,
+            None,
+        )
     })
 }
 
@@ -112,10 +113,14 @@ fn select_video_mode(
                 && (m.parameters.refresh_rate as i32 - target_millihertz as i32).abs() < 500
         })
     } else {
-        modes.iter().enumerate().max_by_key(|(_, m)| {
-            let area = m.parameters.visible_region.width * m.parameters.visible_region.height;
-            (area, m.parameters.refresh_rate)
-        }).map(|(i, _)| i)
+        modes
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, m)| {
+                let area = m.parameters.visible_region.width * m.parameters.visible_region.height;
+                (area, m.parameters.refresh_rate)
+            })
+            .map(|(i, _)| i)
     }
 }
 
@@ -359,22 +364,18 @@ fn probe_xlib_acquire(
     })?;
 
     // Runtime load libX11
-    let lib_x11 =
-        unsafe { libloading::Library::new("libX11.so.6") }.map_err(|e| ProbeFailure {
-            method: AcquisitionMethod::XlibAcquire,
-            reason: format!("libX11.so.6 not found — X11 not installed: {}", e),
-        })?;
+    let lib_x11 = unsafe { libloading::Library::new("libX11.so.6") }.map_err(|e| ProbeFailure {
+        method: AcquisitionMethod::XlibAcquire,
+        reason: format!("libX11.so.6 not found — X11 not installed: {}", e),
+    })?;
 
     // XOpenDisplay(NULL) — connect to $DISPLAY
-    type XOpenDisplayFn =
-        unsafe extern "C" fn(*const std::ffi::c_char) -> *mut std::ffi::c_void;
+    type XOpenDisplayFn = unsafe extern "C" fn(*const std::ffi::c_char) -> *mut std::ffi::c_void;
     let x_open_display: libloading::Symbol<XOpenDisplayFn> = unsafe {
-        lib_x11
-            .get(b"XOpenDisplay\0")
-            .map_err(|e| ProbeFailure {
-                method: AcquisitionMethod::XlibAcquire,
-                reason: format!("XOpenDisplay symbol not found: {}", e),
-            })?
+        lib_x11.get(b"XOpenDisplay\0").map_err(|e| ProbeFailure {
+            method: AcquisitionMethod::XlibAcquire,
+            reason: format!("XOpenDisplay symbol not found: {}", e),
+        })?
     };
 
     let x_display = unsafe { x_open_display(std::ptr::null()) };
@@ -510,7 +511,9 @@ pub(crate) fn acquire_display(
     }
 
     let msg = format_unavailable_message(display_label, &failures);
-    Err(crate::core::context::VSEError::DirectDisplayUnavailable(msg))
+    Err(crate::core::context::VSEError::DirectDisplayUnavailable(
+        msg,
+    ))
 }
 
 /// Default probe order.

@@ -47,11 +47,9 @@ impl EvdevReader {
         }
 
         if keyboards.is_empty() && pointers.is_empty() {
-            return Err(
-                "No readable input devices found in /dev/input/. \
+            return Err("No readable input devices found in /dev/input/. \
                  Try: sudo usermod -aG input $USER  (then re-login)"
-                    .to_string(),
-            );
+                .to_string());
         }
 
         Ok(Self {
@@ -117,12 +115,14 @@ impl EvdevReader {
                     if ev.value() == 1 {
                         input.buttons_down.insert(btn);
                         input.buttons_just_pressed.insert(btn);
-                        input.events.push(crate::core::input::InputEvent::MouseDown {
-                            button: btn,
-                            x: mx,
-                            y: my,
-                            timestamp,
-                        });
+                        input
+                            .events
+                            .push(crate::core::input::InputEvent::MouseDown {
+                                button: btn,
+                                x: mx,
+                                y: my,
+                                timestamp,
+                            });
                     } else if ev.value() == 0 {
                         input.buttons_down.remove(&btn);
                         input.events.push(crate::core::input::InputEvent::MouseUp {
