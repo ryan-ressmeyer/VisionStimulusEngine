@@ -26,9 +26,10 @@ pub mod timing;
 // Re-export commonly used types
 pub mod prelude {
     pub use crate::core::{
-        DeviceSelector, Frame, GPUPreference, InputEvent, KeyCode, MonitorInfo, MonitorSelection,
-        MouseButton, NamedKey, PresentMode, RenderContext, SwapchainConfig, SwapchainManager,
-        VSEContext, VSEContextBuilder, VSEError, VideoModeInfo, WindowMode,
+        AcquisitionMethod, DeviceSelector, DisplayBackend, Frame, GPUPreference, InputEvent,
+        KeyCode, MonitorInfo, MonitorSelection, MouseButton, NamedKey, PresentMode, RenderContext,
+        SwapchainConfig, SwapchainManager, VSEContext, VSEContextBuilder, VSEError, VideoModeInfo,
+        WindowMode,
     };
     pub use crate::drawing::{
         Color, GaborParams, GratingParams, NoiseParams, NoiseType, TextureHandle, WaveType,

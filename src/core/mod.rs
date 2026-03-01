@@ -19,7 +19,7 @@ pub use context::{RenderContext, VSEConfig, VSEContext, VSEContextBuilder, VSEEr
 pub use device::{DeviceError, DeviceSelector, GPUPreference};
 pub use frame::{Frame, FrameError};
 pub use input::{
-    DisplayBackend, InputEvent, Key, KeyCode, MonitorInfo, MonitorSelection, MouseButton, NamedKey,
-    PhysicalKey, VideoModeInfo, WindowMode,
+    AcquisitionMethod, DisplayBackend, InputEvent, Key, KeyCode, MonitorInfo, MonitorSelection,
+    MouseButton, NamedKey, PhysicalKey, VideoModeInfo, WindowMode,
 };
 pub use swapchain::{PresentMode, SwapchainConfig, SwapchainError, SwapchainManager};
