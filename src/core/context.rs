@@ -21,8 +21,8 @@ use winit::{
 use std::path::Path;
 
 use super::input::{
-    InputEvent, InputState, KeyCode, MonitorInfo, MonitorSelection, MouseButton, VideoModeInfo,
-    WindowMode,
+    AcquisitionMethod, DisplayBackend, InputEvent, InputState, KeyCode, MonitorInfo,
+    MonitorSelection, MouseButton, VideoModeInfo, WindowMode,
 };
 use super::{
     device::{DeviceError, DeviceSelector, GPUPreference},
@@ -65,6 +65,18 @@ pub enum VSEError {
     /// Event loop error
     #[error("Event loop error: {0}")]
     EventLoop(String),
+
+    /// All acquisition methods were tried and failed.
+    /// The string contains a formatted diagnostic listing each failure reason.
+    #[error("Direct display mode unavailable: {0}")]
+    DirectDisplayUnavailable(String),
+
+    /// Acquisition succeeded but a subsequent setup step failed.
+    #[error("Direct display setup failed (acquired via {method:?}): {reason}")]
+    DirectDisplaySetupFailed {
+        method: AcquisitionMethod,
+        reason: String,
+    },
 }
 
 /// Configuration for VSEContext
@@ -451,9 +463,10 @@ impl VSEContext {
             .unwrap_or(matches!(config.window_mode, WindowMode::Windowed));
         window.set_cursor_visible(cursor_visible);
 
+        let actual_size = window.inner_size();
         info!(
             "Window created: {}x{} mode={:?} cursor_visible={}",
-            config.window_width, config.window_height, config.window_mode, cursor_visible
+            actual_size.width, actual_size.height, config.window_mode, cursor_visible
         );
 
         // Initialize Vulkan
@@ -462,9 +475,13 @@ impl VSEContext {
 
         let (device, queue) = device_selector.create_device()?;
 
+        // Use the actual window size, not the configured size. In fullscreen
+        // modes the OS/compositor will have already sized the window to the
+        // monitor before Vulkan initialization runs.
+        let win_size = window.inner_size();
         let swapchain_config = SwapchainConfig {
-            width: config.window_width,
-            height: config.window_height,
+            width: win_size.width,
+            height: win_size.height,
             present_mode: config.present_mode,
             image_count: 2,
         };
@@ -682,8 +699,6 @@ impl VSEContext {
                                     return;
                                 }
 
-                                s.input.begin_frame();
-
                                 let mut render_ctx = RenderContext {
                                     state: s,
                                     config: &mut config,
@@ -694,6 +709,13 @@ impl VSEContext {
                                     *error_clone.borrow_mut() = Some(e);
                                     elwt.exit();
                                 }
+
+                                // Clear per-frame input state AFTER the callback runs.
+                                // KeyboardInput/MouseInput events arrive before RedrawRequested
+                                // in the same event loop iteration, so begin_frame() must run
+                                // after the callback — not before — or it would erase those events
+                                // before the callback ever sees them.
+                                s.input.begin_frame();
                             }
                             _ => {}
                         }
@@ -759,8 +781,10 @@ impl<'a> RenderContext<'a> {
         }
 
         // Handle swapchain recreation if needed
+        let win_size = self.state.window.inner_size();
+        let win_size_arr = [win_size.width, win_size.height];
         if self.state.swapchain.needs_recreation() {
-            self.state.swapchain.recreate_from_surface()?;
+            self.state.swapchain.recreate_from_surface(win_size_arr)?;
         }
 
         // Acquire next image
@@ -768,7 +792,7 @@ impl<'a> RenderContext<'a> {
             match self.state.swapchain.acquire_next_image() {
                 Ok(result) => result,
                 Err(SwapchainError::OutOfDate) => {
-                    self.state.swapchain.recreate_from_surface()?;
+                    self.state.swapchain.recreate_from_surface(win_size_arr)?;
                     let info = FlipInfo::skipped(self.state.frame_number);
                     self.state.frame_number += 1;
                     return Ok(info);
@@ -914,10 +938,12 @@ impl<'a> RenderContext<'a> {
         self.config.clear_color
     }
 
-    /// Get the window dimensions
+    /// Get the window dimensions in physical pixels.
+    ///
+    /// In fullscreen modes this returns the monitor's native resolution.
     pub fn window_size(&self) -> (u32, u32) {
-        let extent = self.state.swapchain.extent();
-        (extent[0], extent[1])
+        let size = self.state.window.inner_size();
+        (size.width, size.height)
     }
 
     /// Get the device (for advanced users)
@@ -1240,13 +1266,50 @@ impl<'a> RenderContext<'a> {
         self.state.cursor_visible
     }
 
+    // === Display backend detection ===
+
+    /// Detect the display backend (windowing system) used for this session.
+    ///
+    /// Derived from the raw window handle type. Use this to warn users when
+    /// running under X11/XWayland, which has higher timing jitter than native
+    /// Wayland or direct display mode.
+    ///
+    /// # Example
+    /// ```no_run
+    /// let backend = vse.display_backend();
+    /// if backend.has_compositor() {
+    ///     println!("Warning: frames pass through {}", backend.description());
+    /// }
+    /// ```
+    pub fn display_backend(&self) -> DisplayBackend {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        match self.state.window.window_handle().map(|h| h.as_raw()) {
+            Ok(RawWindowHandle::Wayland(_)) => DisplayBackend::Wayland,
+            Ok(RawWindowHandle::Xcb(_)) | Ok(RawWindowHandle::Xlib(_)) => DisplayBackend::X11,
+            Ok(RawWindowHandle::Win32(_)) => DisplayBackend::Windows,
+            Ok(RawWindowHandle::AppKit(_)) => DisplayBackend::MacOS,
+            _ => DisplayBackend::Unknown,
+        }
+    }
+
     // === Monitor & video mode queries ===
 
     /// Get information about all available monitors.
+    ///
+    /// Duplicates are filtered: some Wayland compositors advertise the same physical
+    /// output via multiple `wl_output` globals. Monitors are considered identical if
+    /// they share the same name, resolution, and desktop position.
     pub fn available_monitors(&self) -> Vec<MonitorInfo> {
+        let mut seen = std::collections::HashSet::new();
         self.state
             .window
             .available_monitors()
+            .filter(|handle| {
+                let pos = handle.position();
+                let size = handle.size();
+                let key = (handle.name(), size.width, size.height, pos.x, pos.y);
+                seen.insert(key)
+            })
             .enumerate()
             .map(|(i, handle)| monitor_handle_to_info(i, &handle))
             .collect()
@@ -1374,5 +1437,19 @@ fn monitor_handle_to_info(index: usize, handle: &winit::monitor::MonitorHandle) 
         scale_factor: handle.scale_factor(),
         position: (position.x, position.y),
         video_modes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_display_unavailable_error_contains_tried_methods() {
+        let msg = "Tried:\n  \u{2717} No-compositor: held by compositor\n  \u{2717} DRM acquire: permission denied";
+        let err = VSEError::DirectDisplayUnavailable(msg.to_string());
+        let display = format!("{}", err);
+        assert!(display.contains("Tried:"));
+        assert!(display.contains("Direct display"));
     }
 }
