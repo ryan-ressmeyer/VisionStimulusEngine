@@ -9,13 +9,15 @@ mod device;
 mod frame;
 pub(crate) mod input;
 mod swapchain;
+#[cfg(target_os = "linux")]
+pub(crate) mod evdev_input;
 
 // Public API exports
 pub use context::{RenderContext, VSEConfig, VSEContext, VSEContextBuilder, VSEError};
 pub use device::{DeviceError, DeviceSelector, GPUPreference};
 pub use frame::{Frame, FrameError};
 pub use input::{
-    InputEvent, Key, KeyCode, MonitorInfo, MonitorSelection, MouseButton, NamedKey, PhysicalKey,
-    VideoModeInfo, WindowMode,
+    DisplayBackend, InputEvent, Key, KeyCode, MonitorInfo, MonitorSelection, MouseButton, NamedKey,
+    PhysicalKey, VideoModeInfo, WindowMode,
 };
 pub use swapchain::{PresentMode, SwapchainConfig, SwapchainError, SwapchainManager};
