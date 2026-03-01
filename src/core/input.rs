@@ -90,6 +90,14 @@ pub enum WindowMode {
     /// Lowest latency, guaranteed vsync ownership.
     /// Falls back to `BorderlessFullscreen` on Wayland.
     ExclusiveFullscreen,
+    /// Bypass the OS compositor entirely via VK_KHR_display.
+    ///
+    /// Acquires exclusive access to the physical display using a cascading
+    /// probe: (1) no-compositor TTY check, (2) VK_EXT_acquire_drm_display,
+    /// (3) VK_EXT_acquire_xlib_display. Input is sourced from evdev.
+    ///
+    /// Linux only. See `docs/guides/display_backends.md` for setup.
+    DirectDisplay,
 }
 
 /// Which monitor to use for fullscreen modes.
@@ -241,6 +249,13 @@ impl InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_mode_direct_display_is_distinct() {
+        assert_ne!(WindowMode::DirectDisplay, WindowMode::BorderlessFullscreen);
+        assert_ne!(WindowMode::DirectDisplay, WindowMode::ExclusiveFullscreen);
+        assert_ne!(WindowMode::DirectDisplay, WindowMode::Windowed);
+    }
 
     #[test]
     fn acquisition_method_has_compositor_flag() {

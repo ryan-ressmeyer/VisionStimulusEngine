@@ -107,6 +107,12 @@ pub struct VSEConfig {
     pub monitor_selection: MonitorSelection,
     /// Whether the cursor is visible. None means auto (hidden in fullscreen, visible in windowed).
     pub cursor_visible: Option<bool>,
+    /// Override video mode for DirectDisplay (width, height, refresh_hz).
+    /// Default: highest refresh rate at native resolution.
+    pub direct_display_video_mode: Option<(u32, u32, f64)>,
+    /// Override acquisition probe order for DirectDisplay mode.
+    /// Default: [NoCompositor, DrmAcquire, XlibAcquire].
+    pub direct_display_acquisition_order: Option<Vec<AcquisitionMethod>>,
 }
 
 impl Default for VSEConfig {
@@ -124,6 +130,8 @@ impl Default for VSEConfig {
             window_mode: WindowMode::default(),
             monitor_selection: MonitorSelection::default(),
             cursor_visible: None,
+            direct_display_video_mode: None,
+            direct_display_acquisition_order: None,
         }
     }
 }
@@ -248,6 +256,23 @@ impl VSEContextBuilder {
     /// in windowed mode. This override applies regardless of window mode.
     pub fn with_cursor_visible(mut self, visible: bool) -> Self {
         self.config.cursor_visible = Some(visible);
+        self
+    }
+
+    /// Override the video mode selected in DirectDisplay mode.
+    ///
+    /// Default: highest refresh rate at native resolution.
+    pub fn with_direct_display_video_mode(mut self, width: u32, height: u32, refresh_hz: f64) -> Self {
+        self.config.direct_display_video_mode = Some((width, height, refresh_hz));
+        self
+    }
+
+    /// Override the acquisition probe order for DirectDisplay mode.
+    ///
+    /// Default: [NoCompositor, DrmAcquire, XlibAcquire].
+    /// Use this if you know your environment and want to skip failed probes.
+    pub fn with_acquisition_order(mut self, order: Vec<AcquisitionMethod>) -> Self {
+        self.config.direct_display_acquisition_order = Some(order);
         self
     }
 
@@ -394,7 +419,7 @@ impl VSEContext {
 
         // --- Build fullscreen setting ---
         let fullscreen = match config.window_mode {
-            WindowMode::Windowed => None,
+            WindowMode::Windowed | WindowMode::DirectDisplay => None,
             WindowMode::BorderlessFullscreen => {
                 Some(Fullscreen::Borderless(target_monitor.clone()))
             }
@@ -1372,8 +1397,13 @@ impl<'a> RenderContext<'a> {
     /// Cursor visibility is automatically updated unless previously overridden
     /// via [`set_cursor_visible`](Self::set_cursor_visible).
     pub fn set_window_mode(&mut self, mode: WindowMode) {
+        if mode == WindowMode::DirectDisplay {
+            warn!("set_window_mode(DirectDisplay) has no effect — use WindowMode::DirectDisplay in the builder");
+            return;
+        }
         let fullscreen = match mode {
             WindowMode::Windowed => None,
+            WindowMode::DirectDisplay => unreachable!(),
             WindowMode::BorderlessFullscreen => {
                 Some(Fullscreen::Borderless(self.state.window.current_monitor()))
             }
