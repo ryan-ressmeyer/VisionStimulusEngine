@@ -93,6 +93,10 @@ path = "examples/06_host_info.rs"
 name = "07_fullscreen_input"
 path = "examples/07_fullscreen_input.rs"
 
+[[example]]
+name = "08_direct_display"
+path = "examples/08_direct_display.rs"
+
 [[bench]]
 name = "frame_timing"
 harness = false
