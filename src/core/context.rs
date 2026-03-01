@@ -586,6 +586,152 @@ impl VSEContext {
         })
     }
 
+    /// Initialize Vulkan state for direct display mode (no winit, no compositor).
+    #[cfg(target_os = "linux")]
+    fn initialize_direct(config: &VSEConfig) -> Result<VSEState, VSEError> {
+        use crate::core::direct_display::{acquire_display, default_acquisition_order};
+        use crate::core::evdev_input::EvdevReader;
+        use vulkano::VulkanObject;
+
+        let target_name = match &config.monitor_selection {
+            MonitorSelection::Name(n) => Some(n.as_str()),
+            _ => None,
+        };
+
+        let (device_selector, instance) =
+            DeviceSelector::with_direct_display(config.gpu_preference)
+                .map_err(VSEError::Device)?;
+
+        let phys_dev = device_selector.physical_device().handle();
+
+        let order = config
+            .direct_display_acquisition_order
+            .clone()
+            .unwrap_or_else(default_acquisition_order);
+
+        let direct_surface = acquire_display(
+            &instance,
+            phys_dev,
+            target_name,
+            config.direct_display_video_mode,
+            &order,
+        )?;
+
+        let (width, height) = (direct_surface.width, direct_surface.height);
+        let method = direct_surface.method;
+        let surface = direct_surface.surface;
+
+        let (device, queue) = device_selector.create_device().map_err(VSEError::Device)?;
+
+        let swapchain_config = SwapchainConfig {
+            width,
+            height,
+            present_mode: config.present_mode,
+            image_count: 2,
+        };
+
+        let swapchain = SwapchainManager::new(device.clone(), surface, swapchain_config)?;
+        let frame_builder = FrameBuilder::new(device.clone(), queue.clone());
+        let renderer = Renderer::new(device.clone(), queue.clone(), swapchain.format())?;
+
+        let clock = Clock::new();
+
+        let timing_provider: Box<dyn TimingProvider> =
+            if device_selector.supports_google_display_timing() {
+                Box::new(unsafe {
+                    GoogleDisplayTimingProvider::new(&device, swapchain.swapchain())
+                })
+            } else {
+                Box::new(CpuTimingProvider::new())
+            };
+
+        let flip_logger = if config.flip_logging {
+            let capacity = 3600 * 10;
+            Some(match &config.flip_log_csv_path {
+                Some(path) => FlipLogger::with_csv(path.clone(), capacity),
+                None => FlipLogger::new(capacity),
+            })
+        } else {
+            None
+        };
+
+        let expected_frame_duration = config
+            .expected_refresh_rate
+            .map(|hz| Duration::from_micros((1_000_000.0 / hz) as u64));
+
+        let evdev_reader = match EvdevReader::open() {
+            Ok(mut r) => {
+                r.set_display_size(width, height);
+                r
+            }
+            Err(msg) => {
+                warn!("evdev input unavailable: {}", msg);
+                EvdevReader::empty()
+            }
+        };
+
+        info!("Direct display initialization complete");
+
+        Ok(VSEState {
+            window: None,
+            device_selector,
+            device,
+            queue,
+            swapchain,
+            frame_builder,
+            renderer,
+            should_close: false,
+            minimized: false,
+            input: InputState::new(),
+            cursor_visible: false,
+            window_mode: WindowMode::DirectDisplay,
+            clock,
+            timing_provider,
+            flip_logger,
+            frame_number: 0,
+            last_present_time: None,
+            expected_frame_duration,
+            refresh_detect_samples: Vec::with_capacity(10),
+            input_source: InputSource::Evdev(evdev_reader),
+            display_size: (width, height),
+            acquired_display: Some(method),
+        })
+    }
+
+    /// Run the direct display render loop (no winit).
+    #[cfg(target_os = "linux")]
+    fn run_direct<F>(self, mut render_fn: F) -> Result<(), VSEError>
+    where
+        F: FnMut(&mut RenderContext) -> Result<(), VSEError> + 'static,
+    {
+        let mut state = Self::initialize_direct(&self.config)?;
+        let mut config = self.config;
+
+        loop {
+            if let InputSource::Evdev(ref mut reader) = state.input_source {
+                reader.poll(&mut state.input, &state.clock);
+            }
+            state.input.begin_frame();
+
+            let mut render_ctx = RenderContext {
+                state: &mut state,
+                config: &mut config,
+            };
+
+            if let Err(e) = render_fn(&mut render_ctx) {
+                warn!("Render error: {}", e);
+                return Err(e);
+            }
+
+            if state.should_close {
+                break;
+            }
+        }
+
+        info!("Direct display loop exited");
+        Ok(())
+    }
+
     /// Run the main event loop
     ///
     /// This method takes ownership of the context and runs the event loop
@@ -603,6 +749,18 @@ impl VSEContext {
     where
         F: FnMut(&mut RenderContext) -> Result<(), VSEError> + 'static,
     {
+        // Branch for direct display mode (Linux only — no winit event loop)
+        #[cfg(target_os = "linux")]
+        if self.config.window_mode == WindowMode::DirectDisplay {
+            return self.run_direct(render_fn);
+        }
+        #[cfg(not(target_os = "linux"))]
+        if self.config.window_mode == WindowMode::DirectDisplay {
+            return Err(VSEError::DirectDisplayUnavailable(
+                "Direct display mode is only supported on Linux".to_string(),
+            ));
+        }
+
         let event_loop = self
             .event_loop
             .take()
