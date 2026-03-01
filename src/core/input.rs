@@ -4,6 +4,79 @@ use crate::timing::Timestamp;
 use std::collections::HashSet;
 pub use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 
+/// How VSE acquired exclusive access to the display in DirectDisplay mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AcquisitionMethod {
+    /// No compositor was running — display was unclaimed (TTY / bare session).
+    NoCompositor,
+    /// Acquired via VK_EXT_acquire_drm_display (requires video group or root).
+    DrmAcquire,
+    /// Acquired via VK_EXT_acquire_xlib_display (requires DISPLAY env var).
+    XlibAcquire,
+}
+
+/// The display backend (windowing system) used for this session.
+///
+/// Detected at runtime from the window handle type. Important for understanding
+/// timing characteristics: compositor-mediated backends (Wayland, X11) add latency
+/// between your `flip()` call and the actual scanout. Direct display mode bypasses
+/// all compositors for true frame-accurate presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DisplayBackend {
+    /// Native Wayland — the Wayland compositor mediates presentation.
+    /// Each frame passes through the compositor before reaching the display.
+    Wayland,
+    /// X11 or XWayland — using the X11 protocol, either via a native X server
+    /// or through the XWayland compatibility layer inside a Wayland session.
+    /// Adds an extra compositor hop compared to native Wayland.
+    X11,
+    /// Windows (Win32/DirectComposition).
+    Windows,
+    /// macOS (AppKit/Metal).
+    MacOS,
+    /// Bypassed the OS compositor via VK_KHR_display.
+    DirectDisplay { method: AcquisitionMethod },
+    /// Could not determine the backend from the window handle type.
+    Unknown,
+}
+
+impl DisplayBackend {
+    /// Whether this backend routes frames through an OS compositor.
+    pub fn has_compositor(&self) -> bool {
+        matches!(
+            self,
+            DisplayBackend::Wayland | DisplayBackend::X11 | DisplayBackend::Unknown
+        )
+        // DirectDisplay, Windows, MacOS return false
+    }
+
+    /// Human-readable name and description of this backend.
+    pub fn description(&self) -> &'static str {
+        match self {
+            DisplayBackend::Wayland => {
+                "Wayland — compositor-mediated presentation (GNOME/Mutter, KDE/KWin, etc.)"
+            }
+            DisplayBackend::X11 => {
+                "X11/XWayland — X protocol; on modern Ubuntu this is XWayland inside Wayland"
+            }
+            DisplayBackend::Windows => "Windows — Win32/DirectComposition",
+            DisplayBackend::MacOS => "macOS — AppKit/Metal",
+            DisplayBackend::DirectDisplay { method } => match method {
+                AcquisitionMethod::NoCompositor => {
+                    "Direct display — no compositor (TTY/bare session)"
+                }
+                AcquisitionMethod::DrmAcquire => {
+                    "Direct display — DRM acquire (VK_EXT_acquire_drm_display)"
+                }
+                AcquisitionMethod::XlibAcquire => {
+                    "Direct display — Xlib acquire (VK_EXT_acquire_xlib_display)"
+                }
+            },
+            DisplayBackend::Unknown => "Unknown display backend",
+        }
+    }
+}
+
 /// How the window should be displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WindowMode {
@@ -162,5 +235,29 @@ impl InputState {
     /// Clear the event queue. Called on flip().
     pub(crate) fn clear_events(&mut self) {
         self.events.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acquisition_method_has_compositor_flag() {
+        let backend = DisplayBackend::DirectDisplay {
+            method: AcquisitionMethod::DrmAcquire,
+        };
+        assert!(!backend.has_compositor());
+        assert!(DisplayBackend::Wayland.has_compositor());
+        assert!(DisplayBackend::X11.has_compositor());
+    }
+
+    #[test]
+    fn display_backend_direct_description() {
+        let backend = DisplayBackend::DirectDisplay {
+            method: AcquisitionMethod::NoCompositor,
+        };
+        let desc = backend.description();
+        assert!(desc.contains("direct") || desc.contains("Direct"));
     }
 }
