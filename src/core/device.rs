@@ -137,6 +137,66 @@ impl DeviceSelector {
         })
     }
 
+    /// Create a device selector for direct display mode (no window/compositor).
+    ///
+    /// Enables VK_KHR_display and the acquisition extensions
+    /// (VK_EXT_acquire_drm_display, VK_EXT_acquire_xlib_display).
+    /// Returns the selector plus the Arc<Instance> needed by the direct display
+    /// acquisition code.
+    #[cfg(target_os = "linux")]
+    pub fn with_direct_display(
+        preference: GPUPreference,
+    ) -> Result<(Self, Arc<Instance>), DeviceError> {
+        let library =
+            VulkanLibrary::new().map_err(|e| DeviceError::LibraryLoadFailed(e.to_string()))?;
+
+        info!("Vulkan library loaded successfully");
+
+        let requested = InstanceExtensions {
+            khr_display: true,
+            ext_acquire_drm_display: true,
+            ext_acquire_xlib_display: true,
+            ..InstanceExtensions::empty()
+        };
+
+        // Mask out extensions not supported by this Vulkan installation.
+        let supported = library.supported_extensions();
+        let enabled_extensions = requested.intersection(supported);
+
+        if !enabled_extensions.khr_display {
+            return Err(DeviceError::InstanceCreationFailed(
+                "VK_KHR_display not supported by this Vulkan installation".to_string(),
+            ));
+        }
+
+        let instance = Instance::new(
+            library,
+            InstanceCreateInfo {
+                flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+                enabled_extensions,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| DeviceError::InstanceCreationFailed(e.to_string()))?;
+
+        info!("Vulkan instance created with direct display extensions");
+
+        let (physical_device, queue_family_index) =
+            Self::select_physical_device(&instance, preference)?;
+
+        let device_name = physical_device.properties().device_name.clone();
+        let device_type = physical_device.properties().device_type;
+        info!("Selected GPU: {} ({:?})", device_name, device_type);
+
+        let selector = Self {
+            instance: Arc::clone(&instance),
+            physical_device,
+            graphics_queue_family_index: queue_family_index,
+        };
+
+        Ok((selector, instance))
+    }
+
     /// Create a new device selector with surface requirements
     ///
     /// This variant ensures the selected device can present to the given window.
