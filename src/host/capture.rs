@@ -131,20 +131,29 @@ pub fn capture_gpu_info(physical_device: &Arc<PhysicalDevice>) -> GpuInfo {
 }
 
 /// Capture display info from winit window
-pub fn capture_display_info(window: &Window) -> DisplayInfo {
-    let monitor = window.current_monitor();
-    let scale_factor = window.scale_factor();
-    let inner_size = window.inner_size();
-
-    DisplayInfo {
-        monitor_name: monitor.as_ref().and_then(|m| m.name()),
-        refresh_rate_millihertz: monitor.as_ref().and_then(|m| m.refresh_rate_millihertz()),
-        scale_factor,
-        physical_size_mm: monitor.as_ref().map(|m| {
-            let size = m.size();
-            (size.width, size.height)
-        }),
-        logical_size: (inner_size.width, inner_size.height),
+pub fn capture_display_info(window: Option<&Window>) -> DisplayInfo {
+    if let Some(w) = window {
+        let monitor = w.current_monitor();
+        let scale_factor = w.scale_factor();
+        let inner_size = w.inner_size();
+        DisplayInfo {
+            monitor_name: monitor.as_ref().and_then(|m| m.name()),
+            refresh_rate_millihertz: monitor.as_ref().and_then(|m| m.refresh_rate_millihertz()),
+            scale_factor,
+            physical_size_mm: monitor.as_ref().map(|m| {
+                let size = m.size();
+                (size.width, size.height)
+            }),
+            logical_size: (inner_size.width, inner_size.height),
+        }
+    } else {
+        DisplayInfo {
+            monitor_name: None,
+            refresh_rate_millihertz: None,
+            scale_factor: 1.0,
+            physical_size_mm: None,
+            logical_size: (0, 0),
+        }
     }
 }
 
@@ -179,7 +188,7 @@ pub fn capture_pipeline_config(config: &VSEConfig) -> PipelineConfig {
 /// Assemble the complete HostInfo snapshot
 pub fn capture_host_info(
     physical_device: &Arc<PhysicalDevice>,
-    window: &Window,
+    window: Option<&Window>,
     swapchain_manager: &SwapchainManager,
     config: &VSEConfig,
 ) -> HostInfo {

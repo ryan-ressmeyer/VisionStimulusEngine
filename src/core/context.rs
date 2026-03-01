@@ -305,9 +305,18 @@ impl Default for VSEContextBuilder {
     }
 }
 
+/// Source of input events for the current session.
+enum InputSource {
+    /// Events from winit (compositor mode).
+    Winit,
+    /// Events from evdev (direct display mode, Linux only).
+    #[cfg(target_os = "linux")]
+    Evdev(crate::core::evdev_input::EvdevReader),
+}
+
 /// Internal state that requires an active window
 struct VSEState {
-    window: Arc<Window>,
+    window: Option<Arc<Window>>, // None in DirectDisplay mode
     device_selector: DeviceSelector,
     device: Arc<vulkano::device::Device>,
     queue: Arc<vulkano::device::Queue>,
@@ -328,6 +337,11 @@ struct VSEState {
     last_present_time: Option<Timestamp>,
     expected_frame_duration: Option<Duration>,
     refresh_detect_samples: Vec<Duration>,
+    input_source: InputSource,
+    /// Physical display dimensions (from window or VkDisplaySurfaceKHR).
+    display_size: (u32, u32),
+    /// Which acquisition method succeeded, if in DirectDisplay mode.
+    acquired_display: Option<AcquisitionMethod>,
 }
 
 /// Main VisionStimulusEngine context
@@ -380,7 +394,7 @@ impl VSEContext {
     }
 
     /// Initialize Vulkan state from an event loop window target
-    fn initialize(
+    fn initialize_compositor(
         elwt: &EventLoopWindowTarget<()>,
         config: &VSEConfig,
     ) -> Result<VSEState, VSEError> {
@@ -544,8 +558,10 @@ impl VSEContext {
 
         info!("Vulkan initialization complete");
 
+        let win_size = (actual_size.width, actual_size.height);
+
         Ok(VSEState {
-            window,
+            window: Some(window),
             device_selector,
             device,
             queue,
@@ -564,6 +580,9 @@ impl VSEContext {
             last_present_time: None,
             expected_frame_duration,
             refresh_detect_samples: Vec::with_capacity(10),
+            input_source: InputSource::Winit,
+            display_size: win_size,
+            acquired_display: None,
         })
     }
 
@@ -604,7 +623,7 @@ impl VSEContext {
                             return;
                         }
 
-                        match Self::initialize(elwt, &config) {
+                        match Self::initialize_compositor(elwt, &config) {
                             Ok(s) => {
                                 state = Some(s);
                             }
@@ -635,6 +654,7 @@ impl VSEContext {
                                     s.minimized = true;
                                 } else {
                                     s.minimized = false;
+                                    s.display_size = (new_size.width, new_size.height);
                                     s.swapchain.mark_needs_recreation();
                                 }
                             }
@@ -747,7 +767,9 @@ impl VSEContext {
                     }
                     Event::AboutToWait => {
                         if let Some(s) = &state {
-                            s.window.request_redraw();
+                            if let Some(w) = &s.window {
+                                w.request_redraw();
+                            }
                         }
                     }
                     _ => {}
@@ -806,8 +828,8 @@ impl<'a> RenderContext<'a> {
         }
 
         // Handle swapchain recreation if needed
-        let win_size = self.state.window.inner_size();
-        let win_size_arr = [win_size.width, win_size.height];
+        let (dsw, dsh) = self.state.display_size;
+        let win_size_arr = [dsw, dsh];
         if self.state.swapchain.needs_recreation() {
             self.state.swapchain.recreate_from_surface(win_size_arr)?;
         }
@@ -967,8 +989,7 @@ impl<'a> RenderContext<'a> {
     ///
     /// In fullscreen modes this returns the monitor's native resolution.
     pub fn window_size(&self) -> (u32, u32) {
-        let size = self.state.window.inner_size();
-        (size.width, size.height)
+        self.state.display_size
     }
 
     /// Get the device (for advanced users)
@@ -1222,7 +1243,7 @@ impl<'a> RenderContext<'a> {
     pub fn capture_host_info(&self) -> crate::host::HostInfo {
         crate::host::capture::capture_host_info(
             self.state.device_selector.physical_device(),
-            &self.state.window,
+            self.state.window.as_deref(),
             &self.state.swapchain,
             self.config,
         )
@@ -1275,15 +1296,16 @@ impl<'a> RenderContext<'a> {
     /// Set whether the mouse cursor is visible.
     pub fn set_cursor_visible(&mut self, visible: bool) {
         self.state.cursor_visible = visible;
-        self.state.window.set_cursor_visible(visible);
+        if let Some(w) = &self.state.window {
+            w.set_cursor_visible(visible);
+        }
     }
 
     /// Move the cursor to the specified position (logical pixels).
     pub fn set_cursor_position(&self, x: f64, y: f64) {
-        let _ = self
-            .state
-            .window
-            .set_cursor_position(LogicalPosition::new(x, y));
+        if let Some(w) = &self.state.window {
+            let _ = w.set_cursor_position(LogicalPosition::new(x, y));
+        }
     }
 
     /// Returns whether the cursor is currently visible.
@@ -1307,14 +1329,24 @@ impl<'a> RenderContext<'a> {
     /// }
     /// ```
     pub fn display_backend(&self) -> DisplayBackend {
-        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        match self.state.window.window_handle().map(|h| h.as_raw()) {
-            Ok(RawWindowHandle::Wayland(_)) => DisplayBackend::Wayland,
-            Ok(RawWindowHandle::Xcb(_)) | Ok(RawWindowHandle::Xlib(_)) => DisplayBackend::X11,
-            Ok(RawWindowHandle::Win32(_)) => DisplayBackend::Windows,
-            Ok(RawWindowHandle::AppKit(_)) => DisplayBackend::MacOS,
-            _ => DisplayBackend::Unknown,
+        // Direct display mode: no window, check the stored acquisition method
+        if let Some(method) = self.state.acquired_display {
+            return DisplayBackend::DirectDisplay { method };
         }
+
+        // Compositor mode: detect from raw window handle
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Some(window) = &self.state.window {
+            return match window.window_handle().map(|h| h.as_raw()) {
+                Ok(RawWindowHandle::Wayland(_)) => DisplayBackend::Wayland,
+                Ok(RawWindowHandle::Xcb(_)) | Ok(RawWindowHandle::Xlib(_)) => DisplayBackend::X11,
+                Ok(RawWindowHandle::Win32(_)) => DisplayBackend::Windows,
+                Ok(RawWindowHandle::AppKit(_)) => DisplayBackend::MacOS,
+                _ => DisplayBackend::Unknown,
+            };
+        }
+
+        DisplayBackend::Unknown
     }
 
     // === Monitor & video mode queries ===
@@ -1325,9 +1357,12 @@ impl<'a> RenderContext<'a> {
     /// output via multiple `wl_output` globals. Monitors are considered identical if
     /// they share the same name, resolution, and desktop position.
     pub fn available_monitors(&self) -> Vec<MonitorInfo> {
+        let window = match &self.state.window {
+            Some(w) => w,
+            None => return vec![],
+        };
         let mut seen = std::collections::HashSet::new();
-        self.state
-            .window
+        window
             .available_monitors()
             .filter(|handle| {
                 let pos = handle.position();
@@ -1344,13 +1379,18 @@ impl<'a> RenderContext<'a> {
     pub fn primary_monitor(&self) -> Option<MonitorInfo> {
         self.state
             .window
+            .as_ref()?
             .primary_monitor()
             .map(|handle| monitor_handle_to_info(0, &handle))
     }
 
     /// Get all video modes for a monitor by index.
     pub fn video_modes(&self, monitor_index: usize) -> Vec<VideoModeInfo> {
-        let monitors: Vec<_> = self.state.window.available_monitors().collect();
+        let window = match &self.state.window {
+            Some(w) => w,
+            None => return vec![],
+        };
+        let monitors: Vec<_> = window.available_monitors().collect();
         monitors
             .get(monitor_index)
             .map(|handle| {
@@ -1369,8 +1409,11 @@ impl<'a> RenderContext<'a> {
 
     /// Get all video modes for the current monitor (the monitor the window is on).
     pub fn current_monitor_video_modes(&self) -> Vec<VideoModeInfo> {
-        self.state
-            .window
+        let window = match &self.state.window {
+            Some(w) => w,
+            None => return vec![],
+        };
+        window
             .current_monitor()
             .map(|handle| {
                 handle
@@ -1401,40 +1444,44 @@ impl<'a> RenderContext<'a> {
             warn!("set_window_mode(DirectDisplay) has no effect — use WindowMode::DirectDisplay in the builder");
             return;
         }
-        let fullscreen = match mode {
-            WindowMode::Windowed => None,
-            WindowMode::DirectDisplay => unreachable!(),
-            WindowMode::BorderlessFullscreen => {
-                Some(Fullscreen::Borderless(self.state.window.current_monitor()))
-            }
-            WindowMode::ExclusiveFullscreen => {
-                if let Some(monitor) = self.state.window.current_monitor() {
-                    let best = monitor.video_modes().max_by(|a, b| {
-                        let area_a = a.size().width * a.size().height;
-                        let area_b = b.size().width * b.size().height;
-                        area_a.cmp(&area_b).then(
-                            a.refresh_rate_millihertz()
-                                .cmp(&b.refresh_rate_millihertz()),
-                        )
-                    });
-                    match best {
-                        Some(vm) => Some(Fullscreen::Exclusive(vm)),
-                        None => Some(Fullscreen::Borderless(Some(monitor))),
-                    }
-                } else {
-                    Some(Fullscreen::Borderless(None))
+        if let Some(w) = &self.state.window {
+            let fullscreen = match mode {
+                WindowMode::Windowed => None,
+                WindowMode::DirectDisplay => unreachable!(),
+                WindowMode::BorderlessFullscreen => {
+                    Some(Fullscreen::Borderless(w.current_monitor()))
                 }
-            }
-        };
-        self.state.window.set_fullscreen(fullscreen);
-        self.state.window_mode = mode;
+                WindowMode::ExclusiveFullscreen => {
+                    if let Some(monitor) = w.current_monitor() {
+                        let best = monitor.video_modes().max_by(|a, b| {
+                            let area_a = a.size().width * a.size().height;
+                            let area_b = b.size().width * b.size().height;
+                            area_a.cmp(&area_b).then(
+                                a.refresh_rate_millihertz()
+                                    .cmp(&b.refresh_rate_millihertz()),
+                            )
+                        });
+                        match best {
+                            Some(vm) => Some(Fullscreen::Exclusive(vm)),
+                            None => Some(Fullscreen::Borderless(Some(monitor))),
+                        }
+                    } else {
+                        Some(Fullscreen::Borderless(None))
+                    }
+                }
+            };
+            w.set_fullscreen(fullscreen);
 
-        // Auto-update cursor visibility if not explicitly overridden by config
-        if self.config.cursor_visible.is_none() {
-            let visible = matches!(mode, WindowMode::Windowed);
-            self.state.cursor_visible = visible;
-            self.state.window.set_cursor_visible(visible);
+            // Auto-update cursor visibility if not explicitly overridden by config
+            if self.config.cursor_visible.is_none() {
+                let visible = matches!(mode, WindowMode::Windowed);
+                self.state.cursor_visible = visible;
+                w.set_cursor_visible(visible);
+            }
+        } else {
+            warn!("set_window_mode() has no effect in DirectDisplay mode");
         }
+        self.state.window_mode = mode;
     }
 }
 
