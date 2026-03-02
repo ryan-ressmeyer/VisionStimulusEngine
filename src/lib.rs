@@ -18,6 +18,7 @@
 //! ```
 
 // Re-export core types for easy access
+pub mod data;
 pub mod core;
 pub mod drawing;
 pub mod host;
