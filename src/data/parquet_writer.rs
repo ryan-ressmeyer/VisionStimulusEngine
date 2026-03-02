@@ -249,9 +249,7 @@ mod tests {
         .unwrap();
         w.write_frame(FrameMessage {
             flip: make_flip(1),
-            payload: Some(
-                serde_json::to_vec(&serde_json::json!({"contrast": 0.5_f64})).unwrap(),
-            ),
+            payload: Some(serde_json::to_vec(&serde_json::json!({"contrast": 0.5_f64})).unwrap()),
             schema_name: "MyData",
         })
         .unwrap();

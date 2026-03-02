@@ -18,8 +18,8 @@
 //! ```
 
 // Re-export core types for easy access
-pub mod data;
 pub mod core;
+pub mod data;
 pub mod drawing;
 pub mod host;
 pub mod timing;
@@ -32,13 +32,13 @@ pub mod prelude {
         SwapchainConfig, SwapchainManager, VSEContext, VSEContextBuilder, VSEError, VideoModeInfo,
         WindowMode,
     };
+    pub use crate::data::{
+        CsvDataWriter, DataError, DataWriter, ExperimentSession, ExperimentSessionBuilder,
+        OverflowBehavior, ParquetDataWriter,
+    };
     pub use crate::drawing::{
         Color, GaborParams, GratingParams, NoiseParams, NoiseType, TextureHandle, WaveType,
     };
     pub use crate::host::HostInfo;
     pub use crate::timing::{FlipInfo, Timestamp, TimingSource, TimingStats};
-    pub use crate::data::{
-        CsvDataWriter, DataError, DataWriter, ExperimentSession,
-        ExperimentSessionBuilder, OverflowBehavior, ParquetDataWriter,
-    };
 }

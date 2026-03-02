@@ -69,9 +69,7 @@ impl ExperimentSession {
             OverflowBehavior::DropWithWarning => match self.tx.try_send(msg) {
                 Ok(()) => Ok(()),
                 Err(mpsc::TrySendError::Full(_)) => {
-                    warn!(
-                        "ExperimentSession: channel full — dropping record (DropWithWarning)"
-                    );
+                    warn!("ExperimentSession: channel full — dropping record (DropWithWarning)");
                     Ok(())
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => Err(DataError::ChannelDisconnected),
@@ -224,7 +222,10 @@ mod tests {
             .with_writer(CsvDataWriter::new("/tmp/ignored"))
             .with_channel_capacity(1024)
             .with_overflow(OverflowBehavior::DropWithWarning);
-        assert!(matches!(builder.overflow, OverflowBehavior::DropWithWarning));
+        assert!(matches!(
+            builder.overflow,
+            OverflowBehavior::DropWithWarning
+        ));
         assert_eq!(builder.channel_capacity, 1024);
     }
 

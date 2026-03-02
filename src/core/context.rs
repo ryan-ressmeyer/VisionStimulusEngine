@@ -31,11 +31,11 @@ use super::{
 };
 use vulkano::sync::GpuFuture;
 
+use crate::data::messages::FrameMessage;
+use crate::data::ExperimentSession;
 use crate::drawing::primitives::{default_circle_segments, DrawCommand};
 use crate::drawing::renderer::{Renderer, RendererError};
 use crate::drawing::{Color, GaborParams, GratingParams, NoiseParams, TextureHandle};
-use crate::data::messages::FrameMessage;
-use crate::data::ExperimentSession;
 use crate::timing::{
     Clock, CpuTimingProvider, FlipInfo, FlipLogger, GoogleDisplayTimingProvider, Timestamp,
     TimingProvider, TimingSource, TimingStats,
@@ -898,8 +898,7 @@ impl VSEContext {
                     .open("/dev/fb0")
                 {
                     let arg: u32 = 0;
-                    let r =
-                        unsafe { libc::ioctl(fb.as_raw_fd(), FBIO_WAITFORVSYNC, &arg) };
+                    let r = unsafe { libc::ioctl(fb.as_raw_fd(), FBIO_WAITFORVSYNC, &arg) };
                     if r == 0 {
                         unsafe { libc::ioctl(fb.as_raw_fd(), FBIOBLANK, 0i32) };
                         info!(
@@ -1389,8 +1388,8 @@ impl<'a> RenderContext<'a> {
 
         recording.last_claimed_frame = Some(flip.frame_number);
 
-        let payload = serde_json::to_vec(&data)
-            .map_err(|e| VSEError::DataRecording(e.to_string()))?;
+        let payload =
+            serde_json::to_vec(&data).map_err(|e| VSEError::DataRecording(e.to_string()))?;
 
         recording
             .session
@@ -1415,8 +1414,8 @@ impl<'a> RenderContext<'a> {
     ) -> Result<(), VSEError> {
         let recording = self.state.recording.as_mut().ok_or(VSEError::NoSession)?;
         let timestamp = self.state.clock.now();
-        let payload = serde_json::to_vec(&data)
-            .map_err(|e| VSEError::DataRecording(e.to_string()))?;
+        let payload =
+            serde_json::to_vec(&data).map_err(|e| VSEError::DataRecording(e.to_string()))?;
         recording
             .session
             .send_annotation(crate::data::messages::AnnotationMessage {

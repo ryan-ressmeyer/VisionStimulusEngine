@@ -295,8 +295,7 @@ fn find_drm_card_path(
 
     if has_drm_ext {
         let mut drm_props = ash::vk::PhysicalDeviceDrmPropertiesEXT::default();
-        let mut props2 =
-            ash::vk::PhysicalDeviceProperties2::default().push_next(&mut drm_props);
+        let mut props2 = ash::vk::PhysicalDeviceProperties2::default().push_next(&mut drm_props);
         unsafe {
             ash_instance.get_physical_device_properties2(physical_device, &mut props2);
         }
@@ -340,12 +339,11 @@ fn probe_drm_acquire(
 
     // Find the DRM card for this GPU. Uses VK_EXT_physical_device_drm when
     // available so the correct card is selected even with multiple GPUs present.
-    let drm_path = find_drm_card_path(&ash_instance, physical_device).ok_or_else(|| {
-        ProbeFailure {
+    let drm_path =
+        find_drm_card_path(&ash_instance, physical_device).ok_or_else(|| ProbeFailure {
             method: AcquisitionMethod::DrmAcquire,
             reason: "no DRM card found in /dev/dri/ (is the DRM driver loaded?)".to_string(),
-        }
-    })?;
+        })?;
     let drm_file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -388,7 +386,10 @@ fn probe_drm_acquire(
             })?;
     }
 
-    info!("Direct display: DRM acquire succeeded on {}", drm_path.display());
+    info!(
+        "Direct display: DRM acquire succeeded on {}",
+        drm_path.display()
+    );
 
     let result = unsafe {
         create_display_surface(

@@ -165,9 +165,7 @@ impl DataWriter for CsvDataWriter {
                 let value: serde_json::Value = serde_json::from_slice(payload_bytes)
                     .map_err(|e| DataError::Serialization(e.to_string()))?;
                 let obj = value.as_object().ok_or_else(|| {
-                    DataError::Serialization(
-                        "frame data must serialize to a JSON object".into(),
-                    )
+                    DataError::Serialization("frame data must serialize to a JSON object".into())
                 })?;
 
                 if self.user_columns.is_none() {
@@ -177,8 +175,7 @@ impl DataWriter for CsvDataWriter {
                     self.flush_pending_timing()?;
                 }
 
-                let user_cols: Vec<String> =
-                    self.user_columns.as_ref().unwrap().clone();
+                let user_cols: Vec<String> = self.user_columns.as_ref().unwrap().clone();
                 let timing = Self::flip_to_csv(&msg.flip);
                 let file = self.frames_file()?;
                 let user_vals: Vec<String> = user_cols
@@ -332,8 +329,7 @@ mod tests {
         assert!(lines[0].contains("orientation"));
         // First row (timing-only) has empty user columns
         assert!(
-            lines[1].ends_with(",,")
-                || lines[1].split(',').count() == lines[0].split(',').count()
+            lines[1].ends_with(",,") || lines[1].split(',').count() == lines[0].split(',').count()
         );
         // Second row has user values
         assert!(lines[2].contains("0.8") || lines[2].contains("45"));
