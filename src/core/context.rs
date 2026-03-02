@@ -412,6 +412,31 @@ struct VSEState {
     acquired_display: Option<AcquisitionMethod>,
     /// Optional data recording session.
     recording: Option<RecordingState>,
+
+    // --- Buffered flip state (None/false when using synchronous run()) ---
+
+    /// Transit slot: flip_with_payload() stores the payload here as a type-erased
+    /// Box<dyn Any>. run_buffered() takes it out after the Render callback returns
+    /// and downcasts it back to T. Always None outside the Render callback.
+    buffered_pending_payload: Option<Box<dyn std::any::Any + Send + 'static>>,
+
+    /// The confirmed FlipInfo for the frame being delivered in a Presented callback.
+    /// Set by run_buffered() before invoking the Presented arm; cleared after.
+    /// record_frame() reads this field instead of pending_flip when Some.
+    buffered_confirmed_flip: Option<FlipInfo>,
+
+    /// True while run_buffered() is executing. Guards flip_with_payload() and
+    /// prevents flip() from being called in that context.
+    in_buffered_mode: bool,
+
+    /// In-flight fences paired with estimated FlipInfo. Populated by flip_with_payload(),
+    /// drained by run_buffered() when GPU confirmation arrives.
+    /// VecDeque because we always drain from the front (FIFO confirmation order).
+    buffered_in_flight: std::collections::VecDeque<(FlipInfo, Box<dyn crate::core::buffered::InFlightFuture>)>,
+
+    /// Tracks whether record_frame() was called during the current Presented callback.
+    /// Reset to false before each Presented callback by run_buffered().
+    buffered_record_called_this_presented: bool,
 }
 
 /// Main VisionStimulusEngine context
@@ -644,6 +669,11 @@ impl VSEContext {
             display_size: win_size,
             acquired_display: None,
             recording: None,
+            buffered_pending_payload: None,
+            buffered_confirmed_flip: None,
+            in_buffered_mode: false,
+            buffered_in_flight: std::collections::VecDeque::new(),
+            buffered_record_called_this_presented: false,
         })
     }
 
@@ -744,6 +774,11 @@ impl VSEContext {
             input_source: InputSource::Evdev(evdev_reader),
             display_size: (width, height),
             acquired_display: Some(method),
+            buffered_pending_payload: None,
+            buffered_confirmed_flip: None,
+            in_buffered_mode: false,
+            buffered_in_flight: std::collections::VecDeque::new(),
+            buffered_record_called_this_presented: false,
         })
     }
 
