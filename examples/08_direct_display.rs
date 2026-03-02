@@ -17,19 +17,21 @@
 use vision_stimulus_engine::prelude::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Write to stderr so logs are captured when redirecting with > log 2>&1
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive(tracing::Level::INFO.into()),
         )
         .init();
 
-    println!("VisionStimulusEngine - Direct Display Example");
-    println!("=============================================");
-    println!();
-    println!("Acquiring display... (this may fail if prerequisites are not met)");
-    println!("See docs/guides/display_backends.md for setup instructions.");
-    println!();
+    eprintln!("VisionStimulusEngine - Direct Display Example");
+    eprintln!("=============================================");
+    eprintln!();
+    eprintln!("Acquiring display... (this may fail if prerequisites are not met)");
+    eprintln!("See docs/guides/display_backends.md for setup instructions.");
+    eprintln!();
 
     let context = VSEContext::builder()
         .with_window_mode(WindowMode::DirectDisplay)
@@ -44,18 +46,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     context.run(move |vse| {
         if frame_count == 0 {
             let backend = vse.display_backend();
-            println!("Acquisition successful!");
-            println!("Backend: {}", backend.description());
+            eprintln!("Acquisition successful!");
+            eprintln!("Backend: {}", backend.description());
             let (w, h) = vse.window_size();
-            println!("Display: {}x{}", w, h);
-            println!();
-            println!("Press Escape to exit.");
+            eprintln!("Display: {}x{}", w, h);
+            eprintln!();
+            eprintln!("Press Escape to exit.");
         }
 
         // Exit on Escape
         if vse.key_just_pressed(KeyCode::Escape) {
-            println!("Escape pressed — exiting.");
-            return Err(VSEError::EventLoop("User requested exit".into()));
+            eprintln!("Escape pressed — exiting.");
+            vse.request_exit();
+            return Ok(());
         }
 
         // Draw a moving white bar to visually confirm rendering
@@ -69,12 +72,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame_count += 1;
 
         if frame_count % 600 == 0 {
-            println!("Frame {}", frame_count);
+            eprintln!("Frame {}", frame_count);
         }
 
         Ok(())
     })?;
 
-    println!("Clean shutdown.");
+    eprintln!("Clean shutdown.");
     Ok(())
 }

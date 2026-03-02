@@ -56,6 +56,10 @@ serde_json = "1.0"
 evdev = "0.12"
 # Runtime dynamic loading for optional X11 acquisition path
 libloading = "0.8"
+# Clean SIGINT (Ctrl+C) handling for direct display mode
+ctrlc = "3"
+# fcntl O_NONBLOCK for evdev devices and KDSETMODE for VT restoration
+libc = "0.2"
 
 [dev-dependencies]
 # Testing utilities

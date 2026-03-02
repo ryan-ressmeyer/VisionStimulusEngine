@@ -21,8 +21,8 @@ Your App → GPU buffer → Compositor → Display Controller → Monitor
 
 This design is great for general-purpose desktops (smooth window management,
 effects, multi-app coordination) but introduces problems for timing-critical
-experiments: the compositor schedules scanout independently of your
-`flip()` call, adding jitter that can exceed 1 ms.
+experiments because the compositor schedules scanout independently of your
+`flip()` call.
 
 ---
 

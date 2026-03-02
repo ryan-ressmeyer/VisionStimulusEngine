@@ -4,10 +4,25 @@
 //! bypassing the window manager. Used when `WindowMode::DirectDisplay`
 //! is active and no winit event loop is running.
 
-use crate::core::input::{InputEvent, InputState, KeyCode, MouseButton};
-use crate::timing::Timestamp;
-use evdev::{Device, EventType, InputEventKind};
-use tracing::{info, warn};
+use crate::core::input::{InputState, KeyCode, MouseButton};
+use evdev::{Device, InputEventKind};
+use std::os::unix::io::AsRawFd;
+use tracing::info;
+
+/// Set a device fd to non-blocking mode so `fetch_events()` returns
+/// immediately with whatever is in the kernel buffer instead of sleeping
+/// until an event arrives.  Without this, the render loop blocks on the
+/// first device that has no pending events (e.g. the headphone jack
+/// button device), preventing any frames from being presented.
+fn set_nonblocking(device: &Device) {
+    unsafe {
+        let fd = device.as_raw_fd();
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
 
 /// Reads input events from evdev devices for direct display mode.
 pub struct EvdevReader {
@@ -39,9 +54,11 @@ impl EvdevReader {
 
             if has_keys {
                 info!("evdev: keyboard device: {:?}", device.name());
+                set_nonblocking(&device);
                 keyboards.push(device);
             } else if has_rel || has_abs {
                 info!("evdev: pointer device: {:?}", device.name());
+                set_nonblocking(&device);
                 pointers.push(device);
             }
         }
