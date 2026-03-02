@@ -90,6 +90,22 @@ pub enum VSEError {
     /// Data recording error.
     #[error("Data recording error: {0}")]
     DataRecording(String),
+
+    /// `record_frame()` called in `FlipEvent::Render` arm of `run_buffered()`.
+    /// Move the `record_frame()` call to the `FlipEvent::Presented` arm.
+    #[error("record_frame() is only valid in the FlipEvent::Presented arm — \
+             move it out of the Render arm")]
+    NoConfirmedFlip,
+
+    /// `flip_with_payload()` called outside of `run_buffered()`.
+    /// Use `flip()` in the standard `run()` loop instead.
+    #[error("flip_with_payload() requires run_buffered() — use flip() inside run()")]
+    NotInBufferedMode,
+
+    /// `flip()` called inside `run_buffered()`.
+    /// Replace with `flip_with_payload()` in the Render arm.
+    #[error("flip() is not supported in run_buffered() — use flip_with_payload() instead")]
+    NotSupportedInBufferedMode,
 }
 
 /// Configuration for VSEContext
@@ -2000,5 +2016,17 @@ mod tests {
         let display = format!("{}", err);
         assert!(display.contains("Tried:"));
         assert!(display.contains("Direct display"));
+    }
+
+    #[test]
+    fn vse_error_variants_display() {
+        let e = VSEError::NoConfirmedFlip;
+        assert!(e.to_string().contains("Presented"));
+
+        let e = VSEError::NotInBufferedMode;
+        assert!(e.to_string().contains("run_buffered"));
+
+        let e = VSEError::NotSupportedInBufferedMode;
+        assert!(e.to_string().contains("flip()"));
     }
 }
