@@ -79,6 +79,18 @@ pub enum VSEError {
         method: AcquisitionMethod,
         reason: String,
     },
+
+    /// record_frame() called before flip() in the current frame.
+    #[error("record_frame() called before flip() — call flip() first")]
+    NoFlipPending,
+
+    /// No ExperimentSession attached. Call VSEContextBuilder::with_session() to enable recording.
+    #[error("no ExperimentSession attached — call .with_session() on the builder")]
+    NoSession,
+
+    /// Data recording error.
+    #[error("Data recording error: {0}")]
+    DataRecording(String),
 }
 
 /// Configuration for VSEContext
@@ -1301,6 +1313,80 @@ impl<'a> RenderContext<'a> {
         Ok(flip_info)
     }
 
+    /// Record per-frame experimental data merged with the most recent flip's timing.
+    ///
+    /// Must be called after `flip()`. The data struct must implement
+    /// `serde::Serialize`. Multiple calls per frame are allowed — each produces
+    /// one row in the output keyed to the same `frame_number`.
+    ///
+    /// Returns `VSEError::NoFlipPending` if `flip()` has not been called yet this
+    /// frame, or `VSEError::NoSession` if no session was attached to the builder.
+    pub fn record_frame<F: serde::Serialize>(&mut self, data: F) -> Result<(), VSEError> {
+        let recording = self.state.recording.as_mut().ok_or(VSEError::NoSession)?;
+        let flip = recording
+            .pending_flip
+            .clone()
+            .ok_or(VSEError::NoFlipPending)?;
+
+        recording.last_claimed_frame = Some(flip.frame_number);
+
+        let payload = serde_json::to_vec(&data)
+            .map_err(|e| VSEError::DataRecording(e.to_string()))?;
+
+        recording
+            .session
+            .send_frame(FrameMessage {
+                flip,
+                payload: Some(payload),
+                schema_name: std::any::type_name::<F>(),
+            })
+            .map_err(|e| VSEError::DataRecording(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Record a typed annotation at the current timestamp.
+    ///
+    /// `stream` is the table/group name in the output file (e.g. `"trial"`,
+    /// `"subject_info"`, `"calibration"`). Any `serde::Serialize` type is accepted.
+    pub fn record_annotation<A: serde::Serialize>(
+        &mut self,
+        stream: &str,
+        data: A,
+    ) -> Result<(), VSEError> {
+        let recording = self.state.recording.as_mut().ok_or(VSEError::NoSession)?;
+        let timestamp = self.state.clock.now();
+        let payload = serde_json::to_vec(&data)
+            .map_err(|e| VSEError::DataRecording(e.to_string()))?;
+        recording
+            .session
+            .send_annotation(crate::data::messages::AnnotationMessage {
+                stream: stream.to_string(),
+                timestamp,
+                payload,
+            })
+            .map_err(|e| VSEError::DataRecording(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Record a raw key-value event at the current timestamp.
+    ///
+    /// Use for unstructured or one-off data. For structured, repeated data
+    /// prefer [`record_frame`] or [`record_annotation`].
+    pub fn record_event(&mut self, name: &str, value: &str) -> Result<(), VSEError> {
+        let recording = self.state.recording.as_mut().ok_or(VSEError::NoSession)?;
+        let timestamp = self.state.clock.now();
+        recording
+            .session
+            .send_event(crate::data::messages::EventMessage {
+                name: name.to_string(),
+                timestamp,
+                value: value.to_string(),
+            })
+            .map_err(|e| VSEError::DataRecording(e.to_string()))?;
+        Ok(())
+    }
+
     /// Check if the window should close
     pub fn should_close(&self) -> bool {
         self.state.should_close
@@ -1863,6 +1949,12 @@ fn monitor_handle_to_info(index: usize, handle: &winit::monitor::MonitorHandle) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_record_frame_without_flip_returns_error() {
+        let err = VSEError::NoFlipPending;
+        assert!(err.to_string().contains("flip"));
+    }
 
     #[test]
     #[ignore] // EventLoop::new() panics off main thread on Linux
