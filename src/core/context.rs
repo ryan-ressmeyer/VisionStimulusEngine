@@ -1430,7 +1430,7 @@ impl<'a> RenderContext<'a> {
     /// Record a raw key-value event at the current timestamp.
     ///
     /// Use for unstructured or one-off data. For structured, repeated data
-    /// prefer [`record_frame`] or [`record_annotation`].
+    /// prefer [`Self::record_frame`] or [`Self::record_annotation`].
     pub fn record_event(&mut self, name: &str, value: &str) -> Result<(), VSEError> {
         let recording = self.state.recording.as_mut().ok_or(VSEError::NoSession)?;
         let timestamp = self.state.clock.now();

@@ -24,9 +24,9 @@ pub enum OverflowBehavior {
 
 /// Manages a dedicated writer thread for non-blocking data recording.
 ///
-/// Created via [`ExperimentSession::builder()`] and attached to [`VSEContext`]
-/// via [`VSEContextBuilder::with_session()`]. Do not call recording methods
-/// directly on `ExperimentSession` — use [`RenderContext::record_frame()`] etc.
+/// Created via [`ExperimentSession::builder()`] and attached to `VSEContext`
+/// via `VSEContextBuilder::with_session()`. Do not call recording methods
+/// directly on `ExperimentSession` — use `RenderContext::record_frame()` etc.
 ///
 /// On drop, sends a shutdown signal and joins the writer thread, ensuring all
 /// buffered data is flushed to storage before the program exits.
