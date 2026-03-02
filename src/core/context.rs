@@ -360,6 +360,38 @@ struct RecordingState {
     last_claimed_frame: Option<u64>,
 }
 
+impl RecordingState {
+    /// Called by flip() after FlipInfo is computed.
+    /// Sends timing-only row for the previous unclaimed flip, then caches new flip.
+    pub(crate) fn on_flip(&mut self, new_flip: FlipInfo) {
+        if let Some(prev) = self.pending_flip.take() {
+            let already_claimed = self.last_claimed_frame == Some(prev.frame_number);
+            if !already_claimed {
+                let _ = self.session.send_frame(FrameMessage {
+                    flip: prev,
+                    payload: None,
+                    schema_name: "",
+                });
+            }
+        }
+        self.pending_flip = Some(new_flip);
+    }
+
+    /// Called on session shutdown — flushes final pending flip as timing-only if unclaimed.
+    pub(crate) fn on_shutdown(&mut self) {
+        if let Some(flip) = self.pending_flip.take() {
+            let claimed = self.last_claimed_frame == Some(flip.frame_number);
+            if !claimed {
+                let _ = self.session.send_frame(FrameMessage {
+                    flip,
+                    payload: None,
+                    schema_name: "",
+                });
+            }
+        }
+    }
+}
+
 /// Internal state that requires an active window
 struct VSEState {
     window: Option<Arc<Window>>, // None in DirectDisplay mode
@@ -810,6 +842,11 @@ impl VSEContext {
             state.input.begin_frame();
         };
 
+        // Flush final pending flip before dropping
+        if let Some(recording) = &mut state.recording {
+            recording.on_shutdown();
+        }
+
         // Drop Vulkan state first so the display is released before we
         // attempt to restore the VT text mode.
         drop(state);
@@ -1115,6 +1152,13 @@ impl VSEContext {
                             }
                         }
                     }
+                    Event::LoopExiting => {
+                        if let Some(s) = &mut state {
+                            if let Some(recording) = &mut s.recording {
+                                recording.on_shutdown();
+                            }
+                        }
+                    }
                     _ => {}
                 }
             })
@@ -1301,6 +1345,11 @@ impl<'a> RenderContext<'a> {
         // Record to logger
         if let Some(logger) = &mut self.state.flip_logger {
             logger.record(flip_info.clone());
+        }
+
+        // Notify RecordingState of new flip
+        if let Some(recording) = &mut self.state.recording {
+            recording.on_flip(flip_info.clone());
         }
 
         // Update state for next frame
@@ -1949,6 +1998,56 @@ fn monitor_handle_to_info(index: usize, handle: &winit::monitor::MonitorHandle) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_recording_state_pending_flip_handoff() {
+        use crate::data::{CsvDataWriter, ExperimentSession};
+        use crate::timing::{FlipInfo, Timestamp, TimingSource};
+
+        let dir = std::env::temp_dir().join("vse_pending_flip_test");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let session = ExperimentSession::builder()
+            .with_writer(CsvDataWriter::new(&dir))
+            .build()
+            .unwrap();
+
+        let mut state = RecordingState {
+            session,
+            pending_flip: None,
+            last_claimed_frame: None,
+        };
+
+        let make_flip = |n: u64| FlipInfo {
+            frame_number: n,
+            timing_source: TimingSource::CpuEstimate,
+            submit_time: Timestamp::from_micros(0),
+            present_time: Timestamp::from_micros(16_667),
+            missed: false,
+            missed_count: 0,
+            skipped: false,
+        };
+
+        // Simulate flip(0) — no record_frame called
+        state.on_flip(make_flip(0));
+        // Simulate flip(1) — flip(0) was unclaimed, timing-only row sent
+        state.on_flip(make_flip(1));
+
+        // Drop sends Shutdown + flush
+        drop(state.session);
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let frames = std::fs::read_to_string(dir.join("frames.csv")).unwrap();
+        let lines: Vec<&str> = frames.lines().collect();
+        // header + 1 timing-only row for frame 0
+        assert!(
+            lines.len() >= 2,
+            "expected at least header + 1 row, got: {:?}",
+            lines
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn test_record_frame_without_flip_returns_error() {
