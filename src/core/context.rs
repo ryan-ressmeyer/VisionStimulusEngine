@@ -222,6 +222,11 @@ impl VSEContextBuilder {
     /// Enable flip timing and logging.
     ///
     /// When enabled, every `flip()` call records timing data.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use VSEContextBuilder::with_session(ExperimentSession::builder()\
+                .with_writer(CsvDataWriter::new(path)).build()?) instead."
+    )]
     pub fn with_flip_logging(mut self, enabled: bool) -> Self {
         self.config.flip_logging = enabled;
         self
@@ -231,6 +236,11 @@ impl VSEContextBuilder {
     ///
     /// The CSV file is written when the context shuts down.
     /// Implies `with_flip_logging(true)`.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use VSEContextBuilder::with_session(ExperimentSession::builder()\
+                .with_writer(CsvDataWriter::new(path)).build()?) instead."
+    )]
     pub fn with_flip_log_csv(mut self, path: impl Into<PathBuf>) -> Self {
         self.config.flip_log_csv_path = Some(path.into());
         self.config.flip_logging = true;

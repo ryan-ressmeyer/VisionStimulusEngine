@@ -13,7 +13,7 @@ mod timing_source;
 
 pub use clock::{Clock, Timestamp};
 pub use flip_info::FlipInfo;
-pub use flip_logger::FlipLogger;
+pub(crate) use flip_logger::FlipLogger;
 pub use provider::{CpuTimingProvider, GoogleDisplayTimingProvider, TimingProvider};
 pub use stats::TimingStats;
 pub use timing_source::TimingSource;
