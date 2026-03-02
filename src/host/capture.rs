@@ -177,11 +177,6 @@ pub fn capture_pipeline_config(config: &VSEConfig) -> PipelineConfig {
         gpu_preference: format!("{:?}", config.gpu_preference),
         present_mode: format!("{:?}", config.present_mode),
         expected_refresh_rate: config.expected_refresh_rate,
-        flip_logging: config.flip_logging,
-        flip_log_csv_path: config
-            .flip_log_csv_path
-            .as_ref()
-            .map(|p| p.display().to_string()),
     }
 }
 

@@ -1,19 +1,14 @@
 //! Timing and synchronization infrastructure
 //!
-//! This module provides high-resolution timing measurement,
-//! per-frame flip logging, and timing statistics for validating
-//! stimulus presentation precision.
+//! This module provides high-resolution timing measurement and
+//! per-frame flip information for stimulus presentation timing.
 
 mod clock;
 mod flip_info;
-mod flip_logger;
 pub(crate) mod provider;
-mod stats;
 mod timing_source;
 
 pub use clock::{Clock, Timestamp};
 pub use flip_info::FlipInfo;
-pub(crate) use flip_logger::FlipLogger;
 pub use provider::{CpuTimingProvider, GoogleDisplayTimingProvider, TimingProvider};
-pub use stats::TimingStats;
 pub use timing_source::TimingSource;

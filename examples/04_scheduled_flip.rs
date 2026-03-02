@@ -18,13 +18,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("VSE - Scheduled Flip Demo");
     println!("=========================");
 
+    let session = ExperimentSession::builder()
+        .with_writer(CsvDataWriter::new("scheduled_flip/"))
+        .build()?;
+
     let context = VSEContext::builder()
         .with_window_size(800, 600)
         .with_title("VSE - Scheduled Flip")
         .with_clear_color(0.3, 0.3, 0.3, 1.0)
         .with_present_mode(PresentMode::Fifo)
-        .with_flip_logging(true)
-        .with_flip_log_csv("scheduled_flip.csv")
+        .with_session(session)
         .build()?;
 
     let mut last_present = None;
@@ -45,10 +48,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         last_present = Some(info.present_time);
-
-        if info.frame_number % 300 == 0 && info.frame_number > 0 {
-            vse.print_timing_report();
-        }
 
         Ok(())
     })?;

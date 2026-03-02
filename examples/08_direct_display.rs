@@ -38,7 +38,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_monitor(MonitorSelection::Primary)
         .with_clear_color(0.1, 0.1, 0.1, 1.0)
         .with_present_mode(PresentMode::Fifo)
-        .with_flip_logging(true)
         .build()?;
 
     let mut frame_count: u64 = 0;

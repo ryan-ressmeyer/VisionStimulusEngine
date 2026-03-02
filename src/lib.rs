@@ -40,5 +40,5 @@ pub mod prelude {
         Color, GaborParams, GratingParams, NoiseParams, NoiseType, TextureHandle, WaveType,
     };
     pub use crate::host::HostInfo;
-    pub use crate::timing::{FlipInfo, Timestamp, TimingSource, TimingStats};
+    pub use crate::timing::{FlipInfo, Timestamp, TimingSource};
 }

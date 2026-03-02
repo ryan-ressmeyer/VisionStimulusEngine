@@ -37,6 +37,7 @@ pub struct EventMessage {
 }
 
 /// Internal channel message envelope.
+#[allow(dead_code)] // Flush reserved for future flush_data() API
 pub(crate) enum WriterMessage {
     Frame(FrameMessage),
     Annotation(AnnotationMessage),

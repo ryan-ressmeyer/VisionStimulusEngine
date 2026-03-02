@@ -4,7 +4,6 @@
 //! resources and providing a clean API for rendering operations.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,8 +36,8 @@ use crate::drawing::primitives::{default_circle_segments, DrawCommand};
 use crate::drawing::renderer::{Renderer, RendererError};
 use crate::drawing::{Color, GaborParams, GratingParams, NoiseParams, TextureHandle};
 use crate::timing::{
-    Clock, CpuTimingProvider, FlipInfo, FlipLogger, GoogleDisplayTimingProvider, Timestamp,
-    TimingProvider, TimingSource, TimingStats,
+    Clock, CpuTimingProvider, FlipInfo, GoogleDisplayTimingProvider, Timestamp, TimingProvider,
+    TimingSource,
 };
 
 /// Errors that can occur in VSEContext
@@ -108,10 +107,6 @@ pub struct VSEConfig {
     pub present_mode: PresentMode,
     /// Clear color (RGBA, 0.0-1.0)
     pub clear_color: [f32; 4],
-    /// Enable flip timing and logging
-    pub flip_logging: bool,
-    /// Optional CSV path for automatic flip log export on shutdown
-    pub flip_log_csv_path: Option<PathBuf>,
     /// Expected refresh rate in Hz (used for missed frame detection).
     /// If None, auto-detected from first 10 frames.
     pub expected_refresh_rate: Option<f64>,
@@ -138,8 +133,6 @@ impl Default for VSEConfig {
             gpu_preference: GPUPreference::Discrete,
             present_mode: PresentMode::Fifo,
             clear_color: [0.0, 0.0, 0.0, 1.0], // Black
-            flip_logging: false,
-            flip_log_csv_path: None,
             expected_refresh_rate: None,
             window_mode: WindowMode::default(),
             monitor_selection: MonitorSelection::default(),
@@ -216,34 +209,6 @@ impl VSEContextBuilder {
     /// Set initial clear color (RGBA, 0.0-1.0 range)
     pub fn with_clear_color(mut self, r: f32, g: f32, b: f32, a: f32) -> Self {
         self.config.clear_color = [r, g, b, a];
-        self
-    }
-
-    /// Enable flip timing and logging.
-    ///
-    /// When enabled, every `flip()` call records timing data.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use VSEContextBuilder::with_session(ExperimentSession::builder()\
-                .with_writer(CsvDataWriter::new(path)).build()?) instead."
-    )]
-    pub fn with_flip_logging(mut self, enabled: bool) -> Self {
-        self.config.flip_logging = enabled;
-        self
-    }
-
-    /// Set CSV path for automatic flip log export.
-    ///
-    /// The CSV file is written when the context shuts down.
-    /// Implies `with_flip_logging(true)`.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use VSEContextBuilder::with_session(ExperimentSession::builder()\
-                .with_writer(CsvDataWriter::new(path)).build()?) instead."
-    )]
-    pub fn with_flip_log_csv(mut self, path: impl Into<PathBuf>) -> Self {
-        self.config.flip_log_csv_path = Some(path.into());
-        self.config.flip_logging = true;
         self
     }
 
@@ -420,7 +385,6 @@ struct VSEState {
     // Timing state
     clock: Clock,
     timing_provider: Box<dyn TimingProvider>,
-    flip_logger: Option<FlipLogger>,
     frame_number: u64,
     last_present_time: Option<Timestamp>,
     expected_frame_duration: Option<Duration>,
@@ -633,16 +597,6 @@ impl VSEContext {
             Box::new(CpuTimingProvider::new())
         };
 
-        let flip_logger = if config.flip_logging {
-            let capacity = 3600 * 10; // ~10 minutes at 60 Hz
-            Some(match &config.flip_log_csv_path {
-                Some(path) => FlipLogger::with_csv(path.clone(), capacity),
-                None => FlipLogger::new(capacity),
-            })
-        } else {
-            None
-        };
-
         let expected_frame_duration = config
             .expected_refresh_rate
             .map(|hz| Duration::from_micros((1_000_000.0 / hz) as u64));
@@ -666,7 +620,6 @@ impl VSEContext {
             window_mode: config.window_mode,
             clock,
             timing_provider,
-            flip_logger,
             frame_number: 0,
             last_present_time: None,
             expected_frame_duration,
@@ -735,16 +688,6 @@ impl VSEContext {
             Box::new(CpuTimingProvider::new())
         };
 
-        let flip_logger = if config.flip_logging {
-            let capacity = 3600 * 10;
-            Some(match &config.flip_log_csv_path {
-                Some(path) => FlipLogger::with_csv(path.clone(), capacity),
-                None => FlipLogger::new(capacity),
-            })
-        } else {
-            None
-        };
-
         let expected_frame_duration = config
             .expected_refresh_rate
             .map(|hz| Duration::from_micros((1_000_000.0 / hz) as u64));
@@ -777,7 +720,6 @@ impl VSEContext {
             window_mode: WindowMode::DirectDisplay,
             clock,
             timing_provider,
-            flip_logger,
             recording: None,
             frame_number: 0,
             last_present_time: None,
@@ -1351,11 +1293,6 @@ impl<'a> RenderContext<'a> {
             skipped: false,
         };
 
-        // Record to logger
-        if let Some(logger) = &mut self.state.flip_logger {
-            logger.record(flip_info.clone());
-        }
-
         // Notify RecordingState of new flip
         if let Some(recording) = &mut self.state.recording {
             recording.on_flip(flip_info.clone());
@@ -1499,28 +1436,6 @@ impl<'a> RenderContext<'a> {
     /// Get the active timing source.
     pub fn timing_source(&self) -> TimingSource {
         self.state.timing_provider.source()
-    }
-
-    /// Get the flip logger (if timing is enabled).
-    pub fn flip_logger(&self) -> Option<&FlipLogger> {
-        self.state.flip_logger.as_ref()
-    }
-
-    /// Get computed timing statistics from all recorded frames.
-    /// Returns None if timing is disabled or fewer than 2 frames recorded.
-    pub fn timing_stats(&self) -> Option<TimingStats> {
-        self.state
-            .flip_logger
-            .as_ref()
-            .and_then(|logger| TimingStats::compute(logger.records()))
-    }
-
-    /// Print a timing report to stdout.
-    /// No-op if timing is not enabled or fewer than 2 frames recorded.
-    pub fn print_timing_report(&self) {
-        if let Some(stats) = self.timing_stats() {
-            stats.print_report();
-        }
     }
 
     /// Get the timing clock (for correlating with external events).

@@ -118,8 +118,6 @@ pub struct PipelineConfig {
     pub gpu_preference: String,
     pub present_mode: String,
     pub expected_refresh_rate: Option<f64>,
-    pub flip_logging: bool,
-    pub flip_log_csv_path: Option<String>,
 }
 
 /// Build-time metadata captured by build.rs

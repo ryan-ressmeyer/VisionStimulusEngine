@@ -9,7 +9,7 @@
 //! memory and flushed once the schema is known.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::data::messages::{AnnotationMessage, EventMessage, FrameMessage};
 use crate::data::writer::{DataError, DataWriter};
