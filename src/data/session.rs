@@ -30,6 +30,7 @@ pub enum OverflowBehavior {
 ///
 /// On drop, sends a shutdown signal and joins the writer thread, ensuring all
 /// buffered data is flushed to storage before the program exits.
+#[derive(Debug)]
 pub struct ExperimentSession {
     tx: mpsc::SyncSender<WriterMessage>,
     thread: Option<thread::JoinHandle<()>>,

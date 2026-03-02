@@ -34,6 +34,8 @@ use vulkano::sync::GpuFuture;
 use crate::drawing::primitives::{default_circle_segments, DrawCommand};
 use crate::drawing::renderer::{Renderer, RendererError};
 use crate::drawing::{Color, GaborParams, GratingParams, NoiseParams, TextureHandle};
+use crate::data::messages::FrameMessage;
+use crate::data::ExperimentSession;
 use crate::timing::{
     Clock, CpuTimingProvider, FlipInfo, FlipLogger, GoogleDisplayTimingProvider, Timestamp,
     TimingProvider, TimingSource, TimingStats,
@@ -150,9 +152,10 @@ impl Default for VSEConfig {
 ///     .build()?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VSEContextBuilder {
     config: VSEConfig,
+    session: Option<ExperimentSession>,
 }
 
 impl VSEContextBuilder {
@@ -160,6 +163,7 @@ impl VSEContextBuilder {
     pub fn new() -> Self {
         Self {
             config: VSEConfig::default(),
+            session: None,
         }
     }
 
@@ -281,6 +285,15 @@ impl VSEContextBuilder {
         self
     }
 
+    /// Attach an experiment session for data recording.
+    ///
+    /// Enables `record_frame()`, `record_annotation()`, and `record_event()`
+    /// on `RenderContext`. If not set, data recording is disabled.
+    pub fn with_session(mut self, session: ExperimentSession) -> Self {
+        self.session = Some(session);
+        self
+    }
+
     /// Build the VSEContext
     ///
     /// This creates the event loop but does not yet create the window.
@@ -305,6 +318,7 @@ impl VSEContextBuilder {
 
         Ok(VSEContext {
             config: self.config,
+            session: self.session,
             event_loop,
         })
     }
@@ -323,6 +337,15 @@ enum InputSource {
     /// Events from evdev (direct display mode, Linux only).
     #[cfg(target_os = "linux")]
     Evdev(crate::core::evdev_input::EvdevReader),
+}
+
+/// Tracks per-frame recording state between flip() and record_frame() calls.
+struct RecordingState {
+    session: ExperimentSession,
+    /// FlipInfo from the most recent flip(), available for record_frame().
+    pending_flip: Option<FlipInfo>,
+    /// frame_number of the most recently claimed flip (had record_frame called).
+    last_claimed_frame: Option<u64>,
 }
 
 /// Internal state that requires an active window
@@ -353,6 +376,8 @@ struct VSEState {
     display_size: (u32, u32),
     /// Which acquisition method succeeded, if in DirectDisplay mode.
     acquired_display: Option<AcquisitionMethod>,
+    /// Optional data recording session.
+    recording: Option<RecordingState>,
 }
 
 /// Main VisionStimulusEngine context
@@ -384,6 +409,7 @@ struct VSEState {
 /// ```
 pub struct VSEContext {
     config: VSEConfig,
+    session: Option<ExperimentSession>,
     event_loop: Option<EventLoop<()>>,
 }
 
@@ -594,6 +620,7 @@ impl VSEContext {
             input_source: InputSource::Winit,
             display_size: win_size,
             acquired_display: None,
+            recording: None,
         })
     }
 
@@ -697,6 +724,7 @@ impl VSEContext {
             clock,
             timing_provider,
             flip_logger,
+            recording: None,
             frame_number: 0,
             last_present_time: None,
             expected_frame_duration,
@@ -709,7 +737,7 @@ impl VSEContext {
 
     /// Run the direct display render loop (no winit).
     #[cfg(target_os = "linux")]
-    fn run_direct<F>(self, mut render_fn: F) -> Result<(), VSEError>
+    fn run_direct<F>(mut self, mut render_fn: F) -> Result<(), VSEError>
     where
         F: FnMut(&mut RenderContext) -> Result<(), VSEError> + 'static,
     {
@@ -717,6 +745,11 @@ impl VSEContext {
         use std::sync::Arc;
 
         let mut state = Self::initialize_direct(&self.config)?;
+        state.recording = self.session.take().map(|session| RecordingState {
+            session,
+            pending_flip: None,
+            last_claimed_frame: None,
+        });
         let mut config = self.config;
 
         // Install a SIGINT (Ctrl+C) handler so the loop can exit cleanly,
@@ -901,6 +934,7 @@ impl VSEContext {
             .ok_or_else(|| VSEError::EventLoop("Event loop already consumed".into()))?;
 
         let mut config = self.config;
+        let mut session = self.session;
         let mut state: Option<VSEState> = None;
         let error: Rc<RefCell<Option<VSEError>>> = Rc::new(RefCell::new(None));
         let error_clone = error.clone();
@@ -916,7 +950,12 @@ impl VSEContext {
                         }
 
                         match Self::initialize_compositor(elwt, &config) {
-                            Ok(s) => {
+                            Ok(mut s) => {
+                                s.recording = session.take().map(|sess| RecordingState {
+                                    session: sess,
+                                    pending_flip: None,
+                                    last_claimed_frame: None,
+                                });
                                 state = Some(s);
                             }
                             Err(e) => {
@@ -1824,6 +1863,20 @@ fn monitor_handle_to_info(index: usize, handle: &winit::monitor::MonitorHandle) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore] // EventLoop::new() panics off main thread on Linux
+    fn test_builder_with_session_compiles() {
+        use crate::data::{CsvDataWriter, ExperimentSession};
+        let session = ExperimentSession::builder()
+            .with_writer(CsvDataWriter::new("/tmp/test_session"))
+            .build()
+            .unwrap();
+        let _builder = VSEContext::builder()
+            .with_window_size(800, 600)
+            .with_session(session);
+        // Just verifies it compiles — ignored at runtime
+    }
 
     #[test]
     fn direct_display_unavailable_error_contains_tried_methods() {
