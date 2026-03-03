@@ -1876,13 +1876,48 @@ impl<'a> RenderContext<'a> {
 
     /// Record per-frame experimental data merged with the most recent flip's timing.
     ///
-    /// Must be called after `flip()`. The data struct must implement
-    /// `serde::Serialize`. Multiple calls per frame are allowed — each produces
-    /// one row in the output keyed to the same `frame_number`.
+    /// In synchronous `run()`: call after `flip()`. Uses the confirmed present time
+    /// from the blocking fence wait.
     ///
-    /// Returns `VSEError::NoFlipPending` if `flip()` has not been called yet this
-    /// frame, or `VSEError::NoSession` if no session was attached to the builder.
+    /// In `run_buffered()`: call inside `FlipEvent::Presented`. Uses the confirmed
+    /// hardware scanout timestamp delivered to that arm — never an estimate.
+    ///
+    /// The data struct must implement `serde::Serialize`. Multiple calls per frame
+    /// are allowed — each produces one row keyed to the same `frame_number`.
+    ///
+    /// # Errors
+    ///
+    /// - [`VSEError::NoSession`] if no session was attached to the builder.
+    /// - [`VSEError::NoFlipPending`] if called before `flip()` in synchronous mode.
+    /// - [`VSEError::NoConfirmedFlip`] if called in the `FlipEvent::Render` arm.
     pub fn record_frame<F: serde::Serialize>(&mut self, data: F) -> Result<(), VSEError> {
+        // Buffered mode: use the confirmed flip set by run_buffered() before this callback.
+        if self.state.in_buffered_mode {
+            let flip = self
+                .state
+                .buffered_confirmed_flip
+                .clone()
+                .ok_or(VSEError::NoConfirmedFlip)?;
+
+            let recording = self.state.recording.as_mut().ok_or(VSEError::NoSession)?;
+
+            let payload =
+                serde_json::to_vec(&data).map_err(|e| VSEError::DataRecording(e.to_string()))?;
+
+            recording
+                .session
+                .send_frame(FrameMessage {
+                    flip,
+                    payload: Some(payload),
+                    schema_name: std::any::type_name::<F>(),
+                })
+                .map_err(|e| VSEError::DataRecording(e.to_string()))?;
+
+            self.state.buffered_record_called_this_presented = true;
+            return Ok(());
+        }
+
+        // Synchronous mode: use pending_flip from the most recent flip().
         let recording = self.state.recording.as_mut().ok_or(VSEError::NoSession)?;
         let flip = recording
             .pending_flip
