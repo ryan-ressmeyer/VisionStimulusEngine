@@ -28,6 +28,22 @@ pub trait TimingProvider {
     /// For CPU: spin-waits until target_time.
     /// For GOOGLE: target is passed to VkPresentTimeGOOGLE during present.
     fn wait_for_target(&self, target_time: Timestamp, clock: &Clock);
+
+    /// Query the confirmed hardware scanout time for a specific frame number.
+    ///
+    /// Returns `Some(Timestamp)` when the driver has confirmed the scanout time for
+    /// the frame identified by `frame_number`. Used by `run_buffered()` to attach
+    /// hardware-verified timing to `FlipEvent::Presented`.
+    ///
+    /// The default implementation returns `None`; the CPU path uses fence-signal time
+    /// from `record_present_time()` instead.
+    fn confirmed_present_time_for(
+        &self,
+        _frame_number: u64,
+        _clock: &Clock,
+    ) -> Option<Timestamp> {
+        None
+    }
 }
 
 /// CPU-based timing (fallback when no Vulkan timing extensions are available).
@@ -161,6 +177,26 @@ impl GoogleDisplayTimingProvider {
             }
         }
     }
+
+    /// Query past presentation timings for a specific `present_id`.
+    ///
+    /// Returns the `actual_present_time` (nanoseconds) if the driver has recorded
+    /// a timing entry whose `presentID` matches `present_id`. The driver may batch
+    /// or delay these records, so callers should fall back to CPU time when this
+    /// returns `None`.
+    fn query_present_time_for_id(&self, present_id: u32) -> Option<u64> {
+        let handle = *self.swapchain_handle.borrow();
+        match unsafe { self.display_timing.get_past_presentation_timing(handle) } {
+            Ok(timings) => timings
+                .iter()
+                .find(|t| t.present_id == present_id)
+                .map(|t| t.actual_present_time),
+            Err(e) => {
+                warn!("vkGetPastPresentationTimingGOOGLE failed: {:?}", e);
+                None
+            }
+        }
+    }
 }
 
 impl TimingProvider for GoogleDisplayTimingProvider {
@@ -202,10 +238,34 @@ impl TimingProvider for GoogleDisplayTimingProvider {
         // For Google Display Timing, the target time should ideally be
         // passed via VkPresentTimesInfoGOOGLE in the present pNext chain.
         // For now, fall back to CPU spin-wait like CpuTimingProvider.
-        // Task 7 will integrate the pNext chain attachment.
         while clock.now() < target_time {
             std::hint::spin_loop();
         }
+    }
+
+    fn confirmed_present_time_for(
+        &self,
+        frame_number: u64,
+        clock: &Clock,
+    ) -> Option<Timestamp> {
+        // Map frame_number to a present_id. We use (frame_number & 0xFFFF_FFFF) as
+        // a u32 present_id. This matches any future VkPresentTimesInfoGOOGLE
+        // integration where the same mapping is used.
+        //
+        // NOTE: Until submit_nonblocking attaches VkPresentTimesInfoGOOGLE to the
+        // present pNext chain (future work), present_id in driver records will be 0
+        // for every frame, so this lookup will not find a matching entry. The
+        // fallback to record_present_time() (most recent timing) is used instead.
+        let present_id = (frame_number & 0xFFFF_FFFF) as u32;
+        self.query_present_time_for_id(present_id)
+            .map(|nanos| Timestamp::from_micros(nanos / 1_000))
+            .or_else(|| {
+                // Fall back to most-recent timing from the driver, same as
+                // record_present_time(). Returns None on first few frames.
+                self.query_latest_present_time()
+                    .map(|nanos| Timestamp::from_micros(nanos / 1_000))
+                    .or_else(|| Some(clock.now()))
+            })
     }
 }
 

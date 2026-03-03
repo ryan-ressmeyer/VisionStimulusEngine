@@ -481,7 +481,11 @@ impl VSEState {
     /// Queries the timing provider for the actual present time, computes missed-frame
     /// detection, and updates `last_present_time` for the next call.
     fn build_confirmed_flip(&mut self, estimated: FlipInfo) -> FlipInfo {
-        let confirmed_present = self.timing_provider.record_present_time(&self.clock);
+        // Prefer hardware-confirmed scanout time for this specific frame when available.
+        let confirmed_present = self
+            .timing_provider
+            .confirmed_present_time_for(estimated.frame_number, &self.clock)
+            .unwrap_or_else(|| self.timing_provider.record_present_time(&self.clock));
 
         let frame_duration = self
             .last_present_time
