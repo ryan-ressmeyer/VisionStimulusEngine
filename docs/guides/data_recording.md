@@ -157,10 +157,25 @@ Every row in `frames.csv` / `frames.parquet` includes a `timing_source` column:
 The `present_time_us` field is microseconds since the VSE clock epoch
 (context creation time), not wall-clock time.
 
-## Future: Buffered Flip
+## Buffered Flip
 
-A future version will add non-blocking `flip()` variants for pipelined GPU
-submission. The `ExperimentSession` architecture is designed for this: a
-pending-confirmation queue will hold frame records with estimated timing until
-the driver confirms the actual scanout time via `vkGetPastPresentationTimingGOOGLE`.
-This is transparent to user code — the `record_frame()` API is unchanged.
+For pipelined GPU experiments, use `run_buffered()` instead of `run()`. In buffered mode,
+`record_frame()` is called in the `FlipEvent::Presented` arm with **confirmed** hardware
+timing — `present_time` is never an estimate. See the
+[buffered flips guide](buffered_flips.md) for full details.
+
+```rust
+context.run_buffered::<MyData, _>(BufferedConfig::default(), |event, vse| {
+    match event {
+        FlipEvent::Render => {
+            vse.flip_with_payload(None, MyData { /* ... */ })?;
+        }
+        FlipEvent::Presented { flip_info, payload } => {
+            // flip_info.present_time is confirmed hardware timing
+            vse.record_frame(payload)?;
+        }
+        _ => {}
+    }
+    Ok(())
+})?;
+```
