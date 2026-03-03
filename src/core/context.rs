@@ -1359,6 +1359,112 @@ impl<'a> RenderContext<'a> {
         Ok(flip_info)
     }
 
+    /// Submit the current frame to the GPU without blocking, attaching a typed payload.
+    ///
+    /// Only valid inside [`VSEContext::run_buffered`]. The `payload` is stored and
+    /// delivered alongside the confirmed [`FlipInfo`] in the next
+    /// [`FlipEvent::Presented`] for this frame.
+    ///
+    /// # Errors
+    ///
+    /// - [`VSEError::NotInBufferedMode`] if called from `run()` instead of `run_buffered()`.
+    /// - [`VSEError::Swapchain`] if image acquisition or submission fails.
+    pub fn flip_with_payload<T: std::any::Any + Send + 'static>(
+        &mut self,
+        target_time: Option<Timestamp>,
+        payload: T,
+    ) -> Result<(), VSEError> {
+        if !self.state.in_buffered_mode {
+            return Err(VSEError::NotInBufferedMode);
+        }
+
+        if self.state.minimized {
+            // Skip silently — no fence, no payload stored; run_buffered() skips push.
+            self.state.frame_number += 1;
+            return Ok(());
+        }
+
+        // Recreate swapchain if needed
+        let (dsw, dsh) = self.state.display_size;
+        let win_size_arr = [dsw, dsh];
+        if self.state.swapchain.needs_recreation() {
+            self.state.swapchain.recreate_from_surface(win_size_arr)?;
+        }
+
+        // Acquire next image (natural backpressure from driver)
+        let (image_index, _suboptimal, acquire_future) =
+            match self.state.swapchain.acquire_next_image() {
+                Ok(r) => r,
+                Err(SwapchainError::OutOfDate) => {
+                    self.state.swapchain.recreate_from_surface(win_size_arr)?;
+                    self.state.frame_number += 1;
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+        let image = self.state.swapchain.images()[image_index as usize].clone();
+        let extent = self.state.swapchain.extent();
+
+        let command_buffer = self
+            .state
+            .renderer
+            .render(image, self.config.clear_color, extent)?;
+
+        let future = acquire_future
+            .then_execute(self.state.queue.clone(), command_buffer)
+            .map_err(|e: vulkano::command_buffer::CommandBufferExecError| {
+                FrameError::ExecutionFailed(e.to_string())
+            })?;
+
+        // Optional CPU spin-wait for scheduled present time
+        if let Some(target) = target_time {
+            self.state
+                .timing_provider
+                .wait_for_target(target, &self.state.clock);
+        }
+
+        let submit_time = self.state.clock.now();
+
+        // Non-blocking submit — returns immediately, keeps fence alive
+        let in_flight = self
+            .state
+            .swapchain
+            .submit_nonblocking(self.state.queue.clone(), image_index, future)?;
+
+        let estimated_present = self.state.clock.now();
+
+        let estimated_flip = FlipInfo {
+            frame_number: self.state.frame_number,
+            timing_source: self.state.timing_provider.source(),
+            submit_time,
+            present_time: estimated_present,
+            missed: false,
+            missed_count: 0,
+            skipped: false,
+        };
+
+        // Store payload for run_buffered() to pick up after callback returns
+        self.state.buffered_pending_payload = Some(Box::new(payload));
+
+        // Store (estimated_flip, fence) — correlated with pending_frames by FIFO order
+        self.state
+            .buffered_in_flight
+            .push_back((estimated_flip, in_flight));
+
+        self.state.frame_number += 1;
+        self.state.input.clear_events();
+
+        Ok(())
+    }
+
+    /// Request a clean exit at the end of the current frame.
+    ///
+    /// Alias for [`request_exit()`](Self::request_exit).
+    pub fn close(&mut self) {
+        self.state.should_close = true;
+    }
+
     /// Record per-frame experimental data merged with the most recent flip's timing.
     ///
     /// Must be called after `flip()`. The data struct must implement
