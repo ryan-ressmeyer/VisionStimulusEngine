@@ -19,6 +19,7 @@ use winit::{
 
 use std::path::Path;
 
+use super::buffered::{BufferedConfig, FlipEvent};
 use super::input::{
     AcquisitionMethod, DisplayBackend, InputEvent, InputState, KeyCode, MonitorInfo,
     MonitorSelection, MouseButton, VideoModeInfo, WindowMode,
@@ -93,8 +94,10 @@ pub enum VSEError {
 
     /// `record_frame()` called in `FlipEvent::Render` arm of `run_buffered()`.
     /// Move the `record_frame()` call to the `FlipEvent::Presented` arm.
-    #[error("record_frame() is only valid in the FlipEvent::Presented arm — \
-             move it out of the Render arm")]
+    #[error(
+        "record_frame() is only valid in the FlipEvent::Presented arm — \
+             move it out of the Render arm"
+    )]
     NoConfirmedFlip,
 
     /// `flip_with_payload()` called outside of `run_buffered()`.
@@ -414,7 +417,6 @@ struct VSEState {
     recording: Option<RecordingState>,
 
     // --- Buffered flip state (None/false when using synchronous run()) ---
-
     /// Transit slot: flip_with_payload() stores the payload here as a type-erased
     /// Box<dyn Any>. run_buffered() takes it out after the Render callback returns
     /// and downcasts it back to T. Always None outside the Render callback.
@@ -432,7 +434,8 @@ struct VSEState {
     /// In-flight fences paired with estimated FlipInfo. Populated by flip_with_payload(),
     /// drained by run_buffered() when GPU confirmation arrives.
     /// VecDeque because we always drain from the front (FIFO confirmation order).
-    buffered_in_flight: std::collections::VecDeque<(FlipInfo, Box<dyn crate::core::buffered::InFlightFuture>)>,
+    buffered_in_flight:
+        std::collections::VecDeque<(FlipInfo, Box<dyn crate::core::buffered::InFlightFuture>)>,
 
     /// Tracks whether record_frame() was called during the current Presented callback.
     /// Reset to false before each Presented callback by run_buffered().
@@ -470,6 +473,64 @@ pub struct VSEContext {
     config: VSEConfig,
     session: Option<ExperimentSession>,
     event_loop: Option<EventLoop<()>>,
+}
+
+impl VSEState {
+    /// Build a confirmed `FlipInfo` from an estimated one captured at submit time.
+    ///
+    /// Queries the timing provider for the actual present time, computes missed-frame
+    /// detection, and updates `last_present_time` for the next call.
+    fn build_confirmed_flip(&mut self, estimated: FlipInfo) -> FlipInfo {
+        let confirmed_present = self.timing_provider.record_present_time(&self.clock);
+
+        let frame_duration = self
+            .last_present_time
+            .map(|prev| confirmed_present.duration_since(prev));
+
+        let expected = self
+            .expected_frame_duration
+            .unwrap_or(Duration::from_micros(16_667));
+
+        // Auto-detect refresh rate using the same logic as flip()
+        if self.expected_frame_duration.is_none() {
+            if let Some(dur) = self.timing_provider.refresh_cycle_duration() {
+                self.expected_frame_duration = Some(dur);
+            } else if let Some(dur) = frame_duration {
+                self.refresh_detect_samples.push(dur);
+                if self.refresh_detect_samples.len() >= 10 {
+                    let total: Duration = self.refresh_detect_samples.iter().copied().sum();
+                    let avg = total / self.refresh_detect_samples.len() as u32;
+                    self.expected_frame_duration = Some(avg);
+                }
+            }
+        }
+
+        let (missed, missed_count) = match frame_duration {
+            Some(dur) => {
+                let ratio = dur.as_micros() as f64 / expected.as_micros() as f64;
+                if ratio > 1.5 {
+                    (true, (ratio.round() as u32).saturating_sub(1))
+                } else {
+                    (false, 0)
+                }
+            }
+            None => (false, 0),
+        };
+
+        let flip = FlipInfo {
+            frame_number: estimated.frame_number,
+            timing_source: self.timing_provider.source(),
+            submit_time: estimated.submit_time,
+            present_time: confirmed_present,
+            missed,
+            missed_count,
+            skipped: false,
+        };
+
+        self.last_present_time = Some(confirmed_present);
+
+        flip
+    }
 }
 
 impl VSEContext {
@@ -1174,6 +1235,353 @@ impl VSEContext {
         info!("VSEContext shut down cleanly");
         Ok(())
     }
+
+    /// Run the experiment loop in buffered (pipelined) mode.
+    ///
+    /// Unlike [`run()`], which blocks on every GPU fence, `run_buffered` pipelines CPU
+    /// and GPU work across frames via [`FlipEvent::Render`] and [`FlipEvent::Presented`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any `VSEError` returned by the callback.
+    pub fn run_buffered<T, F>(
+        mut self,
+        config: BufferedConfig,
+        mut callback: F,
+    ) -> Result<(), VSEError>
+    where
+        T: std::any::Any + serde::Serialize + Send + 'static,
+        F: FnMut(FlipEvent<T>, &mut RenderContext<'_>) -> Result<(), VSEError> + 'static,
+    {
+        use crate::core::buffered::PendingFrame;
+        use std::collections::VecDeque;
+
+        // Branch for direct display mode
+        #[cfg(target_os = "linux")]
+        if self.config.window_mode == WindowMode::DirectDisplay {
+            return Err(VSEError::EventLoop(
+                "run_buffered() does not support DirectDisplay mode".into(),
+            ));
+        }
+
+        let event_loop = self
+            .event_loop
+            .take()
+            .ok_or_else(|| VSEError::EventLoop("Event loop already consumed".into()))?;
+
+        let mut vse_config = self.config;
+        let mut session = self.session;
+        let mut state: Option<VSEState> = None;
+
+        // pending_frames lives alongside in_flight fences; same FIFO order.
+        let pending_frames: Rc<RefCell<VecDeque<PendingFrame<T>>>> =
+            Rc::new(RefCell::new(VecDeque::with_capacity(config.depth + 1)));
+
+        let error: Rc<RefCell<Option<VSEError>>> = Rc::new(RefCell::new(None));
+        let error_clone = error.clone();
+
+        event_loop
+            .run(move |event, elwt| {
+                elwt.set_control_flow(ControlFlow::Poll);
+
+                match event {
+                    Event::Resumed => {
+                        if state.is_some() {
+                            return;
+                        }
+                        match Self::initialize_compositor(elwt, &vse_config) {
+                            Ok(mut s) => {
+                                s.recording = session.take().map(|sess| RecordingState {
+                                    session: sess,
+                                    pending_flip: None,
+                                    last_claimed_frame: None,
+                                });
+                                s.in_buffered_mode = true;
+                                let required = (config.depth + 1) as u32;
+                                if let Err(e) = s.swapchain.ensure_image_count(required) {
+                                    *error_clone.borrow_mut() = Some(e.into());
+                                    elwt.exit();
+                                    return;
+                                }
+                                state = Some(s);
+                            }
+                            Err(e) => {
+                                *error_clone.borrow_mut() = Some(e);
+                                elwt.exit();
+                            }
+                        }
+                    }
+                    Event::WindowEvent {
+                        event: window_event,
+                        ..
+                    } => {
+                        let s = match &mut state {
+                            Some(s) => s,
+                            None => return,
+                        };
+                        match window_event {
+                            WindowEvent::CloseRequested => {
+                                info!("Window close requested");
+                                s.should_close = true;
+                                // Do NOT call elwt.exit() yet — let RedrawRequested drain.
+                            }
+                            WindowEvent::Resized(new_size) => {
+                                debug!("Window resized to {}x{}", new_size.width, new_size.height);
+                                if new_size.width == 0 || new_size.height == 0 {
+                                    s.minimized = true;
+                                } else {
+                                    s.minimized = false;
+                                    s.display_size = (new_size.width, new_size.height);
+                                    s.swapchain.mark_needs_recreation();
+                                }
+                            }
+                            WindowEvent::KeyboardInput { event, .. } => {
+                                if let PhysicalKey::Code(key_code) = event.physical_key {
+                                    let timestamp = s.clock.now();
+                                    let logical_key = event.logical_key.clone();
+                                    match event.state {
+                                        ElementState::Pressed => {
+                                            let repeat = s.input.keys_down.contains(&key_code);
+                                            s.input.keys_down.insert(key_code);
+                                            if !repeat {
+                                                s.input.keys_just_pressed.insert(key_code);
+                                            }
+                                            s.input.events.push(InputEvent::KeyDown {
+                                                key_code,
+                                                logical_key,
+                                                timestamp,
+                                                repeat,
+                                            });
+                                        }
+                                        ElementState::Released => {
+                                            s.input.keys_down.remove(&key_code);
+                                            s.input.keys_just_released.insert(key_code);
+                                            s.input.events.push(InputEvent::KeyUp {
+                                                key_code,
+                                                logical_key,
+                                                timestamp,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            WindowEvent::CursorMoved { position, .. } => {
+                                let timestamp = s.clock.now();
+                                s.input.mouse_position = (position.x, position.y);
+                                s.input.events.push(InputEvent::MouseMove {
+                                    x: position.x,
+                                    y: position.y,
+                                    timestamp,
+                                });
+                            }
+                            WindowEvent::MouseInput {
+                                state: btn_state,
+                                button,
+                                ..
+                            } => {
+                                let timestamp = s.clock.now();
+                                let btn: MouseButton = button.into();
+                                let (mx, my) = s.input.mouse_position;
+                                match btn_state {
+                                    ElementState::Pressed => {
+                                        s.input.buttons_down.insert(btn);
+                                        s.input.buttons_just_pressed.insert(btn);
+                                        s.input.events.push(InputEvent::MouseDown {
+                                            button: btn,
+                                            x: mx,
+                                            y: my,
+                                            timestamp,
+                                        });
+                                    }
+                                    ElementState::Released => {
+                                        s.input.buttons_down.remove(&btn);
+                                        s.input.events.push(InputEvent::MouseUp {
+                                            button: btn,
+                                            x: mx,
+                                            y: my,
+                                            timestamp,
+                                        });
+                                    }
+                                }
+                            }
+                            WindowEvent::MouseWheel { delta, .. } => {
+                                let timestamp = s.clock.now();
+                                let (dx, dy) = match delta {
+                                    MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64),
+                                    MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
+                                };
+                                s.input.events.push(InputEvent::MouseWheel {
+                                    delta_x: dx,
+                                    delta_y: dy,
+                                    timestamp,
+                                });
+                            }
+                            WindowEvent::RedrawRequested => {
+                                if s.minimized {
+                                    return;
+                                }
+
+                                // ── Phase 1: Check for confirmed presentation ──────────
+                                let oldest_complete = s
+                                    .buffered_in_flight
+                                    .front()
+                                    .map(|(_, fence)| fence.is_complete())
+                                    .unwrap_or(false);
+
+                                if oldest_complete {
+                                    let (estimated_flip, fence) =
+                                        s.buffered_in_flight.pop_front().unwrap();
+                                    fence.wait_blocking();
+
+                                    if let Some(pf) = pending_frames.borrow_mut().pop_front() {
+                                        let confirmed = s.build_confirmed_flip(estimated_flip);
+                                        s.buffered_confirmed_flip = Some(confirmed.clone());
+                                        s.buffered_record_called_this_presented = false;
+
+                                        let mut render_ctx = RenderContext {
+                                            state: s,
+                                            config: &mut vse_config,
+                                        };
+                                        if let Err(e) = callback(
+                                            FlipEvent::Presented {
+                                                flip_info: confirmed,
+                                                payload: pf.payload,
+                                            },
+                                            &mut render_ctx,
+                                        ) {
+                                            *error_clone.borrow_mut() = Some(e);
+                                            elwt.exit();
+                                            return;
+                                        }
+                                        s.buffered_confirmed_flip = None;
+                                    }
+                                }
+
+                                // Early exit if callback requested close during Presented
+                                if s.should_close {
+                                    Self::drain_buffered(
+                                        s,
+                                        &mut vse_config,
+                                        &pending_frames,
+                                        &mut callback,
+                                    );
+                                    if let Some(recording) = &mut s.recording {
+                                        recording.on_shutdown();
+                                    }
+                                    s.in_buffered_mode = false;
+                                    elwt.exit();
+                                    return;
+                                }
+
+                                // ── Phase 2: Render ────────────────────────────────────
+                                {
+                                    let mut render_ctx = RenderContext {
+                                        state: s,
+                                        config: &mut vse_config,
+                                    };
+                                    if let Err(e) = callback(FlipEvent::Render, &mut render_ctx) {
+                                        *error_clone.borrow_mut() = Some(e);
+                                        elwt.exit();
+                                        return;
+                                    }
+
+                                    // Pick up payload stored by flip_with_payload()
+                                    if let Some(raw) = s.buffered_pending_payload.take() {
+                                        let payload = *raw
+                                            .downcast::<T>()
+                                            .expect("buffered payload type mismatch");
+                                        if let Some((estimated_flip, _)) =
+                                            s.buffered_in_flight.back()
+                                        {
+                                            let ef = estimated_flip.clone();
+                                            pending_frames.borrow_mut().push_back(PendingFrame {
+                                                frame_number: ef.frame_number,
+                                                payload,
+                                                estimated_flip: ef,
+                                            });
+                                        }
+                                    }
+                                }
+
+                                s.input.begin_frame();
+
+                                if s.should_close {
+                                    Self::drain_buffered(
+                                        s,
+                                        &mut vse_config,
+                                        &pending_frames,
+                                        &mut callback,
+                                    );
+                                    if let Some(recording) = &mut s.recording {
+                                        recording.on_shutdown();
+                                    }
+                                    s.in_buffered_mode = false;
+                                    elwt.exit();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Event::AboutToWait => {
+                        if let Some(s) = &state {
+                            if let Some(w) = &s.window {
+                                w.request_redraw();
+                            }
+                        }
+                    }
+                    Event::LoopExiting => {
+                        if let Some(s) = &mut state {
+                            s.in_buffered_mode = false;
+                            if let Some(recording) = &mut s.recording {
+                                recording.on_shutdown();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            })
+            .map_err(|e| VSEError::EventLoop(e.to_string()))?;
+
+        if let Some(err) = error.borrow_mut().take() {
+            return Err(err);
+        }
+
+        info!("VSEContext (buffered) shut down cleanly");
+        Ok(())
+    }
+
+    /// Drain all remaining in-flight fences and fire Presented events.
+    ///
+    /// Called on clean shutdown from within `run_buffered()`.
+    fn drain_buffered<T, F>(
+        state: &mut VSEState,
+        config: &mut VSEConfig,
+        pending_frames: &Rc<
+            RefCell<std::collections::VecDeque<crate::core::buffered::PendingFrame<T>>>,
+        >,
+        callback: &mut F,
+    ) where
+        T: std::any::Any + serde::Serialize + Send + 'static,
+        F: FnMut(FlipEvent<T>, &mut RenderContext<'_>) -> Result<(), VSEError>,
+    {
+        while let Some((estimated_flip, fence)) = state.buffered_in_flight.pop_front() {
+            fence.wait_blocking();
+            if let Some(pf) = pending_frames.borrow_mut().pop_front() {
+                let confirmed = state.build_confirmed_flip(estimated_flip);
+                state.buffered_confirmed_flip = Some(confirmed.clone());
+                state.buffered_record_called_this_presented = false;
+                let mut render_ctx = RenderContext { state, config };
+                let _ = callback(
+                    FlipEvent::Presented {
+                        flip_info: confirmed,
+                        payload: pf.payload,
+                    },
+                    &mut render_ctx,
+                );
+                state.buffered_confirmed_flip = None;
+            }
+        }
+    }
 }
 
 /// Render context passed to the render callback
@@ -1427,10 +1835,11 @@ impl<'a> RenderContext<'a> {
         let submit_time = self.state.clock.now();
 
         // Non-blocking submit — returns immediately, keeps fence alive
-        let in_flight = self
-            .state
-            .swapchain
-            .submit_nonblocking(self.state.queue.clone(), image_index, future)?;
+        let in_flight = self.state.swapchain.submit_nonblocking(
+            self.state.queue.clone(),
+            image_index,
+            future,
+        )?;
 
         let estimated_present = self.state.clock.now();
 
