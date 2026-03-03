@@ -412,4 +412,80 @@ impl SwapchainManager {
             Err(e) => Err(SwapchainError::PresentFailed(e.to_string())),
         }
     }
+
+    /// Submit a frame to the GPU without blocking on fence completion.
+    ///
+    /// Returns a `Box<dyn InFlightFuture>` that must be kept alive until the frame
+    /// is confirmed. Dropping it would trigger an implicit wait and defeat pipelining.
+    ///
+    /// Used exclusively by `run_buffered()`. For synchronous rendering use [`present()`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwapchainError::PresentFailed` if submission fails.
+    /// Returns `SwapchainError::OutOfDate` if the swapchain needs recreation.
+    pub(crate) fn submit_nonblocking<F>(
+        &mut self,
+        queue: Arc<vulkano::device::Queue>,
+        image_index: u32,
+        wait_future: F,
+    ) -> Result<Box<dyn crate::core::buffered::InFlightFuture>, SwapchainError>
+    where
+        F: GpuFuture + 'static,
+    {
+        use std::time::Duration;
+        use crate::core::buffered::InFlightFuture;
+
+        let present_info =
+            SwapchainPresentInfo::swapchain_image_index(self.swapchain.clone(), image_index);
+
+        let fence = wait_future
+            .then_swapchain_present(queue, present_info)
+            .then_signal_fence_and_flush()
+            .map_err(|e| {
+                if matches!(e, Validated::Error(VulkanError::OutOfDate)) {
+                    self.needs_recreation = true;
+                    SwapchainError::OutOfDate
+                } else {
+                    SwapchainError::PresentFailed(e.to_string())
+                }
+            })?;
+
+        struct VulkanoFence<F: GpuFuture>(
+            vulkano::sync::future::FenceSignalFuture<F>,
+        );
+
+        impl<F: GpuFuture + 'static> InFlightFuture for VulkanoFence<F> {
+            fn is_complete(&self) -> bool {
+                self.0.wait(Some(Duration::ZERO)).is_ok()
+            }
+            fn wait_blocking(&self) {
+                let _ = self.0.wait(None);
+            }
+        }
+
+        Ok(Box::new(VulkanoFence(fence)))
+    }
+
+    /// Ensure the swapchain has at least `min_count` images.
+    ///
+    /// If the current swapchain already has enough images this is a no-op.
+    /// Otherwise the swapchain is recreated with the requested count.
+    ///
+    /// Used by `run_buffered()` to match the swapchain image count to the
+    /// pipeline depth.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwapchainError` if recreation fails.
+    pub fn ensure_image_count(&mut self, min_count: u32) -> Result<(), SwapchainError> {
+        if self.images.len() as u32 >= min_count {
+            return Ok(());
+        }
+        let new_config = SwapchainConfig {
+            image_count: min_count,
+            ..self.config.clone()
+        };
+        self.recreate(new_config)
+    }
 }
