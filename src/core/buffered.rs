@@ -3,31 +3,52 @@
 use crate::data::OverflowBehavior;
 use crate::timing::FlipInfo;
 
-/// Configuration for [`VSEContext::run_buffered`].
+/// Configuration for [`crate::core::VSEContext::run_buffered`].
+///
+/// Controls the pipeline depth and overflow policy of the buffered flip loop.
+/// [`Default`] provides `depth = 1` with blocking overflow — the right choice
+/// for the vast majority of closed-loop experiments.
 ///
 /// # Example
+///
 /// ```
 /// use vision_stimulus_engine::prelude::*;
-/// let cfg = BufferedConfig { depth: 1, overflow: OverflowBehavior::Block };
+/// // Most experiments: one frame of pipelining, never drop data.
+/// let cfg = BufferedConfig::default();
+/// assert_eq!(cfg.depth, 1);
+///
+/// // High-throughput rendering where occasional data loss is acceptable:
+/// let cfg2 = BufferedConfig {
+///     depth: 2,
+///     overflow: OverflowBehavior::DropWithWarning,
+/// };
 /// ```
 #[derive(Debug, Clone)]
 pub struct BufferedConfig {
     /// Number of frames to pipeline ahead of confirmed GPU scanout.
     ///
-    /// - `1` (double-buffering): CPU is one frame ahead of confirmed GPU output.
-    ///   Swapchain image count is set to 2.
-    /// - `2` (triple-buffering): CPU is two frames ahead. Swapchain image count is 3.
+    /// | `depth` | Swapchain images | Latency at 60 Hz | Recommended for |
+    /// |---------|-----------------|------------------|-----------------|
+    /// | `1`     | 2               | ~16 ms           | Most experiments (default) |
+    /// | `2`     | 3               | ~33 ms           | High GPU utilization |
     ///
-    /// Higher values increase GPU utilization but add closed-loop reaction latency.
-    /// For most experiments `depth = 1` is the right choice.
+    /// With `depth = 1`, the CPU is always one frame ahead of the last confirmed
+    /// scanout. When `FlipEvent::Presented` fires for frame N, frame N+1 has already
+    /// been submitted to the GPU. Closed-loop updates in `Presented` take effect
+    /// from frame N+2 onward.
+    ///
+    /// Higher values increase GPU pipeline fill and can improve frame rate
+    /// stability, but each additional level adds one frame (~16 ms at 60 Hz)
+    /// of closed-loop reaction latency.
     pub depth: usize,
 
     /// What to do when the pending-confirmation queue is full.
     ///
     /// - [`OverflowBehavior::Block`]: stall the render loop until space is available.
-    ///   No data loss. Default.
+    ///   No data loss. **Default.**
     /// - [`OverflowBehavior::DropWithWarning`]: discard the oldest unconfirmed frame
-    ///   and emit `tracing::warn!`. Never stalls; risk of data loss if writer falls behind.
+    ///   and emit `tracing::warn!`. Never stalls; risk of data loss if the writer
+    ///   falls behind the render loop.
     pub overflow: OverflowBehavior,
 }
 
@@ -40,32 +61,65 @@ impl Default for BufferedConfig {
     }
 }
 
-/// Events dispatched by [`VSEContext::run_buffered`].
+/// Events dispatched by [`crate::core::VSEContext::run_buffered`].
 ///
-/// The loop alternates between two phases each vblank:
+/// Each vblank produces two events (after the warm-up period):
 ///
-/// 1. **`Presented`** (once the GPU confirms frame `N - depth` was scanned out)
-/// 2. **`Render`** (build and submit frame `N`)
+/// 1. **`Presented`** — the GPU has confirmed that frame `N - depth` was scanned out.
+///    `flip_info.present_time` carries a hardware-verified timestamp. Call
+///    `RenderContext::record_frame` here.
+/// 2. **`Render`** — build and submit frame `N`. Call
+///    `RenderContext::flip_with_payload` before returning.
 ///
-/// During startup (the first `depth` iterations), only `Render` fires — there are no
-/// confirmed frames yet.
+/// During the first `depth` iterations the queue is warming up and only `Render`
+/// fires — there are no confirmed frames yet.
+///
+/// # Two-phase frame timeline (depth = 1)
+///
+/// ```text
+/// vblank N:   [Render N]   → submit non-blocking → GPU processing
+/// vblank N+1: [Presented N] → record confirmed timing
+///             [Render N+1] → submit non-blocking → GPU processing
+/// vblank N+2: [Presented N+1] → record confirmed timing
+///             [Render N+2] → ...
+/// ```
 ///
 /// # Pattern matching
 ///
 /// Because this enum is `#[non_exhaustive]`, always include a catch-all arm:
 ///
 /// ```rust,ignore
-/// match event {
-///     FlipEvent::Render => { /* build frame */ }
-///     FlipEvent::Presented { flip_info, payload } => { /* react + record */ }
-///     _ => {}
-/// }
+/// use vision_stimulus_engine::prelude::*;
+///
+/// #[derive(serde::Serialize)]
+/// struct FrameData { contrast: f32 }
+///
+/// let mut contrast = 1.0f32;
+///
+/// context.run_buffered::<FrameData, _>(BufferedConfig::default(), move |event, vse| {
+///     match event {
+///         FlipEvent::Render => {
+///             vse.clear()?;
+///             // draw stimulus at current contrast …
+///             vse.flip_with_payload(None, FrameData { contrast })?;
+///         }
+///         FlipEvent::Presented { flip_info, payload } => {
+///             // Confirmed timing — safe to record
+///             vse.record_frame(payload)?;
+///             // Closed-loop: reduce contrast when a frame is missed
+///             if flip_info.missed { contrast *= 0.9; }
+///         }
+///         _ => {}
+///     }
+///     Ok(())
+/// })?;
+/// # Ok::<(), vision_stimulus_engine::prelude::VSEError>(())
 /// ```
 #[non_exhaustive]
 pub enum FlipEvent<T> {
     /// Build and submit the next frame.
     ///
-    /// Call [`RenderContext::flip_with_payload`] before returning from this arm.
+    /// Call `RenderContext::flip_with_payload` before returning from this arm.
     /// Drawing calls (`clear`, `draw_rect`, etc.) work normally here.
     /// `record_frame()` is **not** valid in this arm — call it in `Presented`.
     Render,

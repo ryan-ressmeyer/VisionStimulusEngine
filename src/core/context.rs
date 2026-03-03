@@ -1242,12 +1242,68 @@ impl VSEContext {
 
     /// Run the experiment loop in buffered (pipelined) mode.
     ///
-    /// Unlike [`run()`], which blocks on every GPU fence, `run_buffered` pipelines CPU
-    /// and GPU work across frames via [`FlipEvent::Render`] and [`FlipEvent::Presented`].
+    /// Unlike [`Self::run`], which blocks on every GPU fence, `run_buffered` pipelines CPU
+    /// and GPU work across frames. The callback receives two alternating event variants:
+    ///
+    /// - [`FlipEvent::Render`]: build and submit frame `N` via
+    ///   [`flip_with_payload()`](RenderContext::flip_with_payload). Fires every vblank.
+    /// - [`FlipEvent::Presented`]: GPU has confirmed frame `N - depth` was scanned out.
+    ///   `flip_info.present_time` is a confirmed timestamp. Call `record_frame(payload)?`
+    ///   here to record data with accurate timing.
+    ///
+    /// During the first `config.depth` iterations only `Render` fires (queue warming up).
+    /// On clean exit, all pending `Presented` events are drained before returning.
+    ///
+    /// # Closed-loop experiments
+    ///
+    /// The B-frame latency is explicit and predictable: when `Presented` fires for frame
+    /// `N`, frame `N+1` has already been submitted. Stimulus updates in `Presented` take
+    /// effect from frame `N+2` onward.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::{cell::RefCell, rc::Rc};
+    /// use vision_stimulus_engine::prelude::*;
+    ///
+    /// #[derive(serde::Serialize)]
+    /// struct FrameData { trial: u32, contrast: f32 }
+    ///
+    /// let context = VSEContext::builder().with_window_size(800, 600).build()?;
+    ///
+    /// let contrast = Rc::new(RefCell::new(1.0f32));
+    /// let trial    = Rc::new(RefCell::new(0u32));
+    /// let c = contrast.clone();
+    /// let t = trial.clone();
+    ///
+    /// context.run_buffered::<FrameData, _>(BufferedConfig::default(), move |event, vse| {
+    ///     match event {
+    ///         FlipEvent::Render => {
+    ///             vse.clear()?;
+    ///             // draw stimulus …
+    ///             let data = FrameData { trial: *t.borrow(), contrast: *c.borrow() };
+    ///             vse.flip_with_payload(None, data)?;
+    ///         }
+    ///         FlipEvent::Presented { flip_info, payload } => {
+    ///             // Confirmed hardware timing — safe to record
+    ///             vse.record_frame(payload)?;
+    ///             // Closed-loop: reduce contrast on missed frames
+    ///             if flip_info.missed {
+    ///                 *c.borrow_mut() *= 0.9;
+    ///             }
+    ///         }
+    ///         _ => {}
+    ///     }
+    ///     Ok(())
+    /// })?;
+    ///
+    /// # Ok::<(), VSEError>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Propagates any `VSEError` returned by the callback.
+    /// Propagates any `VSEError` returned by the callback, or returns
+    /// `VSEError::EventLoop` if the underlying windowing system fails.
     pub fn run_buffered<T, F>(
         mut self,
         config: BufferedConfig,
@@ -1781,9 +1837,18 @@ impl<'a> RenderContext<'a> {
 
     /// Submit the current frame to the GPU without blocking, attaching a typed payload.
     ///
-    /// Only valid inside [`VSEContext::run_buffered`]. The `payload` is stored and
-    /// delivered alongside the confirmed [`FlipInfo`] in the next
-    /// [`FlipEvent::Presented`] for this frame.
+    /// Only valid inside the [`FlipEvent::Render`] arm of [`VSEContext::run_buffered`].
+    /// The `payload` is stored and delivered alongside the confirmed [`FlipInfo`] in
+    /// the next [`FlipEvent::Presented`] for this frame.
+    ///
+    /// After this call returns, the GPU is processing frame `N` while the CPU is free
+    /// to compute frame `N+1` on the next vblank.
+    ///
+    /// The `target_time` argument optionally schedules the present for a specific
+    /// [`Timestamp`]. Pass `None` for immediate VSync-locked presentation.
+    ///
+    /// Call this method exactly **once** per `Render` event. Calling it multiple times
+    /// or not at all results in queue desynchronisation.
     ///
     /// # Errors
     ///
