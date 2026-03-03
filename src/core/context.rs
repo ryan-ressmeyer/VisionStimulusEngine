@@ -1438,6 +1438,10 @@ impl VSEContext {
                                     fence.wait_blocking();
 
                                     if let Some(pf) = pending_frames.borrow_mut().pop_front() {
+                                        debug_assert_eq!(
+                                            pf.frame_number, pf.estimated_flip.frame_number,
+                                            "PendingFrame FIFO mismatch"
+                                        );
                                         let confirmed = s.build_confirmed_flip(estimated_flip);
                                         s.buffered_confirmed_flip = Some(confirmed.clone());
                                         s.buffered_record_called_this_presented = false;
@@ -1571,6 +1575,10 @@ impl VSEContext {
         while let Some((estimated_flip, fence)) = state.buffered_in_flight.pop_front() {
             fence.wait_blocking();
             if let Some(pf) = pending_frames.borrow_mut().pop_front() {
+                debug_assert_eq!(
+                    pf.frame_number, pf.estimated_flip.frame_number,
+                    "PendingFrame FIFO mismatch"
+                );
                 let confirmed = state.build_confirmed_flip(estimated_flip);
                 state.buffered_confirmed_flip = Some(confirmed.clone());
                 state.buffered_record_called_this_presented = false;

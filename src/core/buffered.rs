@@ -106,3 +106,47 @@ pub(crate) struct PendingFrame<T> {
     /// Best available timing at submit time. Replaced by confirmed timing in `Presented`.
     pub estimated_flip: FlipInfo,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffered_config_default() {
+        let cfg = BufferedConfig::default();
+        assert_eq!(cfg.depth, 1);
+    }
+
+    #[test]
+    fn flip_event_render_matches() {
+        let event: FlipEvent<u32> = FlipEvent::Render;
+        match event {
+            FlipEvent::Render => {}
+            FlipEvent::Presented { .. } => {}
+            // catch-all required by #[non_exhaustive]
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn flip_event_presented_matches() {
+        use crate::timing::{FlipInfo, Timestamp, TimingSource};
+        let flip = FlipInfo {
+            frame_number: 0,
+            timing_source: TimingSource::CpuEstimate,
+            submit_time: Timestamp::from_micros(0),
+            present_time: Timestamp::from_micros(16_667),
+            missed: false,
+            missed_count: 0,
+            skipped: false,
+        };
+        let event: FlipEvent<u32> = FlipEvent::Presented {
+            flip_info: flip,
+            payload: 42,
+        };
+        match event {
+            FlipEvent::Presented { payload, .. } => assert_eq!(payload, 42),
+            _ => panic!("expected Presented"),
+        }
+    }
+}
