@@ -37,11 +37,7 @@ pub trait TimingProvider {
     ///
     /// The default implementation returns `None`; the CPU path uses fence-signal time
     /// from `record_present_time()` instead.
-    fn confirmed_present_time_for(
-        &self,
-        _frame_number: u64,
-        _clock: &Clock,
-    ) -> Option<Timestamp> {
+    fn confirmed_present_time_for(&self, _frame_number: u64, _clock: &Clock) -> Option<Timestamp> {
         None
     }
 }
@@ -243,11 +239,7 @@ impl TimingProvider for GoogleDisplayTimingProvider {
         }
     }
 
-    fn confirmed_present_time_for(
-        &self,
-        frame_number: u64,
-        clock: &Clock,
-    ) -> Option<Timestamp> {
+    fn confirmed_present_time_for(&self, frame_number: u64, clock: &Clock) -> Option<Timestamp> {
         // Map frame_number to a present_id. We use (frame_number & 0xFFFF_FFFF) as
         // a u32 present_id. This matches any future VkPresentTimesInfoGOOGLE
         // integration where the same mapping is used.

@@ -433,8 +433,8 @@ impl SwapchainManager {
     where
         F: GpuFuture + 'static,
     {
-        use std::time::Duration;
         use crate::core::buffered::InFlightFuture;
+        use std::time::Duration;
 
         let present_info =
             SwapchainPresentInfo::swapchain_image_index(self.swapchain.clone(), image_index);
@@ -451,9 +451,7 @@ impl SwapchainManager {
                 }
             })?;
 
-        struct VulkanoFence<F: GpuFuture>(
-            vulkano::sync::future::FenceSignalFuture<F>,
-        );
+        struct VulkanoFence<F: GpuFuture>(vulkano::sync::future::FenceSignalFuture<F>);
 
         impl<F: GpuFuture + 'static> InFlightFuture for VulkanoFence<F> {
             fn is_complete(&self) -> bool {
