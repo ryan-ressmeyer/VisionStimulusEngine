@@ -34,12 +34,12 @@ We support a hierarchy of timing mechanisms, ranging from "Gold Standard" to "Be
 
 ### Tier 1: `VK_EXT_present_timing` (The Gold Standard)
 
-* **What it is:** A 2025 extension that provides a hardware feedback loop.
+* **What it is:** A hardware feedback loop, released in Vulkan 1.4.335 (November 2025) after ~5 years of development.
 * **Capabilities:**
 * **Scheduling:** Allows specifying an `earliestPresentTime`. The GPU will hold the frame until this specific nanosecond, eliminating early flips.
 * **Feedback:** Returns `VkPastPresentationTimingEXT`, containing the exact hardware clock time when the image scanout began.
 
-* **Status:** Preferred. Requires recent drivers (NVIDIA Beta / Mesa 26.1+).
+* **Status:** Preferred, and now shipping. Available in stable Mesa 26.1 (AMD/RADV, NVIDIA/NVK, Intel/ANV) and the NVIDIA 595 series; verified on Intel (Mesa 26.1.4). VSE adoption now needs only `ash` pinned to git (the raw bindings landed on `master`; no published release carries them yet) and the calls wired up.
 
 ### Tier 2: `VK_GOOGLE_display_timing` (The Silver Standard)
 
