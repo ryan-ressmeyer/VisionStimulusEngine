@@ -9,5 +9,5 @@ mod host_info;
 
 pub use host_info::{
     BuildInfo, CpuInfo, DisplayInfo, EdidInfo, GpuInfo, HostInfo, MemoryInfo, OsInfo,
-    PipelineConfig, RuntimeEnv, SwapchainInfo,
+    PipelineConfig, RuntimeEnv, SwapchainInfo, TimingCapabilities,
 };

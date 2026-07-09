@@ -47,6 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let backend = vse.display_backend();
             eprintln!("Acquisition successful!");
             eprintln!("Backend: {}", backend.description());
+            eprintln!("Timing source: {}", vse.timing_source());
             let (w, h) = vse.window_size();
             eprintln!("Display: {}x{}", w, h);
             eprintln!();

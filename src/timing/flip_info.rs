@@ -21,8 +21,7 @@ use super::timing_source::TimingSource;
 ///
 /// The meaning of `present_time` depends on `timing_source`:
 /// - `CpuEstimate`: CPU clock reading after fence signal
-/// - `GoogleDisplayTiming`: driver-reported actual present time
-/// - `ExtPresentTiming`: hardware scanout timestamp (future)
+/// - `ExtPresentTiming`: hardware scanout timestamp (`IMAGE_FIRST_PIXEL_OUT`)
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FlipInfo {
     /// Monotonically increasing frame number (0-indexed from first flip)
@@ -36,6 +35,21 @@ pub struct FlipInfo {
 
     /// Present timestamp (meaning depends on timing_source)
     pub present_time: Timestamp,
+
+    /// The `VK_KHR_present_id2` id assigned to this present, for correlation with raw
+    /// driver timing logs and external systems. Zero for the CPU-estimate path and for
+    /// skipped frames (no present was submitted).
+    pub present_id: u64,
+
+    /// The scheduled target present time, if this flip requested one. `None` for
+    /// immediate (VSync-locked) presents. Under `ExtPresentTiming` the target is
+    /// hardware-enforced; under `CpuEstimate` it is best-effort.
+    pub target_time: Option<Timestamp>,
+
+    /// Whether the frame was presented on or after its `target_time`. `true` when no
+    /// target was requested (vacuously on-target) or when the confirmed scanout met the
+    /// target. Only meaningful under `ExtPresentTiming`.
+    pub on_target: bool,
 
     /// Whether this frame was likely missed (frame_duration > 1.5 * expected)
     pub missed: bool,
@@ -57,6 +71,9 @@ impl FlipInfo {
             timing_source: TimingSource::CpuEstimate,
             submit_time: Timestamp::from_micros(0),
             present_time: Timestamp::from_micros(0),
+            present_id: 0,
+            target_time: None,
+            on_target: true,
             missed: false,
             missed_count: 0,
             skipped: true,
@@ -85,6 +102,9 @@ mod tests {
             timing_source: TimingSource::CpuEstimate,
             submit_time: Timestamp::from_micros(1000),
             present_time: Timestamp::from_micros(2000),
+            present_id: 11,
+            target_time: None,
+            on_target: true,
             missed: false,
             missed_count: 0,
             skipped: false,

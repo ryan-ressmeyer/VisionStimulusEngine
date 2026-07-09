@@ -37,8 +37,8 @@ use crate::drawing::primitives::{default_circle_segments, DrawCommand};
 use crate::drawing::renderer::{Renderer, RendererError};
 use crate::drawing::{Color, GaborParams, GratingParams, NoiseParams, TextureHandle};
 use crate::timing::{
-    Clock, CpuTimingProvider, FlipInfo, GoogleDisplayTimingProvider, Timestamp, TimingProvider,
-    TimingSource,
+    Clock, CpuTimingProvider, ExtPresentTimingProvider, FlipInfo, HostClockBridge, ScanoutClock,
+    ScanoutTimestamp, Timestamp, TimingProvider, TimingSource,
 };
 
 /// Errors that can occur in VSEContext
@@ -141,6 +141,9 @@ pub struct VSEConfig {
     /// Override acquisition probe order for DirectDisplay mode.
     /// Default: [NoCompositor, DrmAcquire, XlibAcquire].
     pub direct_display_acquisition_order: Option<Vec<AcquisitionMethod>>,
+    /// Enable the opt-in host↔scanout clock bridge (see [`VSEContextBuilder::with_host_clock_bridge`]).
+    /// Off by default: display timing lives in the scanout clock and needs no bridge.
+    pub host_clock_bridge: bool,
 }
 
 impl Default for VSEConfig {
@@ -158,6 +161,7 @@ impl Default for VSEConfig {
             cursor_visible: None,
             direct_display_video_mode: None,
             direct_display_acquisition_order: None,
+            host_clock_bridge: false,
         }
     }
 }
@@ -237,6 +241,18 @@ impl VSEContextBuilder {
     /// first 10 frames.
     pub fn with_expected_refresh_rate(mut self, hz: f64) -> Self {
         self.config.expected_refresh_rate = Some(hz);
+        self
+    }
+
+    /// Enable the host↔scanout clock bridge.
+    ///
+    /// VSE's primary clock is the display's scanout clock; display timing needs no host clock.
+    /// Enable this only when you must place host-originated events (key presses, network
+    /// messages) into scanout time, or read a host-clock value for a scanout timestamp. It runs
+    /// a low-rate background calibration ([`RenderContext::host_to_scanout`]) and requires the
+    /// `VK_EXT_present_timing` backend; it is a no-op on the CPU-estimate path.
+    pub fn with_host_clock_bridge(mut self) -> Self {
+        self.config.host_clock_bridge = true;
         self
     }
 
@@ -408,6 +424,14 @@ struct VSEState {
     last_present_time: Option<Timestamp>,
     expected_frame_duration: Option<Duration>,
     refresh_detect_samples: Vec<Duration>,
+    /// Scanout-clock epoch (present-stage-local `t=0`), established on the first flip under the
+    /// EXT backend. `None` on the CPU-estimate path (no scanout clock available).
+    scanout_clock: Option<ScanoutClock>,
+    /// Opt-in host↔scanout bridge (see `with_host_clock_bridge`). `None` unless requested and
+    /// the EXT backend is active.
+    host_bridge: Option<HostClockBridge>,
+    /// VSE-clock time of the last bridge sample, for rate-limiting sampling off the hot path.
+    last_bridge_sample_ts: Option<Timestamp>,
     input_source: InputSource,
     /// Physical display dimensions (from window or VkDisplaySurfaceKHR).
     display_size: (u32, u32),
@@ -475,7 +499,87 @@ pub struct VSEContext {
     event_loop: Option<EventLoop<()>>,
 }
 
+/// Select and construct the timing backend for a freshly created device + swapchain.
+///
+/// When the device was created with `VK_EXT_present_timing` (`ext_features` is `Some`), use
+/// the hardware backend; otherwise (or if its function pointers fail to load) fall back
+/// loudly to CPU estimation.
+fn build_timing_provider(
+    device: &std::sync::Arc<vulkano::device::Device>,
+    swapchain: &std::sync::Arc<vulkano::swapchain::Swapchain>,
+    ext_features: Option<crate::core::present_timing_ext::EnabledPresentTimingFeatures>,
+) -> Box<dyn TimingProvider> {
+    if let Some(enabled) = ext_features {
+        match unsafe { ExtPresentTimingProvider::new(device, swapchain, enabled) } {
+            Some(p) => return Box::new(p),
+            None => {
+                warn!("VK_EXT_present_timing function pointers unavailable; using CPU estimation");
+            }
+        }
+    }
+    Box::new(CpuTimingProvider::new())
+}
+
+/// Build the opt-in host↔scanout bridge, if requested and supported.
+///
+/// The bridge needs the `VK_EXT_present_timing` backend's calibrated-timestamp sampler; on the
+/// CPU-estimate path it cannot function, so the request is refused loudly rather than silently
+/// producing a dead bridge.
+fn build_host_bridge(config: &VSEConfig, provider: &dyn TimingProvider) -> Option<HostClockBridge> {
+    if !config.host_clock_bridge {
+        return None;
+    }
+    if provider.source() == TimingSource::ExtPresentTiming {
+        // 2 s window: measured offset stability plateaus by ~1-2 s (docs/clock-synchronization.md).
+        Some(HostClockBridge::new(Duration::from_secs(2)))
+    } else {
+        warn!("host_clock_bridge requested but EXT present-timing backend is unavailable; bridge disabled");
+        None
+    }
+}
+
 impl VSEState {
+    /// Recreate the swapchain from the current surface and notify the timing provider so it
+    /// refreshes any cached swapchain handle (a retired handle is UB to query).
+    fn recreate_swapchain(&mut self, win_size: [u32; 2]) -> Result<(), SwapchainError> {
+        self.swapchain.recreate_from_surface(win_size)?;
+        self.timing_provider
+            .on_swapchain_recreated(self.swapchain.swapchain());
+        Ok(())
+    }
+
+    /// Per-flip clock maintenance: establish the scanout epoch on the first flip and, when the
+    /// host-clock bridge is enabled, feed it a low-rate calibration sample. One calibrated read
+    /// serves both. A no-op on the CPU-estimate path (the provider's sampler returns `None`).
+    fn update_clocks(&mut self) {
+        let need_epoch = self.scanout_clock.is_none();
+        let bridge_due = self.host_bridge.is_some() && self.bridge_sample_due();
+        if !need_epoch && !bridge_due {
+            return;
+        }
+        if let Some(sample) = self.timing_provider.sample_present_calibration() {
+            if need_epoch {
+                // First scanout reading is the session's scanout `t=0`.
+                self.scanout_clock = Some(ScanoutClock::new(sample.stage_ns));
+            }
+            if bridge_due {
+                self.last_bridge_sample_ts = Some(self.clock.now());
+                if let Some(bridge) = &mut self.host_bridge {
+                    bridge.push(sample);
+                }
+            }
+        }
+    }
+
+    /// Whether enough time has elapsed to take another bridge sample (~10 Hz), keeping the
+    /// calibrated-timestamp read off the presentation hot path.
+    fn bridge_sample_due(&self) -> bool {
+        const RESAMPLE_US: u64 = 100_000; // 100 ms
+        let now = self.clock.now().as_micros();
+        self.last_bridge_sample_ts
+            .map_or(true, |t| now.saturating_sub(t.as_micros()) >= RESAMPLE_US)
+    }
+
     /// Build a confirmed `FlipInfo` from an estimated one captured at submit time.
     ///
     /// Queries the timing provider for the actual present time, computes missed-frame
@@ -526,6 +630,9 @@ impl VSEState {
             timing_source: self.timing_provider.source(),
             submit_time: estimated.submit_time,
             present_time: confirmed_present,
+            present_id: estimated.present_id,
+            target_time: estimated.target_time,
+            on_target: estimated.on_target,
             missed,
             missed_count,
             skipped: false,
@@ -673,7 +780,7 @@ impl VSEContext {
         let (device_selector, surface) =
             DeviceSelector::with_surface(config.gpu_preference, window.clone())?;
 
-        let (device, queue) = device_selector.create_device()?;
+        let (device, queue, ext_features) = device_selector.create_device()?;
 
         // Use the actual window size, not the configured size. In fullscreen
         // modes the OS/compositor will have already sized the window to the
@@ -693,15 +800,9 @@ impl VSEContext {
         // Initialize timing
         let clock = Clock::new();
 
-        let timing_provider: Box<dyn TimingProvider> = if device_selector
-            .supports_google_display_timing()
-        {
-            info!("Timing backend: GoogleDisplayTiming (VK_GOOGLE_display_timing)");
-            Box::new(unsafe { GoogleDisplayTimingProvider::new(&device, swapchain.swapchain()) })
-        } else {
-            warn!("VK_GOOGLE_display_timing not available. Using CPU estimation for timing.");
-            Box::new(CpuTimingProvider::new())
-        };
+        let timing_provider: Box<dyn TimingProvider> =
+            build_timing_provider(&device, swapchain.swapchain(), ext_features);
+        let host_bridge = build_host_bridge(config, timing_provider.as_ref());
 
         let expected_frame_duration = config
             .expected_refresh_rate
@@ -730,6 +831,9 @@ impl VSEContext {
             last_present_time: None,
             expected_frame_duration,
             refresh_detect_samples: Vec::with_capacity(10),
+            scanout_clock: None,
+            host_bridge,
+            last_bridge_sample_ts: None,
             input_source: InputSource::Winit,
             display_size: win_size,
             acquired_display: None,
@@ -776,7 +880,8 @@ impl VSEContext {
         let method = direct_surface.method;
         let surface = direct_surface.surface;
 
-        let (device, queue) = device_selector.create_device().map_err(VSEError::Device)?;
+        let (device, queue, ext_features) =
+            device_selector.create_device().map_err(VSEError::Device)?;
 
         let swapchain_config = SwapchainConfig {
             width,
@@ -791,13 +896,9 @@ impl VSEContext {
 
         let clock = Clock::new();
 
-        let timing_provider: Box<dyn TimingProvider> = if device_selector
-            .supports_google_display_timing()
-        {
-            Box::new(unsafe { GoogleDisplayTimingProvider::new(&device, swapchain.swapchain()) })
-        } else {
-            Box::new(CpuTimingProvider::new())
-        };
+        let timing_provider: Box<dyn TimingProvider> =
+            build_timing_provider(&device, swapchain.swapchain(), ext_features);
+        let host_bridge = build_host_bridge(config, timing_provider.as_ref());
 
         let expected_frame_duration = config
             .expected_refresh_rate
@@ -836,6 +937,9 @@ impl VSEContext {
             last_present_time: None,
             expected_frame_duration,
             refresh_detect_samples: Vec::with_capacity(10),
+            scanout_clock: None,
+            host_bridge,
+            last_bridge_sample_ts: None,
             input_source: InputSource::Evdev(evdev_reader),
             display_size: (width, height),
             acquired_display: Some(method),
@@ -1696,7 +1800,7 @@ impl<'a> RenderContext<'a> {
         let (dsw, dsh) = self.state.display_size;
         let win_size_arr = [dsw, dsh];
         if self.state.swapchain.needs_recreation() {
-            self.state.swapchain.recreate_from_surface(win_size_arr)?;
+            self.state.recreate_swapchain(win_size_arr)?;
         }
 
         // Acquire next image
@@ -1704,7 +1808,7 @@ impl<'a> RenderContext<'a> {
             match self.state.swapchain.acquire_next_image() {
                 Ok(result) => result,
                 Err(SwapchainError::OutOfDate) => {
-                    self.state.swapchain.recreate_from_surface(win_size_arr)?;
+                    self.state.recreate_swapchain(win_size_arr)?;
                     let info = FlipInfo::skipped(self.state.frame_number);
                     self.state.frame_number += 1;
                     return Ok(info);
@@ -1760,6 +1864,9 @@ impl<'a> RenderContext<'a> {
             .timing_provider
             .record_present_time(&self.state.clock);
 
+        // Establish the scanout epoch / feed the opt-in host-clock bridge (off hot path).
+        self.state.update_clocks();
+
         // Compute inter-frame duration
         let frame_duration = self
             .state
@@ -1810,11 +1917,17 @@ impl<'a> RenderContext<'a> {
             None => (false, 0),
         };
 
+        // present_id is assigned by the EXT present path; 0 on the CPU-estimate path.
+        let present_id: u64 = 0;
+
         let flip_info = FlipInfo {
             frame_number: self.state.frame_number,
             timing_source: self.state.timing_provider.source(),
             submit_time,
             present_time,
+            present_id,
+            target_time,
+            on_target: true,
             missed,
             missed_count,
             skipped: false,
@@ -1873,7 +1986,7 @@ impl<'a> RenderContext<'a> {
         let (dsw, dsh) = self.state.display_size;
         let win_size_arr = [dsw, dsh];
         if self.state.swapchain.needs_recreation() {
-            self.state.swapchain.recreate_from_surface(win_size_arr)?;
+            self.state.recreate_swapchain(win_size_arr)?;
         }
 
         // Acquire next image (natural backpressure from driver)
@@ -1881,7 +1994,7 @@ impl<'a> RenderContext<'a> {
             match self.state.swapchain.acquire_next_image() {
                 Ok(r) => r,
                 Err(SwapchainError::OutOfDate) => {
-                    self.state.swapchain.recreate_from_surface(win_size_arr)?;
+                    self.state.recreate_swapchain(win_size_arr)?;
                     self.state.frame_number += 1;
                     return Ok(());
                 }
@@ -1920,11 +2033,20 @@ impl<'a> RenderContext<'a> {
 
         let estimated_present = self.state.clock.now();
 
+        // Establish the scanout epoch / feed the opt-in host-clock bridge (off hot path).
+        self.state.update_clocks();
+
+        // present_id is assigned by the EXT present path; 0 on the CPU-estimate path.
+        let present_id: u64 = 0;
+
         let estimated_flip = FlipInfo {
             frame_number: self.state.frame_number,
             timing_source: self.state.timing_provider.source(),
             submit_time,
             present_time: estimated_present,
+            present_id,
+            target_time,
+            on_target: true,
             missed: false,
             missed_count: 0,
             skipped: false,
@@ -2126,6 +2248,57 @@ impl<'a> RenderContext<'a> {
         self.state.frame_number
     }
 
+    /// Sample the display's `PRESENT_STAGE_LOCAL` scanout clock against `CLOCK_MONOTONIC`.
+    ///
+    /// Returns `None` on the CPU-estimate path or before the present-stage time domain has been
+    /// probed. Used to characterize the clock offset and relative drift that the present-timing
+    /// calibration must correct. See `docs/clock-synchronization.md`.
+    pub fn sample_present_calibration(&self) -> Option<crate::timing::CalibrationSample> {
+        self.state.timing_provider.sample_present_calibration()
+    }
+
+    /// Read the current scanout-clock time — VSE's primary experimental clock.
+    ///
+    /// Returns time since the session's scanout epoch (`t=0`, established on the first flip).
+    /// `None` on the CPU-estimate path, or before the first flip has established the epoch.
+    pub fn scanout_now(&self) -> Option<ScanoutTimestamp> {
+        let clock = self.state.scanout_clock?;
+        let sample = self.state.timing_provider.sample_present_calibration()?;
+        Some(clock.rebase(sample.stage_ns))
+    }
+
+    /// Convert a host-clock [`Timestamp`] (e.g. a key-press or network-event time) into scanout
+    /// time, using the opt-in host-clock bridge.
+    ///
+    /// Returns `None` unless the bridge is enabled ([`VSEContextBuilder::with_host_clock_bridge`]),
+    /// warmed up, and the scanout epoch is established. This is the intended way to place
+    /// host-originated events on the scanout timeline.
+    pub fn host_to_scanout(&self, ts: Timestamp) -> Option<ScanoutTimestamp> {
+        let clock = self.state.scanout_clock?;
+        let bridge = self.state.host_bridge.as_ref()?;
+        let mono_ns = self.state.clock.to_monotonic_nanos(ts)?;
+        let stage_ns = bridge.host_to_scanout_ns(mono_ns)?;
+        Some(clock.rebase(stage_ns))
+    }
+
+    /// Convert a scanout timestamp back into a host-clock [`Timestamp`], using the opt-in bridge.
+    ///
+    /// Inverse of [`host_to_scanout`](Self::host_to_scanout); same availability conditions.
+    pub fn scanout_to_host(&self, ts: ScanoutTimestamp) -> Option<Timestamp> {
+        let clock = self.state.scanout_clock?;
+        let bridge = self.state.host_bridge.as_ref()?;
+        let stage_ns = clock.epoch_stage_ns().saturating_add(ts.as_nanos());
+        let mono_ns = bridge.scanout_to_host_ns(stage_ns)?;
+        self.state.clock.from_monotonic_nanos(mono_ns)
+    }
+
+    /// The host-clock bridge's currently fitted relative drift, in ppm (diagnostic).
+    ///
+    /// `None` unless the bridge is enabled and warmed up.
+    pub fn host_clock_bridge_drift_ppm(&self) -> Option<f64> {
+        self.state.host_bridge.as_ref()?.drift_ppm()
+    }
+
     // === Drawing primitives ===
 
     /// Draw a filled rectangle.
@@ -2320,6 +2493,7 @@ impl<'a> RenderContext<'a> {
     pub fn capture_host_info(&self) -> crate::host::HostInfo {
         crate::host::capture::capture_host_info(
             self.state.device_selector.physical_device(),
+            &self.state.device,
             self.state.window.as_deref(),
             &self.state.swapchain,
             self.config,
@@ -2625,6 +2799,9 @@ mod tests {
             timing_source: TimingSource::CpuEstimate,
             submit_time: Timestamp::from_micros(0),
             present_time: Timestamp::from_micros(16_667),
+            present_id: 0,
+            target_time: None,
+            on_target: true,
             missed: false,
             missed_count: 0,
             skipped: false,

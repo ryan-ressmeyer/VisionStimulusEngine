@@ -26,7 +26,23 @@ Modern rendering is a deep, asynchronous pipeline. A "frame" exists on multiple 
 3. **Display Scanout (`t_present`):** The moment the display controller begins reading memory to send to the panel.
 * *This is the only timestamp that matters for science.*
 
+### Which clock do we live in?
 
+Because scanout is the timestamp that matters, **the scanout clock is VSE's primary experimental
+clock** — not something we convert into host time. We anchor a scanout `t=0` at session start,
+schedule onsets as `t0 + k·T`, and record actual scanout times, all natively in the scanout
+domain. The host CPU clock never enters the presentation loop.
+
+This is deliberate agnosticism about the experiment's *ultimate* clock, matching Psychtoolbox:
+
+* **Aligning to a neural-recording / DAQ box** is done **physically** — a photodiode on a stimulus
+  patch feeding the acquisition ADC records true photon onset in *that box's* clock. VSE does not
+  need to know the acquisition clock; it only guarantees deterministic, known onsets in scanout
+  time.
+* **Host-originated events** (key presses, network messages) arrive in CPU `CLOCK_MONOTONIC` time
+  and can only reach scanout time through an **opt-in** calibration bridge (scanout ↔
+  `CLOCK_MONOTONIC`; see [`clock-synchronization.md`](clock-synchronization.md)). It is off the
+  hot path and must be explicitly requested.
 
 ## 3. Supported Timing Mechanisms in Vulkan
 
@@ -89,7 +105,63 @@ pub enum TimingSource {
 3. Else, try `VK_GOOGLE_display_timing`.
 4. Else, fall back to `CpuEstimate` and emit a warning log.
 
-## 5. Historical Context: The Psychtoolbox Method
+## 5. Development vs. Experiment: Windowed and Direct Display
+
+> **Dogma: develop windowed, run experiments in direct display.**
+
+`VK_EXT_present_timing` is a *swapchain* feature and works in **both** windowed/composited
+and direct-display modes — compositor-awareness was the entire point of its multi-year
+standardization, so it is not restricted to direct display. What changes between the two is
+the **fidelity and determinism** of the timing, and VSE reports which one you are getting
+rather than hiding it.
+
+### Windowed / composited (development)
+
+In a normal desktop session your present hands the image to the compositor (Wayland or X11),
+which composites it with everything else and presents on *its* cadence.
+
+- **Pros:** trivial to run, debug, and iterate; works in your normal session; timing data is
+  still hardware-anchored and labeled `ExtPresentTiming`.
+- **Cons:** the reported time reflects when the *compositor's* frame (containing your
+  stimulus) reached the screen — one extra pipeline stage of latency, and exact scheduled
+  targets are honored only if the compositor cooperates (modern Mutter/KWin/wlroots do, via
+  the presentation-time / FIFO protocols). A fullscreen, unoccluded window often gets a
+  direct scanout/flip path that approaches direct-display fidelity — but that is a compositor
+  optimization, **not a guarantee**, and it can silently regress when anything else redraws.
+
+### Direct display (experiments)
+
+VSE's direct-display mode (`VK_KHR_display`, see `docs/guides/display_backends.md`) takes
+exclusive control of the physical display. There is no compositor in the path.
+
+- **Pros:** `IMAGE_FIRST_PIXEL_OUT` is the true hardware scanout of *your* content; scheduled
+  targets are enforced directly by display hardware; no compositor jitter or latency. This is
+  the deterministic, reproducible path.
+- **Cons:** requires a free display / VT; not your everyday desktop session.
+
+### How VSE keeps this honest
+
+Both paths report `TimingSource::ExtPresentTiming`, so the source label alone does not tell
+you which you were on. VSE therefore:
+
+- logs, at startup, which present *stages* the current surface can actually timestamp
+  (`VkPresentTimingSurfaceCapabilitiesEXT::presentStageQueries`), and
+- records, per frame, which present stage produced the timestamp.
+
+A windowed run is thus never silently mistaken for compositor-free scanout timing. **Prototype
+your experiment in a window; collect the data you will publish in direct display.**
+
+> **Note on clock calibration (not a compositor issue).** Hardware scanout timestamps come
+> back in a driver-chosen time domain. Some drivers expose `CLOCK_MONOTONIC` directly; others
+> — including Intel/ANV (Mesa 26.1.4), in *both* windowed and direct display — expose only an
+> opaque `PRESENT_STAGE_LOCAL` clock. VSE bridges that to `CLOCK_MONOTONIC` (and thus to your
+> ephys hardware) using `VK_KHR_calibrated_timestamps` — the mechanism the extension was
+> designed around. This calibration is required regardless of windowed vs. direct display; the
+> reason to run experiments in direct display is *fidelity and determinism* (no compositor
+> latency, jitter, or reordering), not the clock domain. Full details, including the measured
+> error on this hardware, are in [`clock-synchronization.md`](clock-synchronization.md).
+
+## 6. Historical Context: The Psychtoolbox Method
 
 Historically, **Psychtoolbox-3 (PTB)** set the standard for timing precision using OpenGL. Since older APIs lacked explicit timing controls, PTB achieved precision through "Blocking and Polling":
 
@@ -100,7 +172,7 @@ Historically, **Psychtoolbox-3 (PTB)** set the standard for timing precision usi
 **The Improvement:**
 VisionStimulusEngine's use of `VK_EXT_present_timing` replaces these CPU-intensive "hacks" with a **Hardware Contract**. We do not fight the OS scheduler; we simply register a time with the GPU, and the hardware guarantees execution and reporting. This results in lower CPU usage and higher reliability across different OS versions.
 
-## 6. References
+## 7. References
 
 **Core Standards:**
 

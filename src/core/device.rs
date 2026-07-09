@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use vulkano::{
     device::{
         physical::{PhysicalDevice, PhysicalDeviceType},
@@ -431,28 +431,68 @@ impl DeviceSelector {
         &self.physical_device.properties().device_name
     }
 
-    /// Check if the physical device supports VK_GOOGLE_display_timing
-    pub fn supports_google_display_timing(&self) -> bool {
-        self.physical_device
-            .supported_extensions()
-            .google_display_timing
-    }
-
-    /// Create a logical device with the necessary queues
+    /// Create a logical device with the necessary queues.
+    ///
+    /// Prefers a device with the `VK_EXT_present_timing` family enabled (created raw and
+    /// adopted, since vulkano 0.35 cannot express these Vulkan 1.4 extensions). Falls back
+    /// to a standard vulkano device — with CPU-estimate timing — when the extension is
+    /// unavailable or its device creation fails.
     ///
     /// # Returns
     ///
-    /// A tuple containing the logical device and the graphics queue.
+    /// The logical device, its graphics queue, and — when the EXT path was taken — the
+    /// present-timing sub-features that were actually enabled.
     ///
     /// # Errors
     ///
-    /// Returns `DeviceError` if device creation fails.
-    pub fn create_device(&self) -> Result<(Arc<Device>, Arc<Queue>), DeviceError> {
-        // Required device extensions for swapchain and dynamic rendering
+    /// Returns `DeviceError` if even the standard device creation fails.
+    pub fn create_device(
+        &self,
+    ) -> Result<
+        (
+            Arc<Device>,
+            Arc<Queue>,
+            Option<crate::core::present_timing_ext::EnabledPresentTimingFeatures>,
+        ),
+        DeviceError,
+    > {
+        // Prefer VK_EXT_present_timing when the device advertises the required family.
+        let support = crate::core::present_timing_ext::probe_support(&self.physical_device);
+        if support.is_usable() {
+            match unsafe {
+                crate::core::present_timing_ext::create_device_with_present_timing(
+                    &self.physical_device,
+                    self.graphics_queue_family_index,
+                    support,
+                )
+            } {
+                Ok((device, queue, enabled)) => {
+                    info!(
+                        "Timing backend: ExtPresentTiming (VK_EXT_present_timing; \
+                         scheduling={}, present_wait2={})",
+                        enabled.present_at_absolute_time, enabled.present_wait2
+                    );
+                    return Ok((device, queue, Some(enabled)));
+                }
+                Err(e) => {
+                    warn!(
+                        "VK_EXT_present_timing device creation failed ({e}); \
+                         falling back to standard device with CPU-estimate timing"
+                    );
+                }
+            }
+        } else {
+            info!("VK_EXT_present_timing not available; using CPU-estimate timing");
+        }
+
+        // Standard vulkano device (CPU-estimate timing path).
+        // Enable calibrated timestamps when available so the timing-capabilities probe can
+        // measure CPU<->GPU clock correlation even without present-timing.
+        let supported = self.physical_device.supported_extensions();
         let device_extensions = DeviceExtensions {
             khr_swapchain: true,
             khr_dynamic_rendering: true,
-            google_display_timing: self.supports_google_display_timing(),
+            ext_calibrated_timestamps: supported.ext_calibrated_timestamps,
             ..DeviceExtensions::empty()
         };
 
@@ -479,7 +519,7 @@ impl DeviceSelector {
 
         info!("Logical device created successfully");
 
-        Ok((device, queue))
+        Ok((device, queue, None))
     }
 }
 

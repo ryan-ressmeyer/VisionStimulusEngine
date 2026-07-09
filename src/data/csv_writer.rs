@@ -48,6 +48,9 @@ const TIMING_COLUMNS: &[&str] = &[
     "present_time_us",
     "submit_time_us",
     "timing_source",
+    "present_id",
+    "target_time_us",
+    "on_target",
     "missed",
     "missed_count",
     "skipped",
@@ -104,12 +107,20 @@ impl CsvDataWriter {
 
     /// Serialize a FlipInfo into timing CSV columns (without skipped).
     fn flip_to_csv(flip: &FlipInfo) -> String {
+        // Empty cell for an unscheduled (immediate) present.
+        let target = flip
+            .target_time
+            .map(|t| t.as_micros().to_string())
+            .unwrap_or_default();
         format!(
-            "{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{}",
             flip.frame_number,
             flip.present_time.as_micros(),
             flip.submit_time.as_micros(),
             flip.timing_source,
+            flip.present_id,
+            target,
+            flip.on_target,
             flip.missed,
             flip.missed_count,
         )
@@ -258,6 +269,9 @@ mod tests {
             timing_source: TimingSource::CpuEstimate,
             submit_time: Timestamp::from_micros(frame * 16_667),
             present_time: Timestamp::from_micros(frame * 16_667 + 500),
+            present_id: 0,
+            target_time: None,
+            on_target: true,
             missed: false,
             missed_count: 0,
             skipped: false,

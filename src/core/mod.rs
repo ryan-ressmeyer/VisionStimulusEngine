@@ -13,6 +13,7 @@ pub(crate) mod direct_display;
 pub(crate) mod evdev_input;
 mod frame;
 pub(crate) mod input;
+pub(crate) mod present_timing_ext;
 mod swapchain;
 
 // Public API exports

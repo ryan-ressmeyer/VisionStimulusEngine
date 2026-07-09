@@ -86,6 +86,37 @@ The architecture should support multiple abstraction levels:
 3. **Cross-platform Support**: Consider portability across Linux (common in research), Windows, and macOS
 4. **Scientific Accuracy**: Gamma correction, color calibration, and spatial calibration support
 
+## Clock Model
+
+VSE is **intentionally agnostic about which clock an experiment ultimately synchronizes to**,
+and takes the same posture as Psychtoolbox. Three roles, and they must not be conflated:
+
+1. **The scanout clock is primary.** All display timing lives natively in the display/scanout
+   hardware clock (`VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT`, exposed by `VK_EXT_present_timing`).
+   Capture one scanout timestamp as `t=0` at session start; schedule every onset as `t0 + k·T`
+   and record actual scanout times in that same domain. **The host CPU clock does not enter the
+   core presentation loop** — there is zero cross-clock math on the critical path.
+   `FlipInfo.present_time` is a scanout-clock timestamp by default; a host-clock value is an
+   opt-in derived field, never the native one.
+
+2. **Alignment to acquisition hardware is physical, not software.** An ephys/DAQ box runs its
+   own clock, typically on a different machine. The canonical way to tie stimulus onset to that
+   clock is a **photodiode on a stimulus patch feeding the acquisition box's ADC** — one physical
+   event recorded in the acquisition clock. VSE never needs to know or estimate the acquisition
+   clock; its job is only to make onsets *deterministic and known in scanout time*, which the
+   photodiode then ties to acquisition time.
+
+3. **Host-clock synchronization is an opt-in tool.** Events that genuinely originate on the host
+   (key presses, network messages, anything the OS timestamps) arrive in CPU `CLOCK_MONOTONIC`
+   time and cannot be had in scanout time any other way. For those — and for host-only
+   behavioral experiments where the CPU clock *is* the response clock — VSE provides an opt-in
+   calibration bridge: a measured offset + drift-rate model between the scanout clock and
+   `CLOCK_MONOTONIC` (via `VK_KHR_calibrated_timestamps`). Measured on this hardware (Intel MTL /
+   ANV) the relative drift is a stable ~2 ppm, so the bridge is a lower-envelope sliding-window
+   linear fit, not a single offset. It is off the hot path and must be explicitly requested.
+
+See `docs/clock-synchronization.md` for the full model, error budget, and the drift measurement.
+
 ## Related Projects
 
 The project draws inspiration from:

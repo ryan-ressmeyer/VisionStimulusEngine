@@ -89,6 +89,13 @@ impl ParquetDataWriter {
             .iter()
             .map(|(f, _)| f.timing_source.to_string())
             .collect();
+        let present_ids: Vec<u64> = self.frame_rows.iter().map(|(f, _)| f.present_id).collect();
+        let target_times: Vec<Option<u64>> = self
+            .frame_rows
+            .iter()
+            .map(|(f, _)| f.target_time.map(|t| t.as_micros()))
+            .collect();
+        let on_targets: Vec<bool> = self.frame_rows.iter().map(|(f, _)| f.on_target).collect();
         let missed: Vec<bool> = self.frame_rows.iter().map(|(f, _)| f.missed).collect();
         let missed_counts: Vec<u32> = self
             .frame_rows
@@ -101,6 +108,10 @@ impl ParquetDataWriter {
             Field::new("present_time_us", DataType::UInt64, false),
             Field::new("submit_time_us", DataType::UInt64, false),
             Field::new("timing_source", DataType::Utf8, false),
+            Field::new("present_id", DataType::UInt64, false),
+            // Nullable: absent for immediate (unscheduled) presents.
+            Field::new("target_time_us", DataType::UInt64, true),
+            Field::new("on_target", DataType::Boolean, false),
             Field::new("missed", DataType::Boolean, false),
             Field::new("missed_count", DataType::UInt32, false),
         ];
@@ -110,6 +121,9 @@ impl ParquetDataWriter {
             Arc::new(UInt64Array::from(present_times)),
             Arc::new(UInt64Array::from(submit_times)),
             Arc::new(StringArray::from(timing_sources)),
+            Arc::new(UInt64Array::from(present_ids)),
+            Arc::new(UInt64Array::from(target_times)),
+            Arc::new(BooleanArray::from(on_targets)),
             Arc::new(BooleanArray::from(missed)),
             Arc::new(UInt32Array::from(missed_counts)),
         ];
@@ -227,6 +241,9 @@ mod tests {
             timing_source: TimingSource::CpuEstimate,
             submit_time: Timestamp::from_micros(frame * 16_667),
             present_time: Timestamp::from_micros(frame * 16_667 + 500),
+            present_id: 0,
+            target_time: None,
+            on_target: true,
             missed: false,
             missed_count: 0,
             skipped: false,

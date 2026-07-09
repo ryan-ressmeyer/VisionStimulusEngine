@@ -11,9 +11,10 @@ use winit::window::Window;
 use super::edid::capture_edid;
 use super::host_info::{
     BuildInfo, CpuInfo, DisplayInfo, GpuInfo, HostInfo, MemoryInfo, OsInfo, PipelineConfig,
-    RuntimeEnv, SwapchainInfo,
+    RuntimeEnv, SwapchainInfo, TimingCapabilities,
 };
 use crate::core::{SwapchainManager, VSEConfig};
+use vulkano::device::Device;
 
 /// Capture operating system information
 pub fn capture_os_info() -> OsInfo {
@@ -181,8 +182,117 @@ pub fn capture_pipeline_config(config: &VSEConfig) -> PipelineConfig {
 }
 
 /// Assemble the complete HostInfo snapshot
+/// Human-readable name for a calibrateable `VkTimeDomainKHR`/`EXT`.
+fn time_domain_name(d: ash::vk::TimeDomainEXT) -> String {
+    match d.as_raw() {
+        0 => "Device".to_string(),
+        1 => "ClockMonotonic".to_string(),
+        2 => "ClockMonotonicRaw".to_string(),
+        3 => "QueryPerformanceCounter".to_string(),
+        // VK_EXT_present_timing additions:
+        1_000_208_000 => "PresentStageLocal".to_string(),
+        1_000_208_001 => "SwapchainLocal".to_string(),
+        other => format!("Unknown({other})"),
+    }
+}
+
+/// Probe present-timing + clock-synchronization capabilities, measuring the CPU↔GPU
+/// calibrated-timestamp deviation when possible.
+///
+/// The measurement (`cpu_gpu_max_deviation_ns`) is the driver-reported bound on how tightly
+/// the GPU `Device` clock and the host `CLOCK_MONOTONIC` clock could be sampled together —
+/// the dominant error when converting GPU/present timestamps to the CPU timeline. See
+/// `docs/clock-synchronization.md`.
+pub fn capture_timing_capabilities(device: &Arc<Device>) -> TimingCapabilities {
+    use vulkano::VulkanObject;
+
+    let physical_device = device.physical_device();
+    let support = crate::core::present_timing_ext::probe_support(physical_device);
+    let supported = physical_device.supported_extensions();
+    let calibrated_supported =
+        supported.ext_calibrated_timestamps || supported.khr_calibrated_timestamps;
+
+    let mut caps = TimingCapabilities {
+        present_timing: support.present_timing,
+        present_id2: support.present_id2,
+        present_wait2: support.present_wait2,
+        calibrated_timestamps: calibrated_supported,
+        calibrateable_time_domains: Vec::new(),
+        cpu_gpu_max_deviation_ns: None,
+    };
+
+    if !calibrated_supported {
+        return caps;
+    }
+
+    let instance = physical_device.instance();
+    let entry = match unsafe { ash::Entry::load() } {
+        Ok(e) => e,
+        Err(_) => return caps,
+    };
+    let ash_instance = unsafe {
+        ash::Instance::load_with(
+            |name| {
+                std::mem::transmute(
+                    instance
+                        .library()
+                        .get_instance_proc_addr(instance.handle(), name.as_ptr()),
+                )
+            },
+            instance.handle(),
+        )
+    };
+    let ct_instance = ash::ext::calibrated_timestamps::Instance::new(&entry, &ash_instance);
+
+    let domains = match unsafe {
+        ct_instance.get_physical_device_calibrateable_time_domains(physical_device.handle())
+    } {
+        Ok(d) => d,
+        Err(_) => return caps,
+    };
+    caps.calibrateable_time_domains = domains.iter().map(|d| time_domain_name(*d)).collect();
+
+    // Measure Device↔CLOCK_MONOTONIC deviation if both are calibrateable and the extension
+    // is enabled on this device.
+    let enabled = device.enabled_extensions();
+    let ext_on = enabled.ext_calibrated_timestamps || enabled.khr_calibrated_timestamps;
+    let has_device = domains.contains(&ash::vk::TimeDomainEXT::DEVICE);
+    let has_mono = domains.contains(&ash::vk::TimeDomainEXT::CLOCK_MONOTONIC);
+    if ext_on && has_device && has_mono {
+        let get_dpa = instance.fns().v1_0.get_device_proc_addr;
+        let dev_handle = device.handle();
+        let ash_device = unsafe {
+            ash::Device::load_with(
+                |name| std::mem::transmute(get_dpa(dev_handle, name.as_ptr())),
+                dev_handle,
+            )
+        };
+        let ct_device = ash::ext::calibrated_timestamps::Device::new(&ash_instance, &ash_device);
+        let infos = [
+            ash::vk::CalibratedTimestampInfoEXT::default()
+                .time_domain(ash::vk::TimeDomainEXT::DEVICE),
+            ash::vk::CalibratedTimestampInfoEXT::default()
+                .time_domain(ash::vk::TimeDomainEXT::CLOCK_MONOTONIC),
+        ];
+        // maxDeviation is a per-read upper bound sensitive to scheduling; sample a few times
+        // and keep the best (tightest) read as the representative clock-sync quality.
+        let mut best: Option<u64> = None;
+        for _ in 0..8 {
+            if let Ok((_timestamps, max_deviation)) =
+                unsafe { ct_device.get_calibrated_timestamps(&infos) }
+            {
+                best = Some(best.map_or(max_deviation, |b| b.min(max_deviation)));
+            }
+        }
+        caps.cpu_gpu_max_deviation_ns = best;
+    }
+
+    caps
+}
+
 pub fn capture_host_info(
     physical_device: &Arc<PhysicalDevice>,
+    device: &Arc<Device>,
     window: Option<&Window>,
     swapchain_manager: &SwapchainManager,
     config: &VSEConfig,
@@ -209,6 +319,7 @@ pub fn capture_host_info(
         cpu: capture_cpu_info(),
         memory: capture_memory_info(),
         gpu: capture_gpu_info(physical_device),
+        timing: capture_timing_capabilities(device),
         display: capture_display_info(window),
         swapchain: capture_swapchain_info(swapchain_manager),
         pipeline: capture_pipeline_config(config),

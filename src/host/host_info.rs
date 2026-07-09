@@ -33,6 +33,8 @@ pub struct HostInfo {
     pub memory: MemoryInfo,
     /// GPU/graphics hardware information
     pub gpu: GpuInfo,
+    /// Present-timing and clock-synchronization capabilities
+    pub timing: TimingCapabilities,
     /// Display/monitor information
     pub display: DisplayInfo,
     /// Negotiated swapchain state
@@ -88,6 +90,33 @@ pub struct GpuInfo {
     pub sub_pixel_precision_bits: u32,
     /// Maximum 2D image dimension — ensures textures fit without downscaling
     pub max_image_dimension_2d: u32,
+}
+
+/// Present-timing and clock-synchronization capabilities of the GPU + driver.
+///
+/// Captured into every experiment's host snapshot so a run's timing pedigree is auditable:
+/// whether hardware present timing was even available, and how tightly the CPU and GPU
+/// clocks can be correlated (the basis for aligning stimulus onset with external hardware).
+/// See `docs/clock-synchronization.md`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TimingCapabilities {
+    /// `VK_EXT_present_timing` — hardware scanout timestamps + scheduled presents.
+    pub present_timing: bool,
+    /// `VK_KHR_present_id2` — monotonic present-id correlation (required by present timing).
+    pub present_id2: bool,
+    /// `VK_KHR_present_wait2` — block until a present is confirmed on screen (pacing).
+    pub present_wait2: bool,
+    /// `VK_EXT_calibrated_timestamps` / `VK_KHR_calibrated_timestamps` — the mechanism that
+    /// correlates the GPU/present clock to a CPU clock.
+    pub calibrated_timestamps: bool,
+    /// CPU/host clock domains the GPU can be calibrated against
+    /// (e.g. `"Device"`, `"ClockMonotonic"`, `"ClockMonotonicRaw"`).
+    pub calibrateable_time_domains: Vec<String>,
+    /// Measured maximum deviation, in nanoseconds, of a single `Device`↔`ClockMonotonic`
+    /// calibrated-timestamp sample — i.e. how tightly the two clocks can be read together,
+    /// the dominant error term when mapping GPU timestamps onto the CPU clock. `None` if the
+    /// measurement could not be taken (extension not enabled or domains unavailable).
+    pub cpu_gpu_max_deviation_ns: Option<u64>,
 }
 
 /// Display/monitor information from winit

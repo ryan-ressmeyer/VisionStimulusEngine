@@ -1,13 +1,16 @@
 //! Timing provider trait and implementations.
 
 use std::cell::RefCell;
+use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ash::vk;
 use tracing::warn;
 
 use super::clock::{Clock, Timestamp};
 use super::timing_source::TimingSource;
+use crate::core::present_timing_ext as pt;
 
 /// Abstracts timing backends for different Vulkan extensions.
 pub trait TimingProvider {
@@ -40,6 +43,57 @@ pub trait TimingProvider {
     fn confirmed_present_time_for(&self, _frame_number: u64, _clock: &Clock) -> Option<Timestamp> {
         None
     }
+
+    /// Notify the provider that the swapchain was recreated and its handle changed.
+    ///
+    /// Providers that cache a swapchain handle (the EXT backend) **must** refresh it here —
+    /// querying a retired swapchain handle is undefined behavior. Default: no-op.
+    fn on_swapchain_recreated(&self, _swapchain: &Arc<vulkano::swapchain::Swapchain>) {}
+
+    /// Sample the present-stage scanout clock against `CLOCK_MONOTONIC`, when the backend
+    /// supports it. Default: `None` (CPU estimation has no hardware present clock to bridge).
+    fn sample_present_calibration(&self) -> Option<CalibrationSample> {
+        None
+    }
+}
+
+/// Build the `vkGetCalibratedTimestampsKHR` sampler for a device, if the calibrated-timestamps
+/// extension is enabled. Mirrors the loader pattern in `src/host/capture.rs`.
+fn build_calibrated_timestamps_device(
+    device: &Arc<vulkano::device::Device>,
+) -> Option<ash::ext::calibrated_timestamps::Device> {
+    use vulkano::VulkanObject;
+
+    let enabled = device.enabled_extensions();
+    if !(enabled.ext_calibrated_timestamps || enabled.khr_calibrated_timestamps) {
+        return None;
+    }
+
+    let instance = device.instance();
+    let ash_instance = unsafe {
+        ash::Instance::load_with(
+            |name| {
+                std::mem::transmute(
+                    instance
+                        .library()
+                        .get_instance_proc_addr(instance.handle(), name.as_ptr()),
+                )
+            },
+            instance.handle(),
+        )
+    };
+    let get_dpa = instance.fns().v1_0.get_device_proc_addr;
+    let dev_handle = device.handle();
+    let ash_device = unsafe {
+        ash::Device::load_with(
+            |name| std::mem::transmute(get_dpa(dev_handle, name.as_ptr())),
+            dev_handle,
+        )
+    };
+    Some(ash::ext::calibrated_timestamps::Device::new(
+        &ash_instance,
+        &ash_device,
+    ))
 }
 
 /// CPU-based timing (fallback when no Vulkan timing extensions are available).
@@ -86,128 +140,236 @@ impl TimingProvider for CpuTimingProvider {
     }
 }
 
-/// Provider using VK_GOOGLE_display_timing extension.
+/// A single paired reading of the swapchain's `PRESENT_STAGE_LOCAL` scanout clock and the host
+/// `CLOCK_MONOTONIC` clock, sampled as close together as the hardware allows.
 ///
-/// Uses ash to call `vkGetPastPresentationTimingGOOGLE` for hardware-verified
-/// present timestamps and `vkGetRefreshCycleDurationGOOGLE` for the display
-/// refresh cycle duration.
-pub struct GoogleDisplayTimingProvider {
-    display_timing: ash::google::display_timing::Device,
-    swapchain_handle: RefCell<ash::vk::SwapchainKHR>,
-    /// Cached refresh cycle duration from the driver.
-    cached_refresh_duration: RefCell<Option<Duration>>,
+/// `offset = mono_ns − stage_ns` bridges a scanout timestamp onto the host clock;
+/// `max_deviation_ns` bounds how far apart the two reads actually were. Re-sampling over time
+/// exposes relative clock drift (the slope of `mono_ns` vs `stage_ns`).
+#[derive(Debug, Clone, Copy)]
+pub struct CalibrationSample {
+    /// Present-stage-local (scanout) clock, nanoseconds in the driver's opaque epoch.
+    pub stage_ns: u64,
+    /// Host `CLOCK_MONOTONIC`, nanoseconds.
+    pub mono_ns: u64,
+    /// Driver-reported bound on how far apart the two reads were, nanoseconds.
+    pub max_deviation_ns: u64,
 }
 
-impl GoogleDisplayTimingProvider {
-    /// Create a new provider from vulkano device and instance.
+/// Provider using `VK_EXT_present_timing`.
+///
+/// Owns the loaded present-timing function pointers. It supplies the driver-reported
+/// **refresh cycle duration**, sizes the driver's past-timing ring, and samples the display's
+/// present-stage scanout clock ([`sample_present_calibration`](Self::sample_present_calibration)).
+///
+/// Hardware scanout timestamps live in the driver's opaque *present-stage-local* time domain
+/// (`VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT`, the only domain guaranteed to exist) — VSE's
+/// **primary** experimental clock. It is bridged to the host `CLOCK_MONOTONIC` clock only on
+/// demand, via the opt-in host-clock bridge built on `VK_KHR_calibrated_timestamps` (VSE does
+/// **not** rely on a native `CLOCK_MONOTONIC` swapchain domain, which most drivers — including
+/// Intel/ANV — do not expose). See `docs/clock-synchronization.md`. `record_present_time` still
+/// returns CPU fence-signal time pending the raw-present feedback path; `timing_source` reports
+/// `ExtPresentTiming`.
+pub struct ExtPresentTimingProvider {
+    fns: pt::PresentTimingFns,
+    device: vk::Device,
+    /// Holds the device alive for the calibrated-timestamps sampler's raw handle; consumed by
+    /// the calibration subsystem's periodic re-sampling.
+    #[allow(dead_code)]
+    vk_device: Arc<vulkano::device::Device>,
+    swapchain: RefCell<vk::SwapchainKHR>,
+    cached_refresh: RefCell<Option<Duration>>,
+    present_wait2: bool,
+    /// `vkGetCalibratedTimestampsKHR` sampler, when `VK_KHR/EXT_calibrated_timestamps` is
+    /// enabled. `None` disables present-stage calibration (falls back to CPU fence time).
+    ct_device: Option<ash::ext::calibrated_timestamps::Device>,
+    /// The `timeDomainId` for `PRESENT_STAGE_LOCAL` on the current swapchain, re-read on every
+    /// swapchain recreation. `None` until probed (or if the domain is not offered).
+    present_stage_domain_id: RefCell<Option<u64>>,
+}
+
+impl ExtPresentTimingProvider {
+    /// Size of the driver's past-timing ring buffer (frames of history retained).
+    const TIMING_QUEUE_SIZE: u32 = 16;
+    /// Create the provider, loading fn pointers and configuring the swapchain's timing.
+    ///
+    /// Returns `None` if the extension function pointers cannot be loaded (in which case
+    /// the caller should fall back to CPU timing).
     ///
     /// # Safety
     ///
-    /// The caller must ensure the device was created with
-    /// `VK_GOOGLE_display_timing` enabled.
+    /// The device must have been created with `VK_EXT_present_timing` enabled (see
+    /// [`crate::core::present_timing_ext::create_device_with_present_timing`]).
     pub unsafe fn new(
-        vulkano_device: &Arc<vulkano::device::Device>,
+        device: &Arc<vulkano::device::Device>,
         swapchain: &Arc<vulkano::swapchain::Swapchain>,
-    ) -> Self {
+        enabled: pt::EnabledPresentTimingFeatures,
+    ) -> Option<Self> {
         use vulkano::VulkanObject;
+        let fns = pt::PresentTimingFns::load(device, enabled.present_wait2)?;
+        let ct_device = build_calibrated_timestamps_device(device);
+        let provider = Self {
+            fns,
+            device: device.handle(),
+            vk_device: device.clone(),
+            swapchain: RefCell::new(swapchain.handle()),
+            cached_refresh: RefCell::new(None),
+            present_wait2: enabled.present_wait2,
+            ct_device,
+            present_stage_domain_id: RefCell::new(None),
+        };
+        provider.configure_swapchain();
+        Some(provider)
+    }
 
-        let vk_instance_handle = vulkano_device.instance().handle();
-        let vk_device_handle = vulkano_device.handle();
-        let get_device_proc_addr = vulkano_device.instance().fns().v1_0.get_device_proc_addr;
+    /// Sample the swapchain's `PRESENT_STAGE_LOCAL` scanout clock and `CLOCK_MONOTONIC`
+    /// together via `vkGetCalibratedTimestampsKHR`.
+    ///
+    /// Returns `None` if calibrated timestamps are unavailable or the present-stage domain id
+    /// has not been probed for the current swapchain. Requesting `IMAGE_FIRST_PIXEL_OUT` as the
+    /// present stage matches the scanout-begin timestamp the feedback path reports.
+    pub fn sample_present_calibration(&self) -> Option<CalibrationSample> {
+        use std::ffi::c_void;
 
-        // Build minimal ash::Instance with just get_device_proc_addr loaded
-        let ash_instance = ash::Instance::load_with(
-            |name| std::mem::transmute(get_device_proc_addr(vk_device_handle, name.as_ptr())),
-            vk_instance_handle,
+        let ct = self.ct_device.as_ref()?;
+        let domain_id = (*self.present_stage_domain_id.borrow())?;
+        let sc = *self.swapchain.borrow();
+
+        // The present-stage entry carries a VkSwapchainCalibratedTimestampInfoEXT in its pNext.
+        let swap_info = pt::SwapchainCalibratedTimestampInfoEXT {
+            s_type: pt::STYPE_SWAPCHAIN_CALIBRATED_TIMESTAMP_INFO_EXT,
+            p_next: ptr::null(),
+            swapchain: sc,
+            present_stage: pt::PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT,
+            time_domain_id: domain_id,
+        };
+        let mut stage_info = vk::CalibratedTimestampInfoEXT::default().time_domain(
+            vk::TimeDomainEXT::from_raw(pt::TIME_DOMAIN_PRESENT_STAGE_LOCAL),
         );
+        stage_info.p_next = &swap_info as *const _ as *const c_void;
+        let mono_info = vk::CalibratedTimestampInfoEXT::default()
+            .time_domain(vk::TimeDomainEXT::CLOCK_MONOTONIC);
+        let infos = [stage_info, mono_info];
 
-        // Build minimal ash::Device from the same function loader
-        let ash_device = ash::Device::load_with(
-            |name| std::mem::transmute(get_device_proc_addr(vk_device_handle, name.as_ptr())),
-            vk_device_handle,
-        );
-
-        let display_timing = ash::google::display_timing::Device::new(&ash_instance, &ash_device);
-
-        Self {
-            display_timing,
-            swapchain_handle: RefCell::new(swapchain.handle()),
-            cached_refresh_duration: RefCell::new(None),
+        match unsafe { ct.get_calibrated_timestamps(&infos) } {
+            Ok((ts, max_deviation)) if ts.len() == 2 => Some(CalibrationSample {
+                stage_ns: ts[0],
+                mono_ns: ts[1],
+                max_deviation_ns: max_deviation,
+            }),
+            Ok(_) => None,
+            Err(e) => {
+                warn!("vkGetCalibratedTimestampsKHR (present-stage) failed: {e:?}");
+                None
+            }
         }
     }
 
-    /// Update the swapchain handle after swapchain recreation.
+    /// Whether `VK_KHR_present_wait2` is available for pacing.
+    pub fn has_present_wait2(&self) -> bool {
+        self.present_wait2
+    }
+
+    /// (Re)enable the past-timing ring and re-select the time domain for the current
+    /// swapchain. Called on creation and after every swapchain recreation.
+    fn configure_swapchain(&self) {
+        let sc = *self.swapchain.borrow();
+        let r = unsafe { (self.fns.set_queue_size)(self.device, sc, Self::TIMING_QUEUE_SIZE) };
+        if r != vk::Result::SUCCESS {
+            warn!("vkSetSwapchainPresentTimingQueueSizeEXT failed: {r:?}");
+        }
+        self.log_offered_time_domains(sc);
+        *self.cached_refresh.borrow_mut() = None;
+    }
+
+    /// Update the swapchain handle after recreation and reconfigure timing.
     pub fn update_swapchain(&self, swapchain: &Arc<vulkano::swapchain::Swapchain>) {
         use vulkano::VulkanObject;
-        *self.swapchain_handle.borrow_mut() = swapchain.handle();
-        // Clear cached refresh duration - may change with new swapchain
-        *self.cached_refresh_duration.borrow_mut() = None;
+        *self.swapchain.borrow_mut() = swapchain.handle();
+        self.configure_swapchain();
     }
 
-    /// Query the driver for the refresh cycle duration.
-    fn query_refresh_duration(&self) -> Option<Duration> {
-        let handle = *self.swapchain_handle.borrow();
-        match unsafe { self.display_timing.get_refresh_cycle_duration(handle) } {
-            Ok(cycle) => {
-                if cycle.refresh_duration > 0 {
-                    Some(Duration::from_nanos(cycle.refresh_duration))
-                } else {
-                    None
-                }
-            }
-            Err(e) => {
-                warn!("vkGetRefreshCycleDurationGOOGLE failed: {:?}", e);
-                None
-            }
-        }
-    }
-
-    /// Query past presentation timings, returning the most recent.
-    fn query_latest_present_time(&self) -> Option<u64> {
-        let handle = *self.swapchain_handle.borrow();
-        match unsafe { self.display_timing.get_past_presentation_timing(handle) } {
-            Ok(timings) => timings.last().map(|t| t.actual_present_time),
-            Err(e) => {
-                warn!("vkGetPastPresentationTimingGOOGLE failed: {:?}", e);
-                None
-            }
-        }
-    }
-
-    /// Query past presentation timings for a specific `present_id`.
+    /// Log the present-timing time domains the swapchain reports (diagnostic only).
     ///
-    /// Returns the `actual_present_time` (nanoseconds) if the driver has recorded
-    /// a timing entry whose `presentID` matches `present_id`. The driver may batch
-    /// or delay these records, so callers should fall back to CPU time when this
-    /// returns `None`.
-    fn query_present_time_for_id(&self, present_id: u32) -> Option<u64> {
-        let handle = *self.swapchain_handle.borrow();
-        match unsafe { self.display_timing.get_past_presentation_timing(handle) } {
-            Ok(timings) => timings
+    /// VSE does not depend on any particular domain being offered: present timestamps are
+    /// bridged to the CPU clock through `VK_KHR_calibrated_timestamps`, not by matching a
+    /// native `CLOCK_MONOTONIC` swapchain domain. This is purely to surface, in the log, what
+    /// clock the driver reports present times in.
+    fn log_offered_time_domains(&self, sc: vk::SwapchainKHR) {
+        let mut props = pt::SwapchainTimeDomainPropertiesEXT {
+            s_type: pt::STYPE_SWAPCHAIN_TIME_DOMAIN_PROPERTIES_EXT,
+            p_next: ptr::null_mut(),
+            time_domain_count: 0,
+            p_time_domains: ptr::null_mut(),
+            p_time_domain_ids: ptr::null_mut(),
+        };
+        let mut counter: u64 = 0;
+        let _ = unsafe {
+            (self.fns.get_time_domain_properties)(self.device, sc, &mut props, &mut counter)
+        };
+        let n = props.time_domain_count as usize;
+        if n == 0 {
+            return;
+        }
+        let mut domains = vec![0i32; n];
+        let mut ids = vec![0u64; n];
+        props.p_time_domains = domains.as_mut_ptr();
+        props.p_time_domain_ids = ids.as_mut_ptr();
+        let r = unsafe {
+            (self.fns.get_time_domain_properties)(self.device, sc, &mut props, &mut counter)
+        };
+        if r == vk::Result::SUCCESS || r == vk::Result::INCOMPLETE {
+            let count = props.time_domain_count as usize;
+            tracing::debug!(
+                "VK_EXT_present_timing time domains offered: {:?} \
+                 (1000208000=PRESENT_STAGE_LOCAL, 1000208001=SWAPCHAIN_LOCAL, 1=CLOCK_MONOTONIC); \
+                 bridged to the CPU clock via VK_KHR_calibrated_timestamps",
+                &domains[..count]
+            );
+            // Record the PRESENT_STAGE_LOCAL domain id so the calibration sampler can name it.
+            let stage_id = domains[..count]
                 .iter()
-                .find(|t| t.present_id == present_id)
-                .map(|t| t.actual_present_time),
-            Err(e) => {
-                warn!("vkGetPastPresentationTimingGOOGLE failed: {:?}", e);
-                None
+                .zip(ids[..count].iter())
+                .find(|(d, _)| **d == pt::TIME_DOMAIN_PRESENT_STAGE_LOCAL)
+                .map(|(_, id)| *id);
+            *self.present_stage_domain_id.borrow_mut() = stage_id;
+        }
+    }
+
+    /// Query the driver's refresh cycle duration for the current swapchain.
+    fn query_refresh(&self) -> Option<Duration> {
+        let sc = *self.swapchain.borrow();
+        let mut props = pt::SwapchainTimingPropertiesEXT {
+            s_type: pt::STYPE_SWAPCHAIN_TIMING_PROPERTIES_EXT,
+            p_next: ptr::null_mut(),
+            refresh_duration: 0,
+            refresh_interval: 0,
+        };
+        let mut counter: u64 = 0;
+        let r =
+            unsafe { (self.fns.get_timing_properties)(self.device, sc, &mut props, &mut counter) };
+        if r == vk::Result::SUCCESS && props.refresh_duration > 0 {
+            Some(Duration::from_nanos(props.refresh_duration))
+        } else {
+            if r != vk::Result::SUCCESS {
+                warn!("vkGetSwapchainTimingPropertiesEXT failed: {r:?}");
             }
+            None
         }
     }
 }
 
-impl TimingProvider for GoogleDisplayTimingProvider {
+impl TimingProvider for ExtPresentTimingProvider {
     fn source(&self) -> TimingSource {
-        TimingSource::GoogleDisplayTiming
+        TimingSource::ExtPresentTiming
     }
 
     fn refresh_cycle_duration(&self) -> Option<Duration> {
-        // Return cached value if available
-        if let Some(cached) = *self.cached_refresh_duration.borrow() {
+        if let Some(cached) = *self.cached_refresh.borrow() {
             return Some(cached);
         }
-        // Query and cache
-        if let Some(dur) = self.query_refresh_duration() {
-            *self.cached_refresh_duration.borrow_mut() = Some(dur);
+        if let Some(dur) = self.query_refresh() {
+            *self.cached_refresh.borrow_mut() = Some(dur);
             Some(dur)
         } else {
             None
@@ -215,49 +377,27 @@ impl TimingProvider for GoogleDisplayTimingProvider {
     }
 
     fn record_present_time(&self, clock: &Clock) -> Timestamp {
-        // Try to get hardware present time; fall back to CPU time
-        if let Some(nanos) = self.query_latest_present_time() {
-            // VK_GOOGLE_display_timing reports times in nanoseconds
-            // relative to some device-specific epoch. We convert to
-            // our Timestamp which is microseconds from Clock epoch.
-            // Since we can't correlate device epoch with Clock epoch,
-            // use the CPU time as baseline but this gives us the
-            // actual present time from the driver.
-            Timestamp::from_micros(nanos / 1_000)
-        } else {
-            // No timing data available yet (first frames), fall back
-            clock.now()
-        }
+        // Hardware scanout time requires calibrating the present-stage-local clock to the CPU
+        // clock (VK_KHR_calibrated_timestamps) — a separate subsystem. Until then, use the
+        // CPU fence-signal time, identical to the CPU-estimate path.
+        clock.now()
     }
 
     fn wait_for_target(&self, target_time: Timestamp, clock: &Clock) {
-        // For Google Display Timing, the target time should ideally be
-        // passed via VkPresentTimesInfoGOOGLE in the present pNext chain.
-        // For now, fall back to CPU spin-wait like CpuTimingProvider.
+        // Hardware scheduling rides on the raw present path (VkPresentTimingInfoEXT), which
+        // needs the calibration subsystem to express the target in the driver's clock. Until
+        // then, honor the target with a CPU spin so scheduled presents are not early.
         while clock.now() < target_time {
             std::hint::spin_loop();
         }
     }
 
-    fn confirmed_present_time_for(&self, frame_number: u64, clock: &Clock) -> Option<Timestamp> {
-        // Map frame_number to a present_id. We use (frame_number & 0xFFFF_FFFF) as
-        // a u32 present_id. This matches any future VkPresentTimesInfoGOOGLE
-        // integration where the same mapping is used.
-        //
-        // NOTE: Until submit_nonblocking attaches VkPresentTimesInfoGOOGLE to the
-        // present pNext chain (future work), present_id in driver records will be 0
-        // for every frame, so this lookup will not find a matching entry. The
-        // fallback to record_present_time() (most recent timing) is used instead.
-        let present_id = (frame_number & 0xFFFF_FFFF) as u32;
-        self.query_present_time_for_id(present_id)
-            .map(|nanos| Timestamp::from_micros(nanos / 1_000))
-            .or_else(|| {
-                // Fall back to most-recent timing from the driver, same as
-                // record_present_time(). Returns None on first few frames.
-                self.query_latest_present_time()
-                    .map(|nanos| Timestamp::from_micros(nanos / 1_000))
-                    .or_else(|| Some(clock.now()))
-            })
+    fn on_swapchain_recreated(&self, swapchain: &Arc<vulkano::swapchain::Swapchain>) {
+        self.update_swapchain(swapchain);
+    }
+
+    fn sample_present_calibration(&self) -> Option<CalibrationSample> {
+        ExtPresentTimingProvider::sample_present_calibration(self)
     }
 }
 

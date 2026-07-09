@@ -31,7 +31,9 @@ serde = { version = "1.0", features = ["derive"] }
 # Shader compilation at build time
 vulkano-shaders = "0.35"
 
-# Raw Vulkan bindings for extension access (VK_GOOGLE_display_timing)
+# Raw Vulkan bindings for extension access (VK_EXT_present_timing family,
+# VK_KHR_display); the present-timing 1.4 structs are hand-declared in
+# src/core/present_timing_ext.rs since ash 0.38 predates them.
 ash = "0.38"
 
 # Image loading for textures
