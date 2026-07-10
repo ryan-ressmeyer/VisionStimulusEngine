@@ -14,8 +14,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     context.run(|ctx| {
-        // Capture host info on first frame
-        if ctx.frame_number() == 0 {
+        ctx.clear()?;
+        ctx.flip(None)?;
+
+        // Capture host info AFTER a warm-up run, so the behaviorally-observed present-timing fields
+        // (e.g. whether the driver actually fills IMAGE_FIRST_PIXEL_OUT) are populated, not just the
+        // advertised capabilities. ~24 flips is a full turnover of the driver's timing ring.
+        if ctx.frame_number() == 24 {
             let info = ctx.capture_host_info();
 
             // Print human-readable summary
@@ -25,13 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let json = serde_json::to_string_pretty(&info).expect("Failed to serialize host info");
             std::fs::write("host_info.json", &json).expect("Failed to write host_info.json");
             println!("\nSaved to host_info.json");
-        }
 
-        ctx.clear()?;
-        ctx.flip(None)?;
-
-        // Close after a few frames
-        if ctx.frame_number() > 5 {
             return Err(VSEError::Window("Done".to_string()));
         }
 

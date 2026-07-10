@@ -4,18 +4,21 @@
 //! and presentation for double/triple buffering.
 
 use std::sync::Arc;
+use ash::vk;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use vulkano::{
     device::Device,
     image::Image,
     swapchain::{
-        self, PresentMode as VkPresentMode, Surface, Swapchain, SwapchainCreateInfo,
-        SwapchainPresentInfo,
+        self, ColorSpace, CompositeAlpha, PresentMode as VkPresentMode, Surface, Swapchain,
+        SwapchainCreateInfo, SwapchainPresentInfo,
     },
     sync::GpuFuture,
-    Validated, VulkanError,
+    Validated, VulkanError, VulkanObject,
 };
+
+use crate::core::present_timing_ext as pt;
 
 /// Errors that can occur during swapchain operations
 #[derive(Error, Debug)]
@@ -117,6 +120,47 @@ impl Default for SwapchainConfig {
     }
 }
 
+/// Image usage for VSE swapchain images: color attachment (rendered into) + transfer dst
+/// (cleared / blitted). Shared verbatim by the vulkano and raw creation paths.
+const SWAPCHAIN_IMAGE_USAGE: vulkano::image::ImageUsage = vulkano::image::ImageUsage::COLOR_ATTACHMENT
+    .union(vulkano::image::ImageUsage::TRANSFER_DST);
+
+/// Surface-dependent swapchain parameters resolved once and shared by the vulkano and raw
+/// (present-wait2 opt-in) creation paths.
+struct ResolvedParams {
+    image_format: vulkano::format::Format,
+    image_color_space: ColorSpace,
+    image_extent: [u32; 2],
+    image_count: u32,
+    present_mode: VkPresentMode,
+    composite_alpha: CompositeAlpha,
+}
+
+/// Build an `ash::khr::swapchain::Device` from vulkano's already-loaded device loader, for the raw
+/// `vkCreateSwapchainKHR` path. Mirrors the loader pattern in `present_engine.rs`.
+fn build_ash_swapchain_device(device: &Arc<Device>) -> ash::khr::swapchain::Device {
+    let instance = device.instance();
+    let get_dpa = instance.fns().v1_0.get_device_proc_addr;
+    let dev_handle = device.handle();
+    unsafe {
+        let ash_instance = ash::Instance::load_with(
+            |name| {
+                std::mem::transmute(
+                    instance
+                        .library()
+                        .get_instance_proc_addr(instance.handle(), name.as_ptr()),
+                )
+            },
+            instance.handle(),
+        );
+        let ash_device = ash::Device::load_with(
+            |name| std::mem::transmute(get_dpa(dev_handle, name.as_ptr())),
+            dev_handle,
+        );
+        ash::khr::swapchain::Device::new(&ash_instance, &ash_device)
+    }
+}
+
 /// Manages swapchain and associated resources
 ///
 /// The SwapchainManager handles the lifecycle of the Vulkan swapchain,
@@ -129,6 +173,12 @@ pub struct SwapchainManager {
     images: Vec<Arc<Image>>,
     config: SwapchainConfig,
     needs_recreation: bool,
+    /// When `Some`, swapchains are created through raw `vkCreateSwapchainKHR` with the
+    /// present-id2 / present-wait2 opt-in flags set (see [`pt::SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR`]),
+    /// then adopted via [`Swapchain::from_handle`]. vulkano's `Swapchain::new` predates Vulkan 1.4
+    /// and cannot set these flags, so `vkWaitForPresent2KHR` would be UB (a driver crash) on a
+    /// vulkano-created swapchain. `None` on the CPU-estimate path, which keeps the vulkano path.
+    raw_present: Option<ash::khr::swapchain::Device>,
 }
 
 impl SwapchainManager {
@@ -148,14 +198,37 @@ impl SwapchainManager {
         surface: Arc<Surface>,
         config: SwapchainConfig,
     ) -> Result<Self, SwapchainError> {
-        let (swapchain, images) = Self::create_swapchain(&device, &surface, &config, None)?;
+        Self::new_with_present_opt_in(device, surface, config, false)
+    }
+
+    /// Create a swapchain manager, optionally opting swapchains into present-id2 / present-wait2.
+    ///
+    /// When `present_opt_in` is `true` (the EXT present-timing backend with `presentWait2`
+    /// enabled), every swapchain is created through a raw `vkCreateSwapchainKHR` with the
+    /// [`SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR`](pt::SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR)
+    /// opt-in so `vkWaitForPresent2KHR` is legal on it. Otherwise the vulkano path is used.
+    pub fn new_with_present_opt_in(
+        device: Arc<Device>,
+        surface: Arc<Surface>,
+        config: SwapchainConfig,
+        present_opt_in: bool,
+    ) -> Result<Self, SwapchainError> {
+        let raw_present = if present_opt_in {
+            Some(build_ash_swapchain_device(&device))
+        } else {
+            None
+        };
+
+        let (swapchain, images) =
+            Self::create_swapchain(&device, &surface, &config, None, raw_present.as_ref())?;
 
         info!(
-            "Swapchain created: {}x{}, {} images, {:?}",
+            "Swapchain created: {}x{}, {} images, {:?}, present_wait2_opt_in={}",
             config.width,
             config.height,
             images.len(),
-            config.present_mode
+            config.present_mode,
+            raw_present.is_some(),
         );
 
         Ok(Self {
@@ -165,16 +238,25 @@ impl SwapchainManager {
             images,
             config,
             needs_recreation: false,
+            raw_present,
         })
     }
 
-    /// Create or recreate the swapchain
-    fn create_swapchain(
+    /// Whether the current swapchain was created with the present-wait2 opt-in flag, i.e. whether
+    /// `vkWaitForPresent2KHR` is legal on it. The synchronous `flip()` path must check this before
+    /// calling `wait_for_present` — the call is UB (a driver crash) on a swapchain created without
+    /// the flag.
+    pub fn present_wait2_enabled(&self) -> bool {
+        self.raw_present.is_some()
+    }
+
+    /// Resolve the surface-dependent swapchain parameters shared by the vulkano and raw paths
+    /// (format, color space, extent, image count, present mode, composite alpha).
+    fn resolve_params(
         device: &Arc<Device>,
         surface: &Arc<Surface>,
         config: &SwapchainConfig,
-        old_swapchain: Option<&Arc<Swapchain>>,
-    ) -> Result<(Arc<Swapchain>, Vec<Arc<Image>>), SwapchainError> {
+    ) -> Result<ResolvedParams, SwapchainError> {
         let surface_capabilities = device
             .physical_device()
             .surface_capabilities(surface, Default::default())
@@ -191,7 +273,7 @@ impl SwapchainManager {
             .map_err(|e| SwapchainError::CreationFailed(e.to_string()))?;
 
         // Choose format (prefer sRGB for correct color)
-        let (image_format, _color_space) = surface_formats
+        let (image_format, image_color_space) = surface_formats
             .iter()
             .find(|(format, _)| {
                 format.numeric_format_color() == Some(vulkano::format::NumericFormat::SRGB)
@@ -202,36 +284,66 @@ impl SwapchainManager {
 
         // Determine image count
         let min_image_count = surface_capabilities.min_image_count.max(config.image_count);
-        let max_image_count = surface_capabilities
+        let image_count = surface_capabilities
             .max_image_count
             .map(|max| min_image_count.min(max))
             .unwrap_or(min_image_count);
 
         // Determine extent
-        let extent = surface_capabilities
+        let image_extent = surface_capabilities
             .current_extent
             .unwrap_or([config.width, config.height]);
 
         // Select present mode
         let present_mode = config.present_mode.select_with_fallback(&present_modes);
 
+        let composite_alpha = surface_capabilities
+            .supported_composite_alpha
+            .into_iter()
+            .next()
+            .ok_or_else(|| SwapchainError::CreationFailed("No composite alpha mode".into()))?;
+
+        Ok(ResolvedParams {
+            image_format,
+            image_color_space,
+            image_extent,
+            image_count,
+            present_mode,
+            composite_alpha,
+        })
+    }
+
+    /// Create or recreate the swapchain, dispatching to the raw present-wait2 path when opted in.
+    fn create_swapchain(
+        device: &Arc<Device>,
+        surface: &Arc<Surface>,
+        config: &SwapchainConfig,
+        old_swapchain: Option<&Arc<Swapchain>>,
+        raw_present: Option<&ash::khr::swapchain::Device>,
+    ) -> Result<(Arc<Swapchain>, Vec<Arc<Image>>), SwapchainError> {
+        let params = Self::resolve_params(device, surface, config)?;
+
         debug!(
-            "Creating swapchain: format={:?}, extent={:?}, images={}, present_mode={:?}",
-            image_format, extent, max_image_count, present_mode
+            "Creating swapchain: format={:?}, extent={:?}, images={}, present_mode={:?}, raw={}",
+            params.image_format,
+            params.image_extent,
+            params.image_count,
+            params.present_mode,
+            raw_present.is_some(),
         );
 
+        if let Some(raw) = raw_present {
+            return Self::create_swapchain_raw(device, surface, old_swapchain, raw, &params);
+        }
+
         let create_info = SwapchainCreateInfo {
-            min_image_count: max_image_count,
-            image_format,
-            image_extent: extent,
-            image_usage: vulkano::image::ImageUsage::COLOR_ATTACHMENT
-                | vulkano::image::ImageUsage::TRANSFER_DST,
-            composite_alpha: surface_capabilities
-                .supported_composite_alpha
-                .into_iter()
-                .next()
-                .ok_or_else(|| SwapchainError::CreationFailed("No composite alpha mode".into()))?,
-            present_mode,
+            min_image_count: params.image_count,
+            image_format: params.image_format,
+            image_color_space: params.image_color_space,
+            image_extent: params.image_extent,
+            image_usage: SWAPCHAIN_IMAGE_USAGE,
+            composite_alpha: params.composite_alpha,
+            present_mode: params.present_mode,
             ..Default::default()
         };
 
@@ -242,6 +354,75 @@ impl SwapchainManager {
         };
 
         result.map_err(|e| SwapchainError::CreationFailed(e.to_string()))
+    }
+
+    /// Create the swapchain through raw `vkCreateSwapchainKHR` with the present-id2 / present-wait2
+    /// opt-in flags, then adopt the handle + its images into a vulkano [`Swapchain`] via
+    /// [`Swapchain::from_handle`] (which takes ownership and destroys the handle on drop).
+    ///
+    /// The vulkano `SwapchainCreateInfo` passed to `from_handle` is metadata only (it is not
+    /// re-validated against the handle), so its `flags` stay empty — the real 1.4 flags live only
+    /// in the raw `VkSwapchainCreateInfoKHR` below, which vulkano cannot express.
+    fn create_swapchain_raw(
+        device: &Arc<Device>,
+        surface: &Arc<Surface>,
+        old_swapchain: Option<&Arc<Swapchain>>,
+        raw: &ash::khr::swapchain::Device,
+        params: &ResolvedParams,
+    ) -> Result<(Arc<Swapchain>, Vec<Arc<Image>>), SwapchainError> {
+        let create_flags = vk::SwapchainCreateFlagsKHR::from_raw(
+            pt::SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR | pt::SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR,
+        );
+        let old_handle = old_swapchain
+            .map(|s| s.handle())
+            .unwrap_or_else(vk::SwapchainKHR::null);
+
+        let raw_ci = vk::SwapchainCreateInfoKHR::default()
+            .flags(create_flags)
+            .surface(surface.handle())
+            .min_image_count(params.image_count)
+            .image_format(params.image_format.into())
+            .image_color_space(params.image_color_space.into())
+            .image_extent(vk::Extent2D {
+                width: params.image_extent[0],
+                height: params.image_extent[1],
+            })
+            .image_array_layers(1)
+            .image_usage(SWAPCHAIN_IMAGE_USAGE.into())
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+            .composite_alpha(params.composite_alpha.into())
+            .present_mode(params.present_mode.into())
+            .clipped(true)
+            .old_swapchain(old_handle);
+
+        // SAFETY: all handles belong to `device`; `raw_ci` outlives the call; the returned handle
+        // is handed to vulkano below, which becomes its sole owner.
+        let handle = unsafe { raw.create_swapchain(&raw_ci, None) }.map_err(|e| {
+            SwapchainError::CreationFailed(format!("raw vkCreateSwapchainKHR failed: {e:?}"))
+        })?;
+        let image_handles = unsafe { raw.get_swapchain_images(handle) }.map_err(|e| {
+            SwapchainError::CreationFailed(format!("vkGetSwapchainImagesKHR failed: {e:?}"))
+        })?;
+
+        // Metadata mirroring the raw create info so vulkano's image wrappers are correct.
+        let vko_ci = SwapchainCreateInfo {
+            min_image_count: params.image_count,
+            image_format: params.image_format,
+            image_color_space: params.image_color_space,
+            image_extent: params.image_extent,
+            image_usage: SWAPCHAIN_IMAGE_USAGE,
+            composite_alpha: params.composite_alpha,
+            present_mode: params.present_mode,
+            ..Default::default()
+        };
+
+        // SAFETY: `handle` and `image_handles` were just created from `device`/`surface` with the
+        // matching create info; vulkano takes ownership of both.
+        unsafe {
+            Swapchain::from_handle(device.clone(), handle, image_handles, surface.clone(), vko_ci)
+        }
+        .map_err(|e| SwapchainError::CreationFailed(format!("Swapchain::from_handle failed: {e}")))
     }
 
     /// Get the swapchain images
@@ -328,6 +509,7 @@ impl SwapchainManager {
             &self.surface,
             &new_config,
             Some(&self.swapchain),
+            self.raw_present.as_ref(),
         )?;
 
         self.swapchain = new_swapchain;

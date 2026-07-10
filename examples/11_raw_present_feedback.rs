@@ -43,6 +43,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut feedback_present_ids: HashSet<u64> = HashSet::new();
     let mut feedback_records: u64 = 0;
     let mut first_pixel_out_seen = false;
+    // present_time is now scanout-domain µs under EXT (B3): track monotonicity + inter-flip deltas.
+    let mut last_present_us: Option<u64> = None;
+    let mut present_time_monotonic = true;
+    let mut present_deltas_us: Vec<u64> = Vec::new();
     let mut n: u64 = 0;
 
     context.run(move |ctx| {
@@ -68,6 +72,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         present_ids.push(flip.present_id);
 
+        // present_time is the scanout timestamp on the EXT path: monotonic, vblank-cadence deltas.
+        let pt = flip.present_time.as_micros();
+        if let Some(prev) = last_present_us {
+            if pt < prev {
+                present_time_monotonic = false;
+            } else {
+                present_deltas_us.push(pt - prev);
+            }
+        }
+        last_present_us = Some(pt);
+
         // Confirmed scanout records from the driver.
         for fb in ctx.scanout_feedback() {
             feedback_records += 1;
@@ -87,6 +102,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &feedback_present_ids,
                 first_pixel_out_seen,
             );
+            // present_time (scanout-domain) summary: median inter-flip delta should sit near the
+            // refresh interval, and the series must be monotonic.
+            present_deltas_us.sort_unstable();
+            let med = present_deltas_us
+                .get(present_deltas_us.len() / 2)
+                .copied()
+                .unwrap_or(0);
+            let near_refresh = present_deltas_us
+                .iter()
+                .filter(|&&d| (13_000..=20_000).contains(&d))
+                .count();
+            println!("present_time monotonic   : {present_time_monotonic}");
+            println!(
+                "present_time median dt   : {:.2} ms  ({}/{} deltas within 13-20 ms)",
+                med as f64 / 1000.0,
+                near_refresh,
+                present_deltas_us.len()
+            );
+            println!();
             return Err(VSEError::Window("done".to_string()));
         }
         Ok(())

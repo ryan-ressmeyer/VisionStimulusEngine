@@ -219,6 +219,9 @@ pub fn capture_timing_capabilities(device: &Arc<Device>) -> TimingCapabilities {
         calibrated_timestamps: calibrated_supported,
         calibrateable_time_domains: Vec::new(),
         cpu_gpu_max_deviation_ns: None,
+        // Behaviorally-observed fields: measured at runtime, not from the physical-device probe.
+        scanout_feedback_populated: None,
+        absolute_scheduling_enforced: None,
     };
 
     if !calibrated_supported {
@@ -290,12 +293,24 @@ pub fn capture_timing_capabilities(device: &Arc<Device>) -> TimingCapabilities {
     caps
 }
 
+/// Behaviorally-observed present-timing driver conformance, gathered at runtime (advertised
+/// support can outrun implementation on brand-new extensions). Threaded into the [`HostInfo`]
+/// snapshot so a run records what the driver *actually did*, not just what it claimed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ObservedPresentTiming {
+    /// Whether feedback records carried a non-zero `IMAGE_FIRST_PIXEL_OUT` (see field docs).
+    pub scanout_feedback_populated: Option<bool>,
+    /// Whether absolute `targetTime` scheduling was observed to be enforced (see field docs).
+    pub absolute_scheduling_enforced: Option<bool>,
+}
+
 pub fn capture_host_info(
     physical_device: &Arc<PhysicalDevice>,
     device: &Arc<Device>,
     window: Option<&Window>,
     swapchain_manager: &SwapchainManager,
     config: &VSEConfig,
+    observed: ObservedPresentTiming,
 ) -> HostInfo {
     let captured_at = {
         let now = std::time::SystemTime::now()
@@ -313,13 +328,18 @@ pub fn capture_host_info(
         )
     };
 
+    let mut timing = capture_timing_capabilities(device);
+    // Overlay behaviorally-observed conformance onto the advertised capabilities.
+    timing.scanout_feedback_populated = observed.scanout_feedback_populated;
+    timing.absolute_scheduling_enforced = observed.absolute_scheduling_enforced;
+
     HostInfo {
         captured_at,
         os: capture_os_info(),
         cpu: capture_cpu_info(),
         memory: capture_memory_info(),
         gpu: capture_gpu_info(physical_device),
-        timing: capture_timing_capabilities(device),
+        timing,
         display: capture_display_info(window),
         swapchain: capture_swapchain_info(swapchain_manager),
         pipeline: capture_pipeline_config(config),

@@ -32,18 +32,6 @@ pub trait TimingProvider {
     /// For GOOGLE: target is passed to VkPresentTimeGOOGLE during present.
     fn wait_for_target(&self, target_time: Timestamp, clock: &Clock);
 
-    /// Query the confirmed hardware scanout time for a specific frame number.
-    ///
-    /// Returns `Some(Timestamp)` when the driver has confirmed the scanout time for
-    /// the frame identified by `frame_number`. Used by `run_buffered()` to attach
-    /// hardware-verified timing to `FlipEvent::Presented`.
-    ///
-    /// The default implementation returns `None`; the CPU path uses fence-signal time
-    /// from `record_present_time()` instead.
-    fn confirmed_present_time_for(&self, _frame_number: u64, _clock: &Clock) -> Option<Timestamp> {
-        None
-    }
-
     /// Notify the provider that the swapchain was recreated and its handle changed.
     ///
     /// Providers that cache a swapchain handle (the EXT backend) **must** refresh it here —
@@ -61,6 +49,26 @@ pub trait TimingProvider {
     /// record per present that carried `VkPresentTimingsInfoEXT`.
     fn query_scanouts(&self) -> Vec<pt::ScanoutFeedback> {
         Vec::new()
+    }
+
+    /// The `timeDomainId` of the swapchain's `PRESENT_STAGE_LOCAL` domain, in which absolute
+    /// scanout scheduling targets (`VkPresentTimingInfoEXT.targetTime`) and scanout feedback are
+    /// expressed. `None` until probed, or on backends without hardware scanout timing (CPU). The
+    /// scheduling path needs it to tag a scheduled present with the right domain.
+    fn present_stage_domain_id(&self) -> Option<u64> {
+        None
+    }
+
+    /// Block until the present `present_id` has begun scanout (`vkWaitForPresent2KHR`), returning
+    /// `true` on `VK_SUCCESS`. Default: `false` (no present-wait support); the caller then falls
+    /// back to fence-signal time. Lets the synchronous `flip()` read this frame's real scanout time
+    /// once its feedback record has landed.
+    ///
+    /// **Caller contract:** only legal on a swapchain created with the present-wait2 opt-in flag
+    /// (see [`SwapchainManager::present_wait2_enabled`](crate::core::swapchain::SwapchainManager::present_wait2_enabled)) —
+    /// calling it otherwise is undefined behavior (a driver crash).
+    fn wait_for_present(&self, _present_id: u64, _timeout_ns: u64) -> bool {
+        false
     }
 }
 
@@ -174,9 +182,12 @@ pub struct CalibrationSample {
 /// **primary** experimental clock. It is bridged to the host `CLOCK_MONOTONIC` clock only on
 /// demand, via the opt-in host-clock bridge built on `VK_KHR_calibrated_timestamps` (VSE does
 /// **not** rely on a native `CLOCK_MONOTONIC` swapchain domain, which most drivers — including
-/// Intel/ANV — do not expose). See `docs/clock-synchronization.md`. `record_present_time` still
-/// returns CPU fence-signal time pending the raw-present feedback path; `timing_source` reports
-/// `ExtPresentTiming`.
+/// Intel/ANV — do not expose). See `docs/clock-synchronization.md`.
+///
+/// `FlipInfo.present_time` is the real scanout time on this backend, rebased to the session's
+/// scanout `t=0` by the context (via `wait_for_present` on the sync path + the present-id-keyed
+/// feedback map on the buffered path). This provider's own [`record_present_time`](Self::record_present_time)
+/// is only the CPU fallback the context uses when the driver reports no scanout time (windowed).
 pub struct ExtPresentTimingProvider {
     fns: pt::PresentTimingFns,
     device: vk::Device,
@@ -275,6 +286,40 @@ impl ExtPresentTimingProvider {
     /// Whether `VK_KHR_present_wait2` is available for pacing.
     pub fn has_present_wait2(&self) -> bool {
         self.present_wait2
+    }
+
+    /// Block until the present identified by `present_id` has begun scanout, or `timeout_ns`
+    /// elapses, via `vkWaitForPresent2KHR`.
+    ///
+    /// Returns `true` only on `VK_SUCCESS` (the present actually scanned out) — after which the
+    /// driver's `vkGetPastPresentationTimingEXT` record for that `present_id` is available, so the
+    /// synchronous `flip()` can read a real scanout `present_time`. Returns `false` if present-wait2
+    /// is unavailable, the wait timed out, or the swapchain went out of date (caller falls back to
+    /// fence time).
+    ///
+    /// # Safety of the underlying call
+    ///
+    /// `vkWaitForPresent2KHR` is only valid on a swapchain created with
+    /// `VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR`; the caller must ensure that (VSE gates on
+    /// `SwapchainManager::present_wait2_enabled`). This method assumes the current swapchain has it.
+    pub fn wait_for_present(&self, present_id: u64, timeout_ns: u64) -> bool {
+        let Some(wait_fn) = self.fns.wait_for_present2 else {
+            return false;
+        };
+        let sc = *self.swapchain.borrow();
+        let info = pt::PresentWait2InfoKHR {
+            s_type: pt::STYPE_PRESENT_WAIT_2_INFO_KHR,
+            p_next: ptr::null(),
+            present_id,
+            timeout: timeout_ns,
+        };
+        // SAFETY: `sc` is the current swapchain (assumed present-wait2-enabled per the caller
+        // contract); `info` outlives the call.
+        let r = unsafe { wait_fn(self.device, sc, &info) };
+        if r != vk::Result::SUCCESS && r != vk::Result::TIMEOUT {
+            warn!("vkWaitForPresent2KHR failed: {r:?}");
+        }
+        r == vk::Result::SUCCESS
     }
 
     /// (Re)enable the past-timing ring and re-select the time domain for the current
@@ -469,16 +514,17 @@ impl TimingProvider for ExtPresentTimingProvider {
     }
 
     fn record_present_time(&self, clock: &Clock) -> Timestamp {
-        // Hardware scanout time requires calibrating the present-stage-local clock to the CPU
-        // clock (VK_KHR_calibrated_timestamps) — a separate subsystem. Until then, use the
-        // CPU fence-signal time, identical to the CPU-estimate path.
+        // This is only the context's **fallback** when the driver reports no real scanout time
+        // (windowed compositor). The scanout-native present_time is assembled by the context from
+        // `IMAGE_FIRST_PIXEL_OUT` feedback (see `VSEState::scanout_present_time`); on the direct-
+        // display path that path is taken and this is never used.
         clock.now()
     }
 
     fn wait_for_target(&self, target_time: Timestamp, clock: &Clock) {
-        // Hardware scheduling rides on the raw present path (VkPresentTimingInfoEXT), which
-        // needs the calibration subsystem to express the target in the driver's clock. Until
-        // then, honor the target with a CPU spin so scheduled presents are not early.
+        // Not used on the EXT flip paths: scheduling is done in hardware via
+        // `VkPresentTimingInfoEXT.targetTime` (see `PresentChain::scheduled`), no CPU spin. Kept
+        // as a safe fallback should a caller invoke it directly.
         while clock.now() < target_time {
             std::hint::spin_loop();
         }
@@ -494,6 +540,14 @@ impl TimingProvider for ExtPresentTimingProvider {
 
     fn query_scanouts(&self) -> Vec<pt::ScanoutFeedback> {
         ExtPresentTimingProvider::query_scanouts(self)
+    }
+
+    fn wait_for_present(&self, present_id: u64, timeout_ns: u64) -> bool {
+        ExtPresentTimingProvider::wait_for_present(self, present_id, timeout_ns)
+    }
+
+    fn present_stage_domain_id(&self) -> Option<u64> {
+        *self.present_stage_domain_id.borrow()
     }
 }
 

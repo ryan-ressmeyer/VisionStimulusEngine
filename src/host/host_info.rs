@@ -117,6 +117,23 @@ pub struct TimingCapabilities {
     /// the dominant error term when mapping GPU timestamps onto the CPU clock. `None` if the
     /// measurement could not be taken (extension not enabled or domains unavailable).
     pub cpu_gpu_max_deviation_ns: Option<u64>,
+    /// **Behaviorally observed** (not just advertised): whether the driver actually fills
+    /// `IMAGE_FIRST_PIXEL_OUT` in `vkGetPastPresentationTimingEXT` feedback. `Some(false)` means
+    /// the driver advertises `VK_EXT_present_timing` but returns *zero-valued* scanout stage
+    /// timestamps (measured on Intel/ANV/Mesa 26.1) — a brand-new extension advertised before it
+    /// is fully implemented. VSE then derives `present_time` by sampling the calibrated
+    /// `PRESENT_STAGE_LOCAL` clock after `wait_for_present`. `None` until observed (no flips yet,
+    /// or the CPU-estimate backend). Populated from runtime observation at capture time.
+    #[serde(default)]
+    pub scanout_feedback_populated: Option<bool>,
+    /// **Behaviorally observed**: whether the driver enforces absolute present scheduling
+    /// (`VkPresentTimingInfoEXT.targetTime`). `Some(false)` means it advertises
+    /// `presentAtAbsoluteTime` but ignores the target (measured on Intel/ANV/Mesa 26.1) — VSE then
+    /// software-paces scheduled flips against the scanout clock. `None` until characterized (the
+    /// check disrupts frames, so it is not auto-run; the direct-display example measures it). See
+    /// `docs/clock-synchronization.md`.
+    #[serde(default)]
+    pub absolute_scheduling_enforced: Option<bool>,
 }
 
 /// Display/monitor information from winit
@@ -260,6 +277,44 @@ impl std::fmt::Display for HostInfo {
             self.swapchain.extent[0],
             self.swapchain.extent[1]
         )?;
+        writeln!(f)?;
+        // Present timing: advertised support vs. behaviorally-observed conformance (a brand-new
+        // extension may be advertised before it is implemented — record what the driver actually did).
+        let t = &self.timing;
+        let observed = |o: Option<bool>, yes: &str, no: &str| -> String {
+            match o {
+                Some(true) => yes.to_string(),
+                Some(false) => no.to_string(),
+                None => "not observed".to_string(),
+            }
+        };
+        writeln!(f, "Present timing (VK_EXT_present_timing):")?;
+        writeln!(
+            f,
+            "  advertised: present_timing={}, present_id2={}, present_wait2={}, calibrated_timestamps={}",
+            t.present_timing, t.present_id2, t.present_wait2, t.calibrated_timestamps
+        )?;
+        writeln!(
+            f,
+            "  observed:   scanout feedback timestamps: {}",
+            observed(
+                t.scanout_feedback_populated,
+                "real (IMAGE_FIRST_PIXEL_OUT populated)",
+                "STUBBED to 0 — advertised, not implemented; present_time uses the calibrated scanout clock"
+            )
+        )?;
+        writeln!(
+            f,
+            "              absolute scheduling (targetTime): {}",
+            observed(
+                t.absolute_scheduling_enforced,
+                "enforced by driver",
+                "NOT enforced — advertised, not implemented; VSE software-paces scheduled flips"
+            )
+        )?;
+        if let Some(dev) = t.cpu_gpu_max_deviation_ns {
+            writeln!(f, "  cpu↔gpu calibration max deviation: {dev} ns")?;
+        }
         writeln!(f)?;
         writeln!(f, "VSE: v{}", self.build.vse_version)?;
         if let Some(hash) = &self.build.git_commit_hash {

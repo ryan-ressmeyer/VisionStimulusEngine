@@ -41,6 +41,18 @@ struct FrameSync {
     command_buffer: Option<Arc<dyn PrimaryCommandBufferAbstract>>,
 }
 
+/// Absolute scanout-domain scheduling target for a present, passed to
+/// [`PresentEngine::submit_and_present`]. Expresses *when* the frame's `IMAGE_FIRST_PIXEL_OUT`
+/// scanout should occur, in the swapchain's `PRESENT_STAGE_LOCAL` time domain — the driver then
+/// schedules the present in hardware (`VkPresentTimingInfoEXT.targetTime`), replacing the CPU spin.
+#[derive(Clone, Copy)]
+pub struct ScheduledTarget {
+    /// Absolute present-stage-local nanoseconds at which scanout should begin.
+    pub target_time_ns: u64,
+    /// The `PRESENT_STAGE_LOCAL` time-domain id the target is expressed in.
+    pub time_domain_id: u64,
+}
+
 /// Outcome of a raw present.
 pub struct PresentOutcome {
     /// The `VkPresentId2` value assigned to this present.
@@ -172,7 +184,9 @@ impl PresentEngine {
     ///
     /// The submit waits on the slot's acquire semaphore at `COLOR_ATTACHMENT_OUTPUT` and signals
     /// the render-finished semaphore + the slot fence. The present waits on render-finished and
-    /// attaches [`PresentChain::unscheduled`] (present-id + scanout timing request).
+    /// attaches the timing `pNext` chain: [`PresentChain::scheduled`] with `target`'s absolute
+    /// scanout time when `Some` (hardware scheduling), else [`PresentChain::unscheduled`]
+    /// (present-id + scanout timing request only).
     pub fn submit_and_present(
         &mut self,
         queue: &Arc<Queue>,
@@ -180,6 +194,7 @@ impl PresentEngine {
         image_index: u32,
         slot: usize,
         command_buffer: Arc<dyn PrimaryCommandBufferAbstract>,
+        target: Option<ScheduledTarget>,
     ) -> Result<PresentOutcome, String> {
         // --- Submit: wait acquire@COLOR_ATTACHMENT_OUTPUT, run cmd buf, signal render + fence ---
         let mut wait =
@@ -211,7 +226,10 @@ impl PresentEngine {
 
         // --- Present: wait render-finished, attach the timing pNext chain ---
         let present_id = self.next_present_id();
-        let chain = PresentChain::unscheduled(present_id);
+        let chain = match target {
+            Some(t) => PresentChain::scheduled(present_id, t.target_time_ns, t.time_domain_id),
+            None => PresentChain::unscheduled(present_id),
+        };
 
         let render_sem = self.ring[slot].render_finished.handle();
         let swapchains = [swapchain];

@@ -19,9 +19,15 @@ use super::timing_source::TimingSource;
 ///   submitted to GPU  (source depends on TimingSource)
 /// ```
 ///
-/// The meaning of `present_time` depends on `timing_source`:
-/// - `CpuEstimate`: CPU clock reading after fence signal
-/// - `ExtPresentTiming`: hardware scanout timestamp (`IMAGE_FIRST_PIXEL_OUT`)
+/// The meaning — and clock domain — of `present_time` depends on `timing_source`:
+/// - `CpuEstimate`: host `CLOCK_MONOTONIC` reading after the fence signals (µs since session
+///   start).
+/// - `ExtPresentTiming`: the hardware **scanout** timestamp (`IMAGE_FIRST_PIXEL_OUT`), rebased to
+///   the session's scanout `t=0` (µs in the display's present-stage-local domain — *not* the CPU
+///   clock; see `docs/clock-synchronization.md`). Falls back to CPU fence time when the driver
+///   reports no real scanout time (a windowed compositor reports 0); the direct-display path
+///   yields true scanout times. `timing_source` is the only domain guard — there is no separate
+///   field.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FlipInfo {
     /// Monotonically increasing frame number (0-indexed from first flip)

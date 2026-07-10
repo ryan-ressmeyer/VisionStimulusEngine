@@ -85,6 +85,15 @@ pub const PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT: u32 = 0x0000_0008;
 pub const PRESENT_TIMING_INFO_PRESENT_AT_RELATIVE_TIME_BIT: u32 = 0x0000_0001;
 pub const PRESENT_TIMING_INFO_PRESENT_AT_NEAREST_REFRESH_CYCLE_BIT: u32 = 0x0000_0002;
 
+// `VkSwapchainCreateFlagBitsKHR` — the present-id2 / present-wait2 per-swapchain opt-ins. A
+// swapchain **must** be created with `PRESENT_WAIT_2_BIT` set in `VkSwapchainCreateInfoKHR.flags`
+// for `vkWaitForPresent2KHR` to be legal on it (spec valid usage) — otherwise the call is UB and
+// crashes inside the driver. `PRESENT_ID_2_BIT` is the matching opt-in for `VkPresentId2KHR`.
+// vulkano 0.35's `SwapchainCreateFlags` predates Vulkan 1.4 and cannot express either, so the
+// swapchain is created through raw `vkCreateSwapchainKHR` with these ORed into `flags`.
+pub const SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR: u32 = 0x0000_0040;
+pub const SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR: u32 = 0x0000_0080;
+
 // ─── Feature structs (chained into VkDeviceCreateInfo.pNext) ────────────────
 
 #[repr(C)]
@@ -221,18 +230,45 @@ pub struct PresentChain {
 impl PresentChain {
     /// Build an **unscheduled** present chain (`targetTime = 0`) requesting scanout timing for
     /// the `IMAGE_FIRST_PIXEL_OUT` and `IMAGE_FIRST_PIXEL_VISIBLE` stages, tagged with
-    /// `present_id` for correlation. Scheduling (`targetTime`) lands in B3.
+    /// `present_id` for correlation. Presents at the next opportunity (VSync-locked).
     pub fn unscheduled(present_id: u64) -> Box<Self> {
+        Self::build(present_id, 0, 0, 0)
+    }
+
+    /// Build a **scheduled** present chain: request that the frame's `IMAGE_FIRST_PIXEL_OUT`
+    /// scanout hit at absolute time `target_time_ns` in the time domain `time_domain_id` (the
+    /// swapchain's `PRESENT_STAGE_LOCAL` domain). `flags = 0` selects **absolute** scheduling
+    /// (requires the `presentAtAbsoluteTime` feature); the driver presents at the first refresh
+    /// cycle whose scanout is at or after the target. Still requests all scanout stages for
+    /// feedback. Tagged with `present_id` for correlation.
+    pub fn scheduled(present_id: u64, target_time_ns: u64, time_domain_id: u64) -> Box<Self> {
+        Self::build(
+            present_id,
+            target_time_ns,
+            time_domain_id,
+            PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT,
+        )
+    }
+
+    /// Shared constructor for [`unscheduled`](Self::unscheduled) / [`scheduled`](Self::scheduled):
+    /// allocate the pinned chain and wire its interior pointers. `target_time_ns == 0` (with
+    /// `target_stage == 0`) is the unscheduled case.
+    fn build(
+        present_id: u64,
+        target_time_ns: u64,
+        time_domain_id: u64,
+        target_stage: u32,
+    ) -> Box<Self> {
         let mut chain = Box::new(Self {
             present_ids: [present_id],
             timing_infos: [PresentTimingInfoEXT {
                 s_type: STYPE_PRESENT_TIMING_INFO_EXT,
                 p_next: std::ptr::null(),
-                flags: 0,
-                target_time: 0,
-                time_domain_id: 0,
+                flags: 0, // absolute scheduling (or unscheduled when target_time == 0)
+                target_time: target_time_ns,
+                time_domain_id,
                 present_stage_queries: REQUESTED_PRESENT_STAGES,
-                target_time_domain_present_stage: 0,
+                target_time_domain_present_stage: target_stage,
             }],
             timings: PresentTimingsInfoEXT {
                 s_type: STYPE_PRESENT_TIMINGS_INFO_EXT,
@@ -733,6 +769,14 @@ mod tests {
     use std::ptr;
 
     #[test]
+    fn swapchain_present_opt_in_flag_bits_match_spec() {
+        // VkSwapchainCreateFlagBitsKHR (vulkan_core.h): getting these wrong silently drops the
+        // present-wait2 opt-in and re-introduces the driver segfault, so pin the exact values.
+        assert_eq!(SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR, 0x40);
+        assert_eq!(SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR, 0x80);
+    }
+
+    #[test]
     fn present_chain_wires_pnext_id_and_stage_queries() {
         let chain = PresentChain::unscheduled(42);
 
@@ -772,6 +816,39 @@ mod tests {
         assert_eq!(chain.present_id2.s_type, STYPE_PRESENT_ID_2_KHR);
         assert_eq!(chain.timings.s_type, STYPE_PRESENT_TIMINGS_INFO_EXT);
         assert_eq!(ti.s_type, STYPE_PRESENT_TIMING_INFO_EXT);
+    }
+
+    #[test]
+    fn scheduled_present_chain_sets_target_time_domain_and_stage() {
+        let target_ns: u64 = 29_714_123_456_789;
+        let domain_id: u64 = 7;
+        let chain = PresentChain::scheduled(99, target_ns, domain_id);
+
+        let ti = &chain.timing_infos[0];
+        // Absolute scheduling: flags stay 0 (no relative / nearest-refresh bits).
+        assert_eq!(ti.flags, 0);
+        assert_eq!(ti.target_time, target_ns);
+        assert_eq!(ti.time_domain_id, domain_id);
+        // The target refers to the scanout-begin stage — when photons should start.
+        assert_eq!(
+            ti.target_time_domain_present_stage,
+            PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT
+        );
+        // Feedback is still requested for all stages, and the id still carried.
+        assert_eq!(ti.present_stage_queries, REQUESTED_PRESENT_STAGES);
+        assert_eq!(chain.present_id(), 99);
+        // Interior pointers wired the same as the unscheduled chain.
+        assert_eq!(chain.timings.p_timing_infos, chain.timing_infos.as_ptr());
+        assert_eq!(chain.present_id2.p_present_ids, chain.present_ids.as_ptr());
+    }
+
+    #[test]
+    fn unscheduled_present_chain_has_zero_target() {
+        let chain = PresentChain::unscheduled(3);
+        let ti = &chain.timing_infos[0];
+        assert_eq!(ti.target_time, 0);
+        assert_eq!(ti.time_domain_id, 0);
+        assert_eq!(ti.target_time_domain_present_stage, 0);
     }
 
     #[test]

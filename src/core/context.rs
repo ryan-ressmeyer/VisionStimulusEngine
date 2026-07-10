@@ -24,7 +24,7 @@ use super::input::{
     AcquisitionMethod, DisplayBackend, InputEvent, InputState, KeyCode, MonitorInfo,
     MonitorSelection, MouseButton, VideoModeInfo, WindowMode,
 };
-use super::present_engine::PresentEngine;
+use super::present_engine::{PresentEngine, ScheduledTarget};
 use super::present_timing_ext::ScanoutFeedback;
 use super::{
     device::{DeviceError, DeviceSelector, GPUPreference},
@@ -450,6 +450,17 @@ struct VSEState {
     /// Scanout-clock epoch (present-stage-local `t=0`), established on the first flip under the
     /// EXT backend. `None` on the CPU-estimate path (no scanout clock available).
     scanout_clock: Option<ScanoutClock>,
+    // --- Driver-conformance observation (advertised present-timing features may be unimplemented) ---
+    /// Whether the driver actually fills `IMAGE_FIRST_PIXEL_OUT` in feedback: `Some(true)` once a
+    /// non-zero value is seen; `Some(false)` after enough feedback records arrive all-zero; `None`
+    /// until determined. Recorded into `HostInfo` and drives a one-time guardrail warning.
+    scanout_feedback_populated: Option<bool>,
+    /// Count of feedback records seen while `scanout_feedback_populated` is still undetermined.
+    scanout_feedback_probe_count: u32,
+    /// One-time-warning latches for driver-conformance guardrails (feedback stubbed; scheduling
+    /// software-paced), so the warnings fire once per session rather than every frame.
+    warned_feedback_stub: bool,
+    warned_sw_pacing: bool,
     /// Opt-in host↔scanout bridge (see `with_host_clock_bridge`). `None` unless requested and
     /// the EXT backend is active.
     host_bridge: Option<HostClockBridge>,
@@ -636,7 +647,45 @@ impl VSEState {
         for fb in &feedback {
             self.scanout_by_present_id.insert(fb.present_id, *fb);
         }
+        self.observe_feedback_conformance(&feedback);
         self.recent_scanouts = feedback;
+    }
+
+    /// Passively observe whether the driver actually populates `IMAGE_FIRST_PIXEL_OUT` in
+    /// present-timing feedback (some drivers advertise `VK_EXT_present_timing` but return
+    /// zero-valued stage timestamps). Latches `scanout_feedback_populated` and, on the first
+    /// determination that it is stubbed, emits a one-time guardrail warning naming the workaround
+    /// VSE is using. Cheap and automatic — no extra presents.
+    fn observe_feedback_conformance(&mut self, feedback: &[ScanoutFeedback]) {
+        if self.scanout_feedback_populated == Some(true) {
+            return;
+        }
+        if feedback
+            .iter()
+            .any(|f| f.first_pixel_out_ns.is_some_and(|v| v != 0))
+        {
+            self.scanout_feedback_populated = Some(true);
+            return;
+        }
+        // All-zero so far. Once enough records have arrived all-zero, conclude the driver stubs the
+        // stage timestamps (16 ≈ the driver's timing-ring depth — a full turnover with no real value).
+        self.scanout_feedback_probe_count = self
+            .scanout_feedback_probe_count
+            .saturating_add(feedback.len() as u32);
+        if self.scanout_feedback_populated.is_none() && self.scanout_feedback_probe_count >= 16 {
+            self.scanout_feedback_populated = Some(false);
+            if !self.warned_feedback_stub {
+                self.warned_feedback_stub = true;
+                warn!(
+                    "VK_EXT_present_timing: the driver returns present-timing feedback that \
+                     correlates by present_id but stubs the scanout stage timestamps \
+                     (IMAGE_FIRST_PIXEL_OUT = 0) — advertised but not implemented (seen on \
+                     Intel/ANV/Mesa 26.1). present_time is derived from the calibrated \
+                     PRESENT_STAGE_LOCAL clock instead; scanout timing stays valid. See \
+                     docs/clock-synchronization.md."
+                );
+            }
+        }
     }
 
     /// Take the confirmed scanout record for `present_id`, pruning it and every older entry
@@ -648,24 +697,133 @@ impl VSEState {
         found
     }
 
+    /// Rebase a driver `IMAGE_FIRST_PIXEL_OUT` scanout time (present-stage-local ns) into a
+    /// scanout-domain [`Timestamp`] (µs since the session's scanout `t=0`). This is the value
+    /// stored in `FlipInfo.present_time` under `ExtPresentTiming` — a hardware scanout time, not a
+    /// host-clock time (see the clock model in `docs/clock-synchronization.md`). `None` before the
+    /// scanout epoch is established, or when the driver reports no real scanout time.
+    ///
+    /// A real `IMAGE_FIRST_PIXEL_OUT` is an absolute present-stage-local value (~10¹³ ns), never
+    /// zero. Windowed compositors that cannot observe true scanout report the stage with time `0`
+    /// (seen on windowed Wayland / ANV); that is *not* a scanout time, so it yields `None` and the
+    /// caller falls back to CPU fence time. Real values appear on the direct-display path.
+    fn scanout_present_time(&self, first_pixel_out_ns: u64) -> Option<Timestamp> {
+        if first_pixel_out_ns == 0 {
+            return None;
+        }
+        let clock = self.scanout_clock?;
+        Some(Timestamp::from_micros(
+            clock.rebase(first_pixel_out_ns).as_micros(),
+        ))
+    }
+
+    /// Sample the present-stage-local scanout clock **now** and rebase it to a scanout-domain
+    /// [`Timestamp`] (µs since `t=0`). `None` before the scanout epoch is established or on the
+    /// CPU backend.
+    ///
+    /// Used by the synchronous `flip()` immediately after `wait_for_present` returns — i.e. right
+    /// at this frame's scanout — to obtain a real scanout `present_time`. This is the fallback for
+    /// the (measured) case where the driver stubs `vkGetPastPresentationTimingEXT`'s stage times
+    /// to zero (Intel/ANV/Mesa 26.1): the feedback still correlates by `present_id` but carries no
+    /// timestamp, whereas the calibrated `PRESENT_STAGE_LOCAL` clock reports real, vblank-cadence
+    /// values. The sampled value is scanout-begin plus the calibrated-read latency (tens of µs —
+    /// far below the display-panel latency floor that a photodiode measures anyway).
+    fn sample_scanout_now(&self) -> Option<Timestamp> {
+        let clock = self.scanout_clock?;
+        let sample = self.timing_provider.sample_present_calibration()?;
+        Some(Timestamp::from_micros(clock.rebase(sample.stage_ns).as_micros()))
+    }
+
+    /// Convert a scheduling target (`target`, scanout-domain µs since `t=0`) into an absolute
+    /// [`ScheduledTarget`] the driver can schedule against: absolute present-stage-local ns in the
+    /// swapchain's `PRESENT_STAGE_LOCAL` domain. `None` until the scanout epoch and domain id are
+    /// known (the first flip, before `t=0` is established) — the caller then presents unscheduled.
+    fn scheduled_target(&self, target: Timestamp) -> Option<ScheduledTarget> {
+        let epoch = self.scanout_clock?.epoch_stage_ns();
+        let time_domain_id = self.timing_provider.present_stage_domain_id()?;
+        let target_time_ns = epoch.saturating_add(target.as_micros().saturating_mul(1_000));
+        Some(ScheduledTarget {
+            target_time_ns,
+            time_domain_id,
+        })
+    }
+
+    /// The display's refresh interval, if known (driver-reported, else the auto-detected estimate).
+    fn refresh_interval(&self) -> Option<Duration> {
+        self.timing_provider
+            .refresh_cycle_duration()
+            .or(self.expected_frame_duration)
+    }
+
+    /// One-time guardrail note (per session) that scheduled presents are being software-paced,
+    /// since hardware `targetTime` enforcement is driver-dependent and unverified at runtime.
+    fn note_scheduling_once(&mut self) {
+        if !self.warned_sw_pacing {
+            self.warned_sw_pacing = true;
+            info!(
+                "Scheduled present requested: VSE paces it against the scanout clock (software). \
+                 Hardware targetTime enforcement is driver-dependent and NOT verified here — it is \
+                 ignored on Intel/ANV/Mesa 26.1. Characterize your driver with \
+                 `examples/13_direct_display_scanout` (reports absolute_scheduling_enforced)."
+            );
+        }
+    }
+
+    /// Software scanout-domain pacing for a scheduled flip (sync path only).
+    ///
+    /// Many drivers advertise `presentAtAbsoluteTime` but do **not** enforce
+    /// `VkPresentTimingInfoEXT.targetTime` (measured: Intel/ANV/Mesa 26.1 ignores it), so VSE paces
+    /// the present itself. FIFO quantizes every present to a vblank, so we need only issue the
+    /// present within the target vblank's preceding refresh interval — sleep on the scanout clock
+    /// until then. The wait is a scanout-domain *duration* (≈ real time to within the ~2 ppm
+    /// scanout↔CPU drift), so no absolute cross-clock math enters the loop. Harmless on drivers that
+    /// *do* honor `targetTime` — they would present at the same vblank; we just avoid submitting
+    /// early. No-op when the scanout clock isn't established yet, or the target is already imminent.
+    fn pace_to_scanout_target(&self, target: Timestamp, refresh: Duration) {
+        let Some(now) = self.sample_scanout_now() else {
+            return;
+        };
+        // Aim to submit ~half a refresh before the target vblank: FIFO then shows it at that vblank,
+        // robust to ±½-refresh sleep jitter.
+        let present_at_us = target.as_micros().saturating_sub(refresh.as_micros() as u64 / 2);
+        let now_us = now.as_micros();
+        if present_at_us > now_us {
+            std::thread::sleep(Duration::from_micros(present_at_us - now_us));
+        }
+    }
+
     /// Build a confirmed `FlipInfo` from an estimated one captured at submit time.
     ///
-    /// Computes the present time and missed-frame detection, and updates the trackers for the
-    /// next call. On the EXT backend it keys on the frame's `present_id`: if the driver's scanout
-    /// record for that present has arrived (`scanout_by_present_id`), missed detection uses the
-    /// real `IMAGE_FIRST_PIXEL_OUT` scanout delta; otherwise it falls back to the CPU
-    /// present-time delta (feedback for a present lags its submission by a frame or two).
-    /// `present_time` itself stays CPU-domain until B3 makes it a scanout-native timestamp.
+    /// On the EXT backend, keys on the frame's `present_id`: if this frame's
+    /// `IMAGE_FIRST_PIXEL_OUT` record has arrived (it was presented `depth+1` frames ago, so it
+    /// normally has), `present_time` is the real hardware scanout time (rebased to the scanout
+    /// epoch) and missed detection uses the scanout delta; otherwise it falls back to CPU fence
+    /// time. `timing_source` records which domain the value is in.
     fn build_confirmed_flip(&mut self, estimated: FlipInfo) -> FlipInfo {
-        // Prefer hardware-confirmed scanout time for this specific frame when available.
-        let confirmed_present = self
-            .timing_provider
-            .confirmed_present_time_for(estimated.frame_number, &self.clock)
-            .unwrap_or_else(|| self.timing_provider.record_present_time(&self.clock));
-
         // Look up this frame's confirmed scanout record by present_id, pruning consumed/past
         // entries (present ids are monotonic, so anything ≤ this id is no longer needed).
         let scanout = self.take_scanout_for(estimated.present_id);
+
+        // This frame's real scanout-begin time, if the driver reported one. Zero means "no real
+        // scanout time" — filtered here so both present_time and missed detection below fall back
+        // to the CPU clock rather than treating 0 as a timestamp.
+        //
+        // Note: unlike the synchronous `flip()` path — which blocks on `wait_for_present` and can
+        // therefore sample the calibrated scanout clock at the frame's scanout — the buffered path
+        // is pipelined and never blocks per frame, so it can only use the driver's per-present
+        // feedback. Where that feedback is stubbed to 0 (Intel/ANV/Mesa 26.1), buffered
+        // `present_time` falls back to CPU time; it becomes scanout-native automatically on drivers
+        // that populate `IMAGE_FIRST_PIXEL_OUT`.
+        let scanout_ns = scanout
+            .and_then(|fb| fb.first_pixel_out_ns)
+            .filter(|&ns| ns != 0);
+
+        // present_time is the hardware scanout time for this frame when available, else CPU fence
+        // time. `timing_source` (already ExtPresentTiming) plus a real scanout record is the domain
+        // guard; there is no separate field (see the B3 schema decision).
+        let confirmed_present = scanout_ns
+            .and_then(|ns| self.scanout_present_time(ns))
+            .unwrap_or_else(|| self.timing_provider.record_present_time(&self.clock));
 
         let cpu_frame_duration = self
             .last_present_time
@@ -694,7 +852,7 @@ impl VSEState {
         // present lags its submission (at depth 1 it usually arrives after this frame's
         // confirmation), so a non-consecutive delta would span a gap and false-flag a miss.
         // Otherwise fall back to the CPU present-time delta.
-        let frame_duration = match scanout.and_then(|fb| fb.first_pixel_out_ns) {
+        let frame_duration = match scanout_ns {
             Some(scanout_ns) => {
                 let consecutive =
                     self.last_scanout_present_id == Some(estimated.present_id.wrapping_sub(1));
@@ -723,6 +881,14 @@ impl VSEState {
             None => (false, 0),
         };
 
+        // on_target: with a real scanout time (same domain as the target) the scheduled present
+        // met its deadline iff scanout landed at/after target. Without one (windowed), keep the
+        // estimate rather than claim a verification we cannot make.
+        let on_target = match (estimated.target_time, scanout_ns) {
+            (Some(target), Some(_)) => confirmed_present.as_micros() >= target.as_micros(),
+            _ => estimated.on_target,
+        };
+
         let flip = FlipInfo {
             frame_number: estimated.frame_number,
             timing_source: self.timing_provider.source(),
@@ -730,7 +896,7 @@ impl VSEState {
             present_time: confirmed_present,
             present_id: estimated.present_id,
             target_time: estimated.target_time,
-            on_target: estimated.on_target,
+            on_target,
             missed,
             missed_count,
             skipped: false,
@@ -891,7 +1057,16 @@ impl VSEContext {
             image_count: 2,
         };
 
-        let swapchain = SwapchainManager::new(device.clone(), surface, swapchain_config)?;
+        // Opt the swapchain into present-id2 / present-wait2 (raw create) when the device enabled
+        // presentWait2, so the synchronous flip() can block on vkWaitForPresent2KHR for this
+        // frame's real scanout time.
+        let present_opt_in = ext_features.map(|f| f.present_wait2).unwrap_or(false);
+        let swapchain = SwapchainManager::new_with_present_opt_in(
+            device.clone(),
+            surface,
+            swapchain_config,
+            present_opt_in,
+        )?;
         let frame_builder = FrameBuilder::new(device.clone(), queue.clone());
         let renderer = Renderer::new(device.clone(), queue.clone(), swapchain.format())?;
 
@@ -940,6 +1115,10 @@ impl VSEContext {
             expected_frame_duration,
             refresh_detect_samples: Vec::with_capacity(10),
             scanout_clock: None,
+            scanout_feedback_populated: None,
+            scanout_feedback_probe_count: 0,
+            warned_feedback_stub: false,
+            warned_sw_pacing: false,
             host_bridge,
             last_bridge_sample_ts: None,
             input_source: InputSource::Winit,
@@ -998,7 +1177,14 @@ impl VSEContext {
             image_count: 2,
         };
 
-        let swapchain = SwapchainManager::new(device.clone(), surface, swapchain_config)?;
+        // Opt into present-id2 / present-wait2 (raw swapchain) when presentWait2 was enabled.
+        let present_opt_in = ext_features.map(|f| f.present_wait2).unwrap_or(false);
+        let swapchain = SwapchainManager::new_with_present_opt_in(
+            device.clone(),
+            surface,
+            swapchain_config,
+            present_opt_in,
+        )?;
         let frame_builder = FrameBuilder::new(device.clone(), queue.clone());
         let renderer = Renderer::new(device.clone(), queue.clone(), swapchain.format())?;
 
@@ -1056,6 +1242,10 @@ impl VSEContext {
             expected_frame_duration,
             refresh_detect_samples: Vec::with_capacity(10),
             scanout_clock: None,
+            scanout_feedback_populated: None,
+            scanout_feedback_probe_count: 0,
+            warned_feedback_stub: false,
+            warned_sw_pacing: false,
             host_bridge,
             last_bridge_sample_ts: None,
             input_source: InputSource::Evdev(evdev_reader),
@@ -2139,11 +2329,19 @@ impl<'a> RenderContext<'a> {
         let extent = self.state.swapchain.extent();
         let command_buffer = self.state.renderer.render(image, clear_color, extent)?;
 
-        // Scheduled target still rides a CPU spin in B1 (hardware scheduling lands in B3).
+        // Hardware scheduling: express the target (scanout-domain µs) as an absolute scanout time
+        // for `VkPresentTimingInfoEXT.targetTime`. Falls back to unscheduled when the scanout
+        // epoch/domain isn't known yet (the very first flip, before `t=0` is established).
+        let scheduled = target_time.and_then(|t| self.state.scheduled_target(t));
+
+        // Software scanout-domain pacing: not every driver enforces `targetTime` (Intel/ANV/Mesa
+        // 26.1 does not), so pace the present ourselves against the scanout clock. Harmless when the
+        // driver *does* honor the hardware target above. Sync path only (buffered stays pipelined).
         if let Some(target) = target_time {
-            self.state
-                .timing_provider
-                .wait_for_target(target, &self.state.clock);
+            self.state.note_scheduling_once();
+            if let Some(refresh) = self.state.refresh_interval() {
+                self.state.pace_to_scanout_target(target, refresh);
+            }
         }
 
         let submit_time = self.state.clock.now();
@@ -2155,32 +2353,44 @@ impl<'a> RenderContext<'a> {
             .present_engine
             .as_mut()
             .expect("flip_ext called without a present engine")
-            .submit_and_present(&queue, swapchain_handle, image_index, slot, command_buffer)
+            .submit_and_present(
+                &queue,
+                swapchain_handle,
+                image_index,
+                slot,
+                command_buffer,
+                scheduled,
+            )
             .map_err(SwapchainError::PresentFailed)?;
         if outcome.suboptimal {
             self.state.swapchain.mark_needs_recreation();
         }
 
-        // Synchronous flip(): block until this frame's GPU work completes before sampling the
-        // present time, so inter-frame deltas track the vblank cadence (matches the CPU path's
-        // blocking present). The buffered path confirms asynchronously and never calls this.
+        // Synchronous flip(): block on the render fence (GPU render done) before sampling — cheap,
+        // and keeps the command buffer alive. The scanout-time wait below paces to the vblank.
         if let Some(engine) = &self.state.present_engine {
             engine.wait_frame(slot);
         }
 
-        // present_time is CPU fence-signal time in B1; B3 rebases scanout feedback instead.
-        let present_time = self
-            .state
-            .timing_provider
-            .record_present_time(&self.state.clock);
-
-        // Establish the scanout epoch / feed the opt-in host-clock bridge (off hot path).
+        // Establish the scanout epoch on the first flip / feed the opt-in host-clock bridge (off
+        // hot path). Must run before rebasing scanout feedback into scanout-domain time below.
         self.state.update_clocks();
 
-        // --- Feedback read (B1): drain confirmed scanout records ONCE and cache them ---
-        // `query_scanouts` dequeues from the driver's ring, so it must be called exactly once
-        // per frame; `scanout_feedback()` returns this cache rather than re-draining.
-        self.state.recent_scanouts = self.state.timing_provider.query_scanouts();
+        // Block until THIS frame has begun scanout, so its IMAGE_FIRST_PIXEL_OUT feedback record
+        // has landed (feedback lags the present by ~1 vblank — that lag is why the sync path needs
+        // present-wait2). Only legal on a present-wait2 swapchain, so gate on that; falls back to
+        // CPU fence time when present-wait2 is unavailable or the wait times out.
+        const SCANOUT_WAIT_NS: u64 = 250_000_000; // 250 ms safety cap (≫ one vblank)
+        let waited = self.state.swapchain.present_wait2_enabled()
+            && self
+                .state
+                .timing_provider
+                .wait_for_present(outcome.present_id, SCANOUT_WAIT_NS);
+
+        // Drain confirmed scanout records ONCE (destructive dequeue) and cache them: populates
+        // `scanout_by_present_id` (present-id keyed) and `recent_scanouts` (for `scanout_feedback()`).
+        let feedback = self.state.timing_provider.query_scanouts();
+        self.state.ingest_scanout_feedback(feedback);
         if let Some(last) = self.state.recent_scanouts.last() {
             debug!(
                 "scanout feedback: {} record(s); latest present_id={} first_pixel_out={:?} domain={}",
@@ -2190,6 +2400,35 @@ impl<'a> RenderContext<'a> {
                 last.time_domain
             );
         }
+
+        // present_time is THIS frame's real hardware scanout time — the scientifically meaningful
+        // "photons started" timestamp, in the scanout domain. Source order:
+        //   1. the driver's `IMAGE_FIRST_PIXEL_OUT` feedback for this present, when the driver fills
+        //      it (a true per-present scanout time);
+        //   2. else — since `wait_for_present` just blocked until this frame began scanout — the
+        //      calibrated present-stage-local clock sampled now (Intel/ANV/Mesa 26.1 stubs the
+        //      feedback stage times to 0, so this is the real scanout source on that driver);
+        //   3. else CPU fence-signal time (windowed with no scanout, no present-wait2, or before
+        //      the scanout epoch is established).
+        let scanout_present = self
+            .state
+            .take_scanout_for(outcome.present_id)
+            .and_then(|fb| fb.first_pixel_out_ns)
+            .and_then(|ns| self.state.scanout_present_time(ns))
+            .or_else(|| waited.then(|| self.state.sample_scanout_now()).flatten());
+        let present_time = scanout_present.unwrap_or_else(|| {
+            self.state
+                .timing_provider
+                .record_present_time(&self.state.clock)
+        });
+
+        // on_target is only knowable against a real scanout time (same domain as the target). When
+        // there is one, the scheduled present met its deadline iff scanout landed at/after target;
+        // without one (windowed) we cannot verify, so report `true`.
+        let on_target = match (target_time, scanout_present) {
+            (Some(target), Some(sp)) => sp.as_micros() >= target.as_micros(),
+            _ => true,
+        };
 
         // --- Shared bottom half: refresh detect, missed-frame detection, FlipInfo assembly ---
         let frame_duration = self
@@ -2239,7 +2478,7 @@ impl<'a> RenderContext<'a> {
             present_time,
             present_id: outcome.present_id,
             target_time,
-            on_target: true,
+            on_target,
             missed,
             missed_count,
             skipped: false,
@@ -2435,12 +2674,9 @@ impl<'a> RenderContext<'a> {
         let extent = self.state.swapchain.extent();
         let command_buffer = self.state.renderer.render(image, clear_color, extent)?;
 
-        // Scheduled target still rides a CPU spin (hardware scheduling lands in B3).
-        if let Some(target) = target_time {
-            self.state
-                .timing_provider
-                .wait_for_target(target, &self.state.clock);
-        }
+        // Hardware scheduling (no CPU spin): express the target as an absolute scanout time for
+        // the driver. Falls back to unscheduled before the scanout epoch/domain is known.
+        let scheduled = target_time.and_then(|t| self.state.scheduled_target(t));
 
         let submit_time = self.state.clock.now();
 
@@ -2451,7 +2687,14 @@ impl<'a> RenderContext<'a> {
             .present_engine
             .as_mut()
             .expect("flip_with_payload_ext called without a present engine")
-            .submit_and_present(&queue, swapchain_handle, image_index, slot, command_buffer)
+            .submit_and_present(
+                &queue,
+                swapchain_handle,
+                image_index,
+                slot,
+                command_buffer,
+                scheduled,
+            )
             .map_err(SwapchainError::PresentFailed)?;
         if outcome.suboptimal {
             self.state.swapchain.mark_needs_recreation();
@@ -2939,7 +3182,25 @@ impl<'a> RenderContext<'a> {
             self.state.window.as_deref(),
             &self.state.swapchain,
             self.config,
+            crate::host::capture::ObservedPresentTiming {
+                scanout_feedback_populated: self.state.scanout_feedback_populated,
+                // Enforcement is not auto-probed (it disrupts frames); `None` here. The
+                // direct-display characterization example measures and reports it.
+                absolute_scheduling_enforced: None,
+            },
         )
+    }
+
+    /// Whether the driver was observed to actually populate `IMAGE_FIRST_PIXEL_OUT` in
+    /// present-timing feedback, as opposed to merely advertising `VK_EXT_present_timing`.
+    ///
+    /// `Some(true)` — real per-present scanout timestamps; `Some(false)` — feedback correlates by
+    /// present_id but carries zero-valued stage times (VSE falls back to sampling the calibrated
+    /// scanout clock; measured on Intel/ANV/Mesa 26.1); `None` — not yet determined (too few flips,
+    /// or the CPU-estimate backend). A guardrail against trusting an advertised-but-unimplemented
+    /// feature. See `docs/clock-synchronization.md`.
+    pub fn scanout_feedback_populated(&self) -> Option<bool> {
+        self.state.scanout_feedback_populated
     }
 
     // === Input polling (frame-aligned) ===
