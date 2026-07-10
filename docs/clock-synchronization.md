@@ -161,7 +161,50 @@ Caveat: 120 s cannot observe thermal wander of the *rate* itself over a long rec
 reason the bridge **tracks** (sliding window) rather than freezing a slope. Re-confirm on the
 direct-display path when the raw-present subsystem lands.
 
-## 6. Primary sources
+## 6. Driver conformance: advertised ≠ implemented
+
+`VK_EXT_present_timing` is very new (finalized 2024–2025), and a driver can **advertise** the
+extension and its feature bits while only **partially implementing** them. VSE therefore treats
+advertised support as a claim to be *behaviorally verified*, falls back to a correct path when a
+sub-feature is missing, and **records what the driver actually did** in the host snapshot so a run's
+timing pedigree is never silently wrong.
+
+**Measured on this project's reference machine (Intel Meteor Lake / ANV / Mesa 26.1, 2026-07),
+direct-display and windowed:** two sub-features are advertised but not functional:
+
+| Sub-feature | Advertised | Actually works | VSE's response |
+|---|---|---|---|
+| `present_id2` correlation | ✓ | ✓ | Used directly (`FlipInfo.present_id`). |
+| `present_wait2` | ✓ | ✓ | Paces the sync `flip()` to the vblank. |
+| Calibrated `PRESENT_STAGE_LOCAL` clock | ✓ | ✓ | The real scanout-time source (see below). |
+| **`vkGetPastPresentationTimingEXT` stage timestamps** | ✓ | **✗ — returns `IMAGE_FIRST_PIXEL_OUT = 0`** in *complete* records | Sync `flip()` samples the calibrated scanout clock right after `wait_for_present` (which returns at the frame's scanout) → real scanout `present_time`, **7 µs** from the clock. |
+| **Absolute scheduling `VkPresentTimingInfoEXT.targetTime`** | ✓ (`presentAtAbsoluteTime`) | **✗ — target accepted and echoed in feedback, but the present is not held** | VSE **software-paces** scheduled flips against the scanout clock (still sends the hardware target, which a conformant driver would honor). |
+
+Both gaps are the *timing-report* and *scheduling* halves of the extension; the driver implemented
+the *correlation* and *wait* halves first. On a driver that fully implements the extension, VSE
+automatically prefers the true per-present feedback timestamp and (harmlessly) the hardware target —
+no code change needed.
+
+### How VSE detects and reports it
+
+- **Passive feedback check (automatic, every session):** VSE watches present-timing feedback and,
+  once a ring's worth of records has arrived all-zero, concludes the stage timestamps are stubbed,
+  emits a **one-time `WARN`** naming the fallback in use, and records
+  `HostInfo.timing.scanout_feedback_populated = Some(false)`. `ctx.scanout_feedback_populated()`
+  exposes it. No extra presents, no startup cost.
+- **Scheduling provenance:** the first scheduled `flip(Some(t))` logs a one-time note that presents
+  are software-paced and that hardware `targetTime` enforcement is driver-dependent and unverified.
+- **Enforcement characterization (on demand):** actively testing scheduling enforcement requires
+  presenting deliberate multi-vblank gaps, which disrupts frames, so it is **not** auto-run.
+  `examples/13_direct_display_scanout` measures it (schedules gaps from a fixed `t0 + k·T` anchor and
+  checks the measured scanout gap) and reports `absolute_scheduling_enforced`. Run it once per
+  hardware/driver config; `examples/06_host_info` prints the advertised-vs-observed table.
+
+The guiding rule: **VSE's behavior stays correct via fallbacks, and provenance
+(`FlipInfo.timing_source`, `HostInfo.timing.*`, the one-time warnings) reports the mechanism that was
+actually used** — so hardware-verified and worked-around runs are never confused in the data.
+
+## 7. Primary sources
 
 - [VkTimeDomainKHR — reference](https://docs.vulkan.org/refpages/latest/refpages/source/VkTimeDomainKHR.html)
 - [VK_EXT_present_timing — proposal](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_present_timing.html)

@@ -115,7 +115,18 @@ and takes the same posture as Psychtoolbox. Three roles, and they must not be co
    ANV) the relative drift is a stable ~2 ppm, so the bridge is a lower-envelope sliding-window
    linear fit, not a single offset. It is off the hot path and must be explicitly requested.
 
-See `docs/clock-synchronization.md` for the full model, error budget, and the drift measurement.
+**Driver conformance caveat.** `VK_EXT_present_timing` is new enough that a driver may *advertise*
+sub-features it has not *implemented*. Measured on the reference hardware (Intel MTL / ANV / Mesa
+26.1), the driver stubs the `vkGetPastPresentationTimingEXT` scanout stage timestamps to 0 and does
+not enforce `targetTime` scheduling — while advertising both. VSE verifies behaviorally and falls
+back correctly: `present_time` comes from sampling the calibrated scanout clock after
+`wait_for_present` (not the stubbed feedback), and scheduled flips are software-paced against the
+scanout clock. It records what the driver actually did in `HostInfo.timing` and warns once. Never
+assume an advertised present-timing feature works — check `scanout_feedback_populated` /
+`absolute_scheduling_enforced`.
+
+See `docs/clock-synchronization.md` for the full model, error budget, the drift measurement, and the
+driver-conformance table (§6).
 
 ## Related Projects
 
