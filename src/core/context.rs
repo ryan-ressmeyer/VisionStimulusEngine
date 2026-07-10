@@ -430,8 +430,21 @@ struct VSEState {
     /// here and cached for `scanout_feedback()` to return without re-draining. Empty on the
     /// CPU-estimate path.
     recent_scanouts: Vec<ScanoutFeedback>,
+    /// Confirmed scanout records accumulated across flips, keyed by `present_id`. Feedback for a
+    /// present arrives a frame or two after submission, so the buffered path stores records here
+    /// and looks them up by the confirming frame's `present_id` (see `build_confirmed_flip`).
+    /// Pruned on lookup to stay bounded (present ids are monotonic).
+    scanout_by_present_id: std::collections::HashMap<u64, ScanoutFeedback>,
     frame_number: u64,
     last_present_time: Option<Timestamp>,
+    /// `IMAGE_FIRST_PIXEL_OUT` scanout time (present-stage-local ns) of the last frame confirmed
+    /// with hardware feedback, for computing scanout-delta missed detection on the buffered path.
+    /// `None` until the first confirmed scanout record arrives.
+    last_scanout_ns: Option<u64>,
+    /// `present_id` paired with [`last_scanout_ns`]. A scanout delta is only trusted between
+    /// *consecutive* present ids (`this == last + 1`); otherwise a lagged or dropped feedback
+    /// record would inflate the delta into a false miss, so we fall back to the CPU delta.
+    last_scanout_present_id: Option<u64>,
     expected_frame_duration: Option<Duration>,
     refresh_detect_samples: Vec<Duration>,
     /// Scanout-clock epoch (present-stage-local `t=0`), established on the first flip under the
@@ -616,10 +629,33 @@ impl VSEState {
             .map_or(true, |t| now.saturating_sub(t.as_micros()) >= RESAMPLE_US)
     }
 
+    /// Record confirmed scanout feedback drained this frame: index each record by its
+    /// `present_id` for later buffered confirmation, and keep the raw list for
+    /// `scanout_feedback()`. The read is destructive, so this is called exactly once per flip.
+    fn ingest_scanout_feedback(&mut self, feedback: Vec<ScanoutFeedback>) {
+        for fb in &feedback {
+            self.scanout_by_present_id.insert(fb.present_id, *fb);
+        }
+        self.recent_scanouts = feedback;
+    }
+
+    /// Take the confirmed scanout record for `present_id`, pruning it and every older entry
+    /// (present ids are monotonic, so records ≤ `present_id` are past and never looked up again).
+    /// Keeps `scanout_by_present_id` bounded to the in-flight + feedback-lag window.
+    fn take_scanout_for(&mut self, present_id: u64) -> Option<ScanoutFeedback> {
+        let found = self.scanout_by_present_id.remove(&present_id);
+        self.scanout_by_present_id.retain(|&id, _| id > present_id);
+        found
+    }
+
     /// Build a confirmed `FlipInfo` from an estimated one captured at submit time.
     ///
-    /// Queries the timing provider for the actual present time, computes missed-frame
-    /// detection, and updates `last_present_time` for the next call.
+    /// Computes the present time and missed-frame detection, and updates the trackers for the
+    /// next call. On the EXT backend it keys on the frame's `present_id`: if the driver's scanout
+    /// record for that present has arrived (`scanout_by_present_id`), missed detection uses the
+    /// real `IMAGE_FIRST_PIXEL_OUT` scanout delta; otherwise it falls back to the CPU
+    /// present-time delta (feedback for a present lags its submission by a frame or two).
+    /// `present_time` itself stays CPU-domain until B3 makes it a scanout-native timestamp.
     fn build_confirmed_flip(&mut self, estimated: FlipInfo) -> FlipInfo {
         // Prefer hardware-confirmed scanout time for this specific frame when available.
         let confirmed_present = self
@@ -627,7 +663,11 @@ impl VSEState {
             .confirmed_present_time_for(estimated.frame_number, &self.clock)
             .unwrap_or_else(|| self.timing_provider.record_present_time(&self.clock));
 
-        let frame_duration = self
+        // Look up this frame's confirmed scanout record by present_id, pruning consumed/past
+        // entries (present ids are monotonic, so anything ≤ this id is no longer needed).
+        let scanout = self.take_scanout_for(estimated.present_id);
+
+        let cpu_frame_duration = self
             .last_present_time
             .map(|prev| confirmed_present.duration_since(prev));
 
@@ -639,7 +679,7 @@ impl VSEState {
         if self.expected_frame_duration.is_none() {
             if let Some(dur) = self.timing_provider.refresh_cycle_duration() {
                 self.expected_frame_duration = Some(dur);
-            } else if let Some(dur) = frame_duration {
+            } else if let Some(dur) = cpu_frame_duration {
                 self.refresh_detect_samples.push(dur);
                 if self.refresh_detect_samples.len() >= 10 {
                     let total: Duration = self.refresh_detect_samples.iter().copied().sum();
@@ -648,6 +688,28 @@ impl VSEState {
                 }
             }
         }
+
+        // Missed detection prefers the real scanout delta (present-stage-local ns), but only
+        // between *consecutive* present ids where both records are present — feedback for a
+        // present lags its submission (at depth 1 it usually arrives after this frame's
+        // confirmation), so a non-consecutive delta would span a gap and false-flag a miss.
+        // Otherwise fall back to the CPU present-time delta.
+        let frame_duration = match scanout.and_then(|fb| fb.first_pixel_out_ns) {
+            Some(scanout_ns) => {
+                let consecutive =
+                    self.last_scanout_present_id == Some(estimated.present_id.wrapping_sub(1));
+                let dur = match (self.last_scanout_ns, consecutive) {
+                    (Some(prev), true) => {
+                        Some(Duration::from_nanos(scanout_ns.saturating_sub(prev)))
+                    }
+                    _ => cpu_frame_duration,
+                };
+                self.last_scanout_ns = Some(scanout_ns);
+                self.last_scanout_present_id = Some(estimated.present_id);
+                dur
+            }
+            None => cpu_frame_duration,
+        };
 
         let (missed, missed_count) = match frame_duration {
             Some(dur) => {
@@ -870,8 +932,11 @@ impl VSEContext {
             timing_provider,
             present_engine,
             recent_scanouts: Vec::new(),
+            scanout_by_present_id: std::collections::HashMap::new(),
             frame_number: 0,
             last_present_time: None,
+            last_scanout_ns: None,
+            last_scanout_present_id: None,
             expected_frame_duration,
             refresh_detect_samples: Vec::with_capacity(10),
             scanout_clock: None,
@@ -982,9 +1047,12 @@ impl VSEContext {
             timing_provider,
             present_engine,
             recent_scanouts: Vec::new(),
+            scanout_by_present_id: std::collections::HashMap::new(),
             recording: None,
             frame_number: 0,
             last_present_time: None,
+            last_scanout_ns: None,
+            last_scanout_present_id: None,
             expected_frame_duration,
             refresh_detect_samples: Vec::with_capacity(10),
             scanout_clock: None,
@@ -1516,6 +1584,21 @@ impl VSEContext {
                                     *error_clone.borrow_mut() = Some(e.into());
                                     elwt.exit();
                                     return;
+                                }
+                                // The raw present engine pipelines `depth + 1` frames, so its
+                                // sync ring must have at least that many slots (+1 slack) or a
+                                // slot's fence would be reset while its frame is still in flight.
+                                if let Some(engine) = &mut s.present_engine {
+                                    let slots = s.swapchain.images().len() + 1;
+                                    if !engine.ensure_ring(slots) {
+                                        *error_clone.borrow_mut() = Some(VSEError::Swapchain(
+                                            SwapchainError::CreationFailed(
+                                                "failed to grow present engine sync ring".into(),
+                                            ),
+                                        ));
+                                        elwt.exit();
+                                        return;
+                                    }
                                 }
                                 state = Some(s);
                             }
@@ -2207,6 +2290,11 @@ impl<'a> RenderContext<'a> {
             return Ok(());
         }
 
+        // On the EXT backend, submit through the raw present engine (present-id + timing chain).
+        if self.state.present_engine.is_some() {
+            return self.flip_with_payload_ext(target_time, payload);
+        }
+
         // Recreate swapchain if needed
         let (dsw, dsh) = self.state.display_size;
         let win_size_arr = [dsw, dsh];
@@ -2281,6 +2369,119 @@ impl<'a> RenderContext<'a> {
         self.state.buffered_pending_payload = Some(Box::new(payload));
 
         // Store (estimated_flip, fence) — correlated with pending_frames by FIFO order
+        self.state
+            .buffered_in_flight
+            .push_back((estimated_flip, in_flight));
+
+        self.state.frame_number += 1;
+        self.state.input.clear_events();
+
+        Ok(())
+    }
+
+    /// Buffered (non-blocking) flip on the `VK_EXT_present_timing` backend.
+    ///
+    /// Mirrors [`flip_with_payload`](Self::flip_with_payload) but drives the raw acquire → submit →
+    /// present engine: the present carries a real `VkPresentId2` + timing chain, and the frame's
+    /// slot fence is wrapped as the in-flight future `run_buffered()` polls. Unlike
+    /// [`flip_ext`](Self::flip_ext) it does **not** block on the fence — that is the point of the
+    /// buffered pipeline. Scanout feedback is drained once here (the driver read is destructive)
+    /// and cached for present-id-keyed confirmation.
+    fn flip_with_payload_ext<T: std::any::Any + Send + 'static>(
+        &mut self,
+        target_time: Option<Timestamp>,
+        payload: T,
+    ) -> Result<(), VSEError> {
+        use super::present_engine::EngineInFlight;
+        use vulkano::VulkanObject;
+
+        let clear_color = self.config.clear_color;
+        let swapchain_handle = self.state.swapchain.swapchain().handle();
+        let (dsw, dsh) = self.state.display_size;
+        let win_size_arr = [dsw, dsh];
+
+        if self.state.swapchain.needs_recreation() {
+            if let Some(engine) = &mut self.state.present_engine {
+                engine.wait_idle();
+            }
+            self.state.recreate_swapchain(win_size_arr)?;
+        }
+
+        // --- Acquire (raw) ---
+        let (image_index, acquire_suboptimal, slot) = match self
+            .state
+            .present_engine
+            .as_mut()
+            .expect("flip_with_payload_ext called without a present engine")
+            .acquire_next(swapchain_handle)
+        {
+            Ok(r) => r,
+            Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                if let Some(engine) = &mut self.state.present_engine {
+                    engine.wait_idle();
+                }
+                self.state.recreate_swapchain(win_size_arr)?;
+                self.state.frame_number += 1;
+                return Ok(());
+            }
+            Err(e) => return Err(SwapchainError::AcquireFailed(format!("{e:?}")).into()),
+        };
+        if acquire_suboptimal {
+            self.state.swapchain.mark_needs_recreation();
+        }
+
+        // --- Render ---
+        let image = self.state.swapchain.images()[image_index as usize].clone();
+        let extent = self.state.swapchain.extent();
+        let command_buffer = self.state.renderer.render(image, clear_color, extent)?;
+
+        // Scheduled target still rides a CPU spin (hardware scheduling lands in B3).
+        if let Some(target) = target_time {
+            self.state
+                .timing_provider
+                .wait_for_target(target, &self.state.clock);
+        }
+
+        let submit_time = self.state.clock.now();
+
+        // --- Submit + raw present (non-blocking) ---
+        let queue = self.state.queue.clone();
+        let outcome = self
+            .state
+            .present_engine
+            .as_mut()
+            .expect("flip_with_payload_ext called without a present engine")
+            .submit_and_present(&queue, swapchain_handle, image_index, slot, command_buffer)
+            .map_err(SwapchainError::PresentFailed)?;
+        if outcome.suboptimal {
+            self.state.swapchain.mark_needs_recreation();
+        }
+
+        let estimated_present = self.state.clock.now();
+        self.state.update_clocks();
+
+        // Drain confirmed scanout records once (destructive read) and cache them for
+        // present-id-keyed confirmation in `build_confirmed_flip`.
+        let feedback = self.state.timing_provider.query_scanouts();
+        self.state.ingest_scanout_feedback(feedback);
+
+        let in_flight: Box<dyn crate::core::buffered::InFlightFuture> =
+            Box::new(EngineInFlight::new(outcome.fence));
+
+        let estimated_flip = FlipInfo {
+            frame_number: self.state.frame_number,
+            timing_source: self.state.timing_provider.source(),
+            submit_time,
+            present_time: estimated_present,
+            present_id: outcome.present_id,
+            target_time,
+            on_target: true,
+            missed: false,
+            missed_count: 0,
+            skipped: false,
+        };
+
+        self.state.buffered_pending_payload = Some(Box::new(payload));
         self.state
             .buffered_in_flight
             .push_back((estimated_flip, in_flight));

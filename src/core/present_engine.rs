@@ -47,10 +47,38 @@ pub struct PresentOutcome {
     pub present_id: u64,
     /// Whether the swapchain reported itself suboptimal (needs recreation).
     pub suboptimal: bool,
+    /// The slot fence signalled by this frame's render submit. The synchronous path waits it via
+    /// [`PresentEngine::wait_frame`]; the buffered path wraps it as an [`InFlightFuture`] to
+    /// confirm the frame asynchronously. Valid until the slot is reused (`ring_len` frames later).
+    pub fence: Arc<Fence>,
+}
+
+/// A fence-backed [`InFlightFuture`](crate::core::buffered::InFlightFuture) for the buffered path.
+///
+/// Wraps the slot fence signalled by a raw render submit so `run_buffered` can poll for
+/// completion without blocking. The engine's ring is sized so the slot is not reused (and the
+/// fence not reset) until after this frame has been confirmed.
+pub(crate) struct EngineInFlight(Arc<Fence>);
+
+impl crate::core::buffered::InFlightFuture for EngineInFlight {
+    fn is_complete(&self) -> bool {
+        self.0.is_signaled().unwrap_or(false)
+    }
+    fn wait_blocking(&self) {
+        let _ = self.0.wait(None);
+    }
+}
+
+impl EngineInFlight {
+    /// Wrap a slot fence (from [`PresentOutcome::fence`]) as an in-flight future.
+    pub(crate) fn new(fence: Arc<Fence>) -> Self {
+        Self(fence)
+    }
 }
 
 /// Owns the raw acquire/submit/present machinery for the EXT present-timing path.
 pub struct PresentEngine {
+    device: Arc<Device>,
     swapchain_fns: ash::khr::swapchain::Device,
     ring: Vec<FrameSync>,
     /// Monotonic frame counter; selects the ring slot and seeds the present id.
@@ -67,31 +95,32 @@ impl PresentEngine {
         let ring_size = (image_count as usize).saturating_add(1).max(2);
         let mut ring = Vec::with_capacity(ring_size);
         for _ in 0..ring_size {
-            let acquire = Semaphore::new(device.clone(), SemaphoreCreateInfo::default()).ok()?;
-            let render_finished =
-                Semaphore::new(device.clone(), SemaphoreCreateInfo::default()).ok()?;
-            // Created signalled so the first reuse-wait on each slot returns immediately.
-            let fence = Fence::new(
-                device.clone(),
-                FenceCreateInfo {
-                    flags: FenceCreateFlags::SIGNALED,
-                    ..Default::default()
-                },
-            )
-            .ok()?;
-            ring.push(FrameSync {
-                acquire: Arc::new(acquire),
-                render_finished: Arc::new(render_finished),
-                fence: Arc::new(fence),
-                command_buffer: None,
-            });
+            ring.push(new_frame_sync(device)?);
         }
 
         Some(Self {
+            device: device.clone(),
             swapchain_fns,
             ring,
             counter: 0,
         })
+    }
+
+    /// Grow the sync ring to at least `min_slots` frame-in-flight slots.
+    ///
+    /// The buffered path pipelines `depth + 1` frames and resizes the swapchain to match; the
+    /// ring must have at least that many slots or a slot would be reused (its fence reset) while
+    /// its frame is still unconfirmed. Called after the swapchain image count grows. A no-op if
+    /// the ring is already large enough; on allocation failure it leaves the ring unchanged and
+    /// returns `false`.
+    pub fn ensure_ring(&mut self, min_slots: usize) -> bool {
+        while self.ring.len() < min_slots {
+            match new_frame_sync(&self.device) {
+                Some(slot) => self.ring.push(slot),
+                None => return false,
+            }
+        }
+        true
     }
 
     /// The `VkPresentId2` value the next present will carry: the running count of successful
@@ -115,12 +144,12 @@ impl PresentEngine {
     ) -> Result<(u32, bool, usize), vk::Result> {
         let slot = (self.counter % self.ring.len() as u64) as usize;
 
-        // Wait for this slot's previous frame to finish before reusing its objects.
+        // Wait for this slot's previous frame to finish before reusing its objects. The fence is
+        // left **signalled** here — it is reset only in `submit_and_present`, immediately before
+        // the submit that re-signals it. That way an acquire failure (e.g. `OUT_OF_DATE`) leaves
+        // the fence signalled, so the caller's `wait_idle`/recovery path cannot deadlock on a
+        // fence that will never be signalled (no submit happened).
         let _ = self.ring[slot].fence.wait(None);
-        // SAFETY: the fence is signalled (just waited), so resetting it is legal.
-        unsafe {
-            let _ = self.ring[slot].fence.reset();
-        }
         // Drop the previous command buffer now the GPU is done with it.
         self.ring[slot].command_buffer = None;
 
@@ -167,6 +196,12 @@ impl PresentEngine {
         };
 
         let fence = self.ring[slot].fence.clone();
+        // Reset the (signalled) fence immediately before the submit that re-signals it — see the
+        // note in `acquire_next` on why the reset lives here and not there.
+        // SAFETY: the fence is signalled (acquire_next waited it), so resetting is legal.
+        unsafe {
+            let _ = fence.reset();
+        }
         queue
             .with(|mut guard| unsafe { guard.submit(&[submit_info], Some(&fence)) })
             .map_err(|e| format!("QueueGuard::submit failed: {e:?}"))?;
@@ -200,6 +235,7 @@ impl PresentEngine {
         Ok(PresentOutcome {
             present_id,
             suboptimal,
+            fence: self.ring[slot].fence.clone(),
         })
     }
 
@@ -221,6 +257,28 @@ impl PresentEngine {
             slot.command_buffer = None;
         }
     }
+}
+
+/// Create one frame-in-flight sync set (two binary semaphores + a signalled fence).
+///
+/// The fence is created **signalled** so the first reuse-wait on a fresh slot returns immediately.
+fn new_frame_sync(device: &Arc<Device>) -> Option<FrameSync> {
+    let acquire = Semaphore::new(device.clone(), SemaphoreCreateInfo::default()).ok()?;
+    let render_finished = Semaphore::new(device.clone(), SemaphoreCreateInfo::default()).ok()?;
+    let fence = Fence::new(
+        device.clone(),
+        FenceCreateInfo {
+            flags: FenceCreateFlags::SIGNALED,
+            ..Default::default()
+        },
+    )
+    .ok()?;
+    Some(FrameSync {
+        acquire: Arc::new(acquire),
+        render_finished: Arc::new(render_finished),
+        fence: Arc::new(fence),
+        command_buffer: None,
+    })
 }
 
 /// Build an `ash::khr::swapchain::Device` from vulkano's already-loaded device loader, mirroring
