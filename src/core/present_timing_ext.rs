@@ -191,6 +191,128 @@ pub struct PastPresentationTimingPropertiesEXT {
     pub p_presentation_timings: *mut PastPresentationTimingEXT,
 }
 
+// ─── Present pNext chain builder (attached to vkQueuePresentKHR) ─────────────
+
+/// Present stages requested on every timed present. `IMAGE_FIRST_PIXEL_OUT` is the
+/// scientifically meaningful scanout-begin time; the earlier pipeline stages
+/// (`QUEUE_OPERATIONS_END`, `REQUEST_DEQUEUED`) are requested too so the driver records *some*
+/// timing even where the compositor cannot report true scanout (e.g. windowed Wayland), which
+/// keeps the feedback path exercised off the direct-display TTY.
+pub const REQUESTED_PRESENT_STAGES: u32 = PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT
+    | PRESENT_STAGE_REQUEST_DEQUEUED_BIT
+    | PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT
+    | PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT;
+
+/// Owns the `pNext` chain attached to `vkQueuePresentKHR` for a single frame:
+/// a [`PresentId2KHR`] (frame correlation) followed by [`PresentTimingsInfoEXT`] →
+/// [`PresentTimingInfoEXT`] (so the driver actually records scanout timing — the feedback
+/// query returns **empty** without this).
+///
+/// The chain is self-referential (each struct's `p_next` / array pointers point into sibling
+/// fields), so it **must stay pinned** — it is always heap-allocated (`Box`) and must outlive
+/// the `queue_present` call. Moving it invalidates the interior pointers.
+pub struct PresentChain {
+    present_ids: [u64; 1],
+    timing_infos: [PresentTimingInfoEXT; 1],
+    timings: PresentTimingsInfoEXT,
+    present_id2: PresentId2KHR,
+}
+
+impl PresentChain {
+    /// Build an **unscheduled** present chain (`targetTime = 0`) requesting scanout timing for
+    /// the `IMAGE_FIRST_PIXEL_OUT` and `IMAGE_FIRST_PIXEL_VISIBLE` stages, tagged with
+    /// `present_id` for correlation. Scheduling (`targetTime`) lands in B3.
+    pub fn unscheduled(present_id: u64) -> Box<Self> {
+        let mut chain = Box::new(Self {
+            present_ids: [present_id],
+            timing_infos: [PresentTimingInfoEXT {
+                s_type: STYPE_PRESENT_TIMING_INFO_EXT,
+                p_next: std::ptr::null(),
+                flags: 0,
+                target_time: 0,
+                time_domain_id: 0,
+                present_stage_queries: REQUESTED_PRESENT_STAGES,
+                target_time_domain_present_stage: 0,
+            }],
+            timings: PresentTimingsInfoEXT {
+                s_type: STYPE_PRESENT_TIMINGS_INFO_EXT,
+                p_next: std::ptr::null(),
+                swapchain_count: 1,
+                p_timing_infos: std::ptr::null(),
+            },
+            present_id2: PresentId2KHR {
+                s_type: STYPE_PRESENT_ID_2_KHR,
+                p_next: std::ptr::null(),
+                swapchain_count: 1,
+                p_present_ids: std::ptr::null(),
+            },
+        });
+
+        // Wire the interior pointers now that the box has a stable heap address. Order:
+        // VkPresentInfoKHR.pNext → present_id2 → timings → timing_infos[0].
+        chain.timings.p_timing_infos = chain.timing_infos.as_ptr();
+        chain.present_id2.p_present_ids = chain.present_ids.as_ptr();
+        chain.present_id2.p_next = &chain.timings as *const _ as *const c_void;
+        chain
+    }
+
+    /// Pointer to the chain head, for `VkPresentInfoKHR::p_next`.
+    pub fn head(&self) -> *const c_void {
+        &self.present_id2 as *const _ as *const c_void
+    }
+
+    /// The `VkPresentId2` value carried by this chain.
+    pub fn present_id(&self) -> u64 {
+        self.present_ids[0]
+    }
+}
+
+// ─── Feedback parsing (vkGetPastPresentationTimingEXT results) ───────────────
+
+/// Parsed scanout timing for one presented frame (one [`PastPresentationTimingEXT`] record).
+///
+/// Times are in the record's own `time_domain` (normally `PRESENT_STAGE_LOCAL`, driver-epoch
+/// nanoseconds); rebasing to a [`ScanoutTimestamp`](crate::timing::ScanoutTimestamp) via the
+/// session `ScanoutClock` is B3's job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanoutFeedback {
+    pub present_id: u64,
+    pub target_time: u64,
+    /// `IMAGE_FIRST_PIXEL_OUT` scanout-begin time — the "when photons start" timestamp.
+    pub first_pixel_out_ns: Option<u64>,
+    /// `IMAGE_FIRST_PIXEL_VISIBLE` time (accounts for display latency), if reported.
+    pub first_pixel_visible_ns: Option<u64>,
+    pub time_domain: i32,
+    pub time_domain_id: u64,
+    pub report_complete: bool,
+}
+
+/// Time of a specific present stage within a record's stage array, if present.
+fn stage_time(stages: &[PresentStageTimeEXT], stage_bit: u32) -> Option<u64> {
+    stages
+        .iter()
+        .find(|s| s.stage & stage_bit != 0)
+        .map(|s| s.time)
+}
+
+/// Build a [`ScanoutFeedback`] from a record's scalar fields and its (already length-bounded)
+/// stage slice. Pure over the slice — the unsafe pointer-following that produces `stages` lives
+/// in the `vkGetPastPresentationTimingEXT` call site.
+pub fn feedback_from_record(
+    rec: &PastPresentationTimingEXT,
+    stages: &[PresentStageTimeEXT],
+) -> ScanoutFeedback {
+    ScanoutFeedback {
+        present_id: rec.present_id,
+        target_time: rec.target_time,
+        first_pixel_out_ns: stage_time(stages, PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT),
+        first_pixel_visible_ns: stage_time(stages, PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT),
+        time_domain: rec.time_domain,
+        time_domain_id: rec.time_domain_id,
+        report_complete: rec.report_complete != 0,
+    }
+}
+
 // ─── Time domain + refresh properties ───────────────────────────────────────
 
 #[repr(C)]
@@ -604,3 +726,117 @@ const _: () = {
     // sType(4)/pad(4)/pNext(8)/swapchain(8)/presentStage(4)/pad(4)/timeDomainId(8) = 40.
     assert!(size_of::<SwapchainCalibratedTimestampInfoEXT>() == 40);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ptr;
+
+    #[test]
+    fn present_chain_wires_pnext_id_and_stage_queries() {
+        let chain = PresentChain::unscheduled(42);
+
+        // Head is the PresentId2KHR, which chains to the PresentTimingsInfoEXT.
+        assert_eq!(
+            chain.head(),
+            &chain.present_id2 as *const _ as *const c_void
+        );
+        assert_eq!(
+            chain.present_id2.p_next,
+            &chain.timings as *const _ as *const c_void
+        );
+        assert_eq!(chain.timings.p_next, ptr::null());
+
+        // present_id2 points at the [present_id] slot and carries the id.
+        assert_eq!(chain.present_id2.p_present_ids, chain.present_ids.as_ptr());
+        assert_eq!(chain.present_id2.swapchain_count, 1);
+        assert_eq!(chain.present_id(), 42);
+        assert_eq!(unsafe { *chain.present_id2.p_present_ids }, 42);
+
+        // timings points at the single per-swapchain timing info.
+        assert_eq!(chain.timings.p_timing_infos, chain.timing_infos.as_ptr());
+        assert_eq!(chain.timings.swapchain_count, 1);
+
+        // The per-swapchain timing info requests both scanout stages, unscheduled.
+        let ti = &chain.timing_infos[0];
+        assert_eq!(ti.present_stage_queries, REQUESTED_PRESENT_STAGES);
+        // The scanout-begin stage (the one that matters for science) must be requested.
+        assert_ne!(
+            ti.present_stage_queries & PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT,
+            0
+        );
+        assert_eq!(ti.target_time, 0);
+        assert_eq!(ti.flags, 0);
+
+        // Correct sTypes throughout.
+        assert_eq!(chain.present_id2.s_type, STYPE_PRESENT_ID_2_KHR);
+        assert_eq!(chain.timings.s_type, STYPE_PRESENT_TIMINGS_INFO_EXT);
+        assert_eq!(ti.s_type, STYPE_PRESENT_TIMING_INFO_EXT);
+    }
+
+    #[test]
+    fn present_chain_survives_being_boxed_and_moved() {
+        // The Box must keep interior pointers valid even though `unscheduled` returns by move.
+        let chain = PresentChain::unscheduled(7);
+        // Pointer targets must land inside the heap allocation, not a stale stack frame.
+        assert_eq!(chain.timings.p_timing_infos, chain.timing_infos.as_ptr());
+        assert_eq!(chain.present_id2.p_present_ids, chain.present_ids.as_ptr());
+    }
+
+    fn record(present_id: u64, domain: i32, domain_id: u64) -> PastPresentationTimingEXT {
+        PastPresentationTimingEXT {
+            s_type: STYPE_PAST_PRESENTATION_TIMING_EXT,
+            p_next: ptr::null_mut(),
+            present_id,
+            target_time: 0,
+            present_stage_count: 0,
+            p_present_stages: ptr::null_mut(),
+            time_domain: domain,
+            time_domain_id: domain_id,
+            report_complete: 1,
+        }
+    }
+
+    #[test]
+    fn feedback_extracts_first_pixel_out_and_visible() {
+        let rec = record(99, TIME_DOMAIN_PRESENT_STAGE_LOCAL, 5);
+        let stages = [
+            PresentStageTimeEXT {
+                stage: PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT,
+                time: 111_000,
+            },
+            PresentStageTimeEXT {
+                stage: PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT,
+                time: 222_000,
+            },
+        ];
+        let fb = feedback_from_record(&rec, &stages);
+        assert_eq!(fb.present_id, 99);
+        assert_eq!(fb.first_pixel_out_ns, Some(111_000));
+        assert_eq!(fb.first_pixel_visible_ns, Some(222_000));
+        assert_eq!(fb.time_domain, TIME_DOMAIN_PRESENT_STAGE_LOCAL);
+        assert_eq!(fb.time_domain_id, 5);
+        assert!(fb.report_complete);
+    }
+
+    #[test]
+    fn feedback_absent_stage_is_none() {
+        let rec = record(1, TIME_DOMAIN_PRESENT_STAGE_LOCAL, 0);
+        // Only a queue-operations-end stage present: neither scanout stage reported yet.
+        let stages = [PresentStageTimeEXT {
+            stage: PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT,
+            time: 5,
+        }];
+        let fb = feedback_from_record(&rec, &stages);
+        assert_eq!(fb.first_pixel_out_ns, None);
+        assert_eq!(fb.first_pixel_visible_ns, None);
+    }
+
+    #[test]
+    fn feedback_empty_stage_slice_is_none() {
+        let rec = record(1, TIME_DOMAIN_PRESENT_STAGE_LOCAL, 0);
+        let fb = feedback_from_record(&rec, &[]);
+        assert_eq!(fb.first_pixel_out_ns, None);
+        assert_eq!(fb.first_pixel_visible_ns, None);
+    }
+}

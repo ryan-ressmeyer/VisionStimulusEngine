@@ -55,6 +55,13 @@ pub trait TimingProvider {
     fn sample_present_calibration(&self) -> Option<CalibrationSample> {
         None
     }
+
+    /// Read back confirmed per-present scanout timings from the driver, when the backend records
+    /// them. Default: empty (CPU estimation has no hardware feedback). The EXT backend returns one
+    /// record per present that carried `VkPresentTimingsInfoEXT`.
+    fn query_scanouts(&self) -> Vec<pt::ScanoutFeedback> {
+        Vec::new()
+    }
 }
 
 /// Build the `vkGetCalibratedTimestampsKHR` sampler for a device, if the calibrated-timestamps
@@ -336,6 +343,91 @@ impl ExtPresentTimingProvider {
         }
     }
 
+    /// Read back confirmed scanout timings from the driver's past-timing ring via
+    /// `vkGetPastPresentationTimingEXT`.
+    ///
+    /// Returns one [`ScanoutFeedback`](pt::ScanoutFeedback) per record the driver has ready,
+    /// each carrying the `IMAGE_FIRST_PIXEL_OUT` scanout time (in the record's own time domain,
+    /// normally `PRESENT_STAGE_LOCAL`) and the correlating `present_id`. **Empty** unless the
+    /// matching present attached `VkPresentTimingsInfoEXT` (see [`PresentChain`]) — that is what
+    /// tells the driver to record timing at all.
+    ///
+    /// **Destructive:** each record is *dequeued* from the driver's ring on read, so this must be
+    /// called **at most once per frame** and its result cached — a second call the same frame
+    /// returns nothing. `flip()` drains it once into `VSEState::recent_scanouts`.
+    ///
+    /// [`PresentChain`]: pt::PresentChain
+    pub fn query_scanouts(&self) -> Vec<pt::ScanoutFeedback> {
+        /// Fixed per-record stage-array capacity: only ~4 present stages are defined, so 8 always
+        /// holds every reported stage in a single fill call (no nested two-call sizing needed).
+        const STAGE_CAP: usize = 8;
+
+        let sc = *self.swapchain.borrow();
+        let info = pt::PastPresentationTimingInfoEXT {
+            s_type: pt::STYPE_PAST_PRESENTATION_TIMING_INFO_EXT,
+            p_next: ptr::null(),
+            flags: 0,
+            swapchain: sc,
+        };
+
+        // Call 1: null timings pointer → driver reports how many records are ready.
+        let mut props = pt::PastPresentationTimingPropertiesEXT {
+            s_type: pt::STYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT,
+            p_next: ptr::null_mut(),
+            timing_properties_counter: 0,
+            time_domains_counter: 0,
+            presentation_timing_count: 0,
+            p_presentation_timings: ptr::null_mut(),
+        };
+        let r = unsafe { (self.fns.get_past_presentation_timing)(self.device, &info, &mut props) };
+        if r != vk::Result::SUCCESS && r != vk::Result::INCOMPLETE {
+            warn!("vkGetPastPresentationTimingEXT (count) failed: {r:?}");
+            return Vec::new();
+        }
+        let n = props.presentation_timing_count as usize;
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Per-record stage buffers (fixed capacity) + record array, wired together.
+        let mut stage_bufs: Vec<[pt::PresentStageTimeEXT; STAGE_CAP]> =
+            vec![[pt::PresentStageTimeEXT { stage: 0, time: 0 }; STAGE_CAP]; n];
+        let mut records: Vec<pt::PastPresentationTimingEXT> = Vec::with_capacity(n);
+        for buf in stage_bufs.iter_mut() {
+            records.push(pt::PastPresentationTimingEXT {
+                s_type: pt::STYPE_PAST_PRESENTATION_TIMING_EXT,
+                p_next: ptr::null_mut(),
+                present_id: 0,
+                target_time: 0,
+                present_stage_count: STAGE_CAP as u32,
+                p_present_stages: buf.as_mut_ptr(),
+                time_domain: 0,
+                time_domain_id: 0,
+                report_complete: 0,
+            });
+        }
+        props.presentation_timing_count = n as u32;
+        props.p_presentation_timings = records.as_mut_ptr();
+
+        // Call 2: driver fills the records and their stage arrays. This **dequeues** them from
+        // the driver's ring — each record is returned exactly once, so `query_scanouts` must be
+        // called at most once per frame and its result cached (see `VSEState::recent_scanouts`).
+        let r = unsafe { (self.fns.get_past_presentation_timing)(self.device, &info, &mut props) };
+        if r != vk::Result::SUCCESS && r != vk::Result::INCOMPLETE {
+            warn!("vkGetPastPresentationTimingEXT (fill) failed: {r:?}");
+            return Vec::new();
+        }
+        let filled = (props.presentation_timing_count as usize).min(n);
+
+        (0..filled)
+            .map(|i| {
+                let rec = &records[i];
+                let count = (rec.present_stage_count as usize).min(STAGE_CAP);
+                pt::feedback_from_record(rec, &stage_bufs[i][..count])
+            })
+            .collect()
+    }
+
     /// Query the driver's refresh cycle duration for the current swapchain.
     fn query_refresh(&self) -> Option<Duration> {
         let sc = *self.swapchain.borrow();
@@ -398,6 +490,10 @@ impl TimingProvider for ExtPresentTimingProvider {
 
     fn sample_present_calibration(&self) -> Option<CalibrationSample> {
         ExtPresentTimingProvider::sample_present_calibration(self)
+    }
+
+    fn query_scanouts(&self) -> Vec<pt::ScanoutFeedback> {
+        ExtPresentTimingProvider::query_scanouts(self)
     }
 }
 

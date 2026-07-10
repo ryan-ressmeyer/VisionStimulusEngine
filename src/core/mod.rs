@@ -13,6 +13,7 @@ pub(crate) mod direct_display;
 pub(crate) mod evdev_input;
 mod frame;
 pub(crate) mod input;
+pub(crate) mod present_engine;
 pub(crate) mod present_timing_ext;
 mod swapchain;
 
@@ -25,4 +26,5 @@ pub use input::{
     AcquisitionMethod, DisplayBackend, InputEvent, Key, KeyCode, MonitorInfo, MonitorSelection,
     MouseButton, NamedKey, PhysicalKey, VideoModeInfo, WindowMode,
 };
+pub use present_timing_ext::ScanoutFeedback;
 pub use swapchain::{PresentMode, SwapchainConfig, SwapchainError, SwapchainManager};

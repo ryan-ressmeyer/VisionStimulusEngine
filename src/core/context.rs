@@ -24,6 +24,8 @@ use super::input::{
     AcquisitionMethod, DisplayBackend, InputEvent, InputState, KeyCode, MonitorInfo,
     MonitorSelection, MouseButton, VideoModeInfo, WindowMode,
 };
+use super::present_engine::PresentEngine;
+use super::present_timing_ext::ScanoutFeedback;
 use super::{
     device::{DeviceError, DeviceSelector, GPUPreference},
     frame::{FrameBuilder, FrameError},
@@ -420,6 +422,14 @@ struct VSEState {
     // Timing state
     clock: Clock,
     timing_provider: Box<dyn TimingProvider>,
+    /// Raw acquire/submit/present engine for the EXT present-timing path. `None` on the
+    /// CPU-estimate path (which keeps using vulkano's present).
+    present_engine: Option<PresentEngine>,
+    /// Scanout-timing records drained from the driver on the most recent flip.
+    /// `vkGetPastPresentationTimingEXT` dequeues records, so they are read exactly once per frame
+    /// here and cached for `scanout_feedback()` to return without re-draining. Empty on the
+    /// CPU-estimate path.
+    recent_scanouts: Vec<ScanoutFeedback>,
     frame_number: u64,
     last_present_time: Option<Timestamp>,
     expected_frame_duration: Option<Duration>,
@@ -535,6 +545,32 @@ fn build_host_bridge(config: &VSEConfig, provider: &dyn TimingProvider) -> Optio
     } else {
         warn!("host_clock_bridge requested but EXT present-timing backend is unavailable; bridge disabled");
         None
+    }
+}
+
+/// Build the raw present engine for the EXT present-timing path.
+///
+/// Returns `None` on the CPU-estimate path (which keeps using vulkano's present) and, loudly,
+/// if the EXT backend is active but the engine's function pointers / sync objects cannot be
+/// created — in which case `flip()` degrades to the vulkano present with no present-id or
+/// scanout feedback.
+fn build_present_engine(
+    device: &Arc<vulkano::device::Device>,
+    image_count: u32,
+    provider: &dyn TimingProvider,
+) -> Option<PresentEngine> {
+    if provider.source() != TimingSource::ExtPresentTiming {
+        return None;
+    }
+    match PresentEngine::new(device, image_count) {
+        Some(e) => Some(e),
+        None => {
+            warn!(
+                "EXT present-timing backend active but PresentEngine unavailable; \
+                 falling back to vulkano present (no present-id / scanout feedback)"
+            );
+            None
+        }
     }
 }
 
@@ -803,6 +839,11 @@ impl VSEContext {
         let timing_provider: Box<dyn TimingProvider> =
             build_timing_provider(&device, swapchain.swapchain(), ext_features);
         let host_bridge = build_host_bridge(config, timing_provider.as_ref());
+        let present_engine = build_present_engine(
+            &device,
+            swapchain.images().len() as u32,
+            timing_provider.as_ref(),
+        );
 
         let expected_frame_duration = config
             .expected_refresh_rate
@@ -827,6 +868,8 @@ impl VSEContext {
             window_mode: config.window_mode,
             clock,
             timing_provider,
+            present_engine,
+            recent_scanouts: Vec::new(),
             frame_number: 0,
             last_present_time: None,
             expected_frame_duration,
@@ -899,6 +942,11 @@ impl VSEContext {
         let timing_provider: Box<dyn TimingProvider> =
             build_timing_provider(&device, swapchain.swapchain(), ext_features);
         let host_bridge = build_host_bridge(config, timing_provider.as_ref());
+        let present_engine = build_present_engine(
+            &device,
+            swapchain.images().len() as u32,
+            timing_provider.as_ref(),
+        );
 
         let expected_frame_duration = config
             .expected_refresh_rate
@@ -932,6 +980,8 @@ impl VSEContext {
             window_mode: WindowMode::DirectDisplay,
             clock,
             timing_provider,
+            present_engine,
+            recent_scanouts: Vec::new(),
             recording: None,
             frame_number: 0,
             last_present_time: None,
@@ -1800,7 +1850,18 @@ impl<'a> RenderContext<'a> {
         let (dsw, dsh) = self.state.display_size;
         let win_size_arr = [dsw, dsh];
         if self.state.swapchain.needs_recreation() {
+            // Drain in-flight raw presents before the swapchain (and its images) is retired.
+            if let Some(engine) = &mut self.state.present_engine {
+                engine.wait_idle();
+            }
             self.state.recreate_swapchain(win_size_arr)?;
+        }
+
+        // On the EXT present-timing backend, take the raw acquire/submit/present path (attaches
+        // present-id + timing pNext, reads scanout feedback). The CPU-estimate path below is
+        // unchanged.
+        if self.state.present_engine.is_some() {
+            return self.flip_ext(target_time);
         }
 
         // Acquire next image
@@ -1943,6 +2004,170 @@ impl<'a> RenderContext<'a> {
         self.state.frame_number += 1;
 
         // Clear input event queue after the frame
+        self.state.input.clear_events();
+
+        Ok(flip_info)
+    }
+
+    /// Synchronous flip on the `VK_EXT_present_timing` backend: raw acquire → submit → present
+    /// with a [`PresentChain`](crate::core::present_timing_ext::PresentChain) (present-id +
+    /// scanout-timing request) attached to `vkQueuePresentKHR`, plus a
+    /// `vkGetPastPresentationTimingEXT` feedback read.
+    ///
+    /// `FlipInfo.present_id` becomes the driver's real `VkPresentId2` value. `present_time` is
+    /// still CPU fence time in B1 (B3 makes it a scanout-native timestamp). The CPU-estimate
+    /// path stays on vulkano's present in [`flip()`](Self::flip).
+    fn flip_ext(&mut self, target_time: Option<Timestamp>) -> Result<FlipInfo, VSEError> {
+        use vulkano::VulkanObject;
+
+        let clear_color = self.config.clear_color;
+        let swapchain_handle = self.state.swapchain.swapchain().handle();
+        let (dsw, dsh) = self.state.display_size;
+        let win_size_arr = [dsw, dsh];
+
+        // --- Acquire (raw, signals the slot's acquire semaphore) ---
+        let (image_index, acquire_suboptimal, slot) = match self
+            .state
+            .present_engine
+            .as_mut()
+            .expect("flip_ext called without a present engine")
+            .acquire_next(swapchain_handle)
+        {
+            Ok(r) => r,
+            Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                if let Some(engine) = &mut self.state.present_engine {
+                    engine.wait_idle();
+                }
+                self.state.recreate_swapchain(win_size_arr)?;
+                let info = FlipInfo::skipped(self.state.frame_number);
+                self.state.frame_number += 1;
+                return Ok(info);
+            }
+            Err(e) => {
+                return Err(SwapchainError::AcquireFailed(format!("{e:?}")).into());
+            }
+        };
+        if acquire_suboptimal {
+            self.state.swapchain.mark_needs_recreation();
+        }
+
+        // --- Render into the acquired image ---
+        let image = self.state.swapchain.images()[image_index as usize].clone();
+        let extent = self.state.swapchain.extent();
+        let command_buffer = self.state.renderer.render(image, clear_color, extent)?;
+
+        // Scheduled target still rides a CPU spin in B1 (hardware scheduling lands in B3).
+        if let Some(target) = target_time {
+            self.state
+                .timing_provider
+                .wait_for_target(target, &self.state.clock);
+        }
+
+        let submit_time = self.state.clock.now();
+
+        // --- Submit + raw present with the timing pNext chain ---
+        let queue = self.state.queue.clone();
+        let outcome = self
+            .state
+            .present_engine
+            .as_mut()
+            .expect("flip_ext called without a present engine")
+            .submit_and_present(&queue, swapchain_handle, image_index, slot, command_buffer)
+            .map_err(SwapchainError::PresentFailed)?;
+        if outcome.suboptimal {
+            self.state.swapchain.mark_needs_recreation();
+        }
+
+        // Synchronous flip(): block until this frame's GPU work completes before sampling the
+        // present time, so inter-frame deltas track the vblank cadence (matches the CPU path's
+        // blocking present). The buffered path confirms asynchronously and never calls this.
+        if let Some(engine) = &self.state.present_engine {
+            engine.wait_frame(slot);
+        }
+
+        // present_time is CPU fence-signal time in B1; B3 rebases scanout feedback instead.
+        let present_time = self
+            .state
+            .timing_provider
+            .record_present_time(&self.state.clock);
+
+        // Establish the scanout epoch / feed the opt-in host-clock bridge (off hot path).
+        self.state.update_clocks();
+
+        // --- Feedback read (B1): drain confirmed scanout records ONCE and cache them ---
+        // `query_scanouts` dequeues from the driver's ring, so it must be called exactly once
+        // per frame; `scanout_feedback()` returns this cache rather than re-draining.
+        self.state.recent_scanouts = self.state.timing_provider.query_scanouts();
+        if let Some(last) = self.state.recent_scanouts.last() {
+            debug!(
+                "scanout feedback: {} record(s); latest present_id={} first_pixel_out={:?} domain={}",
+                self.state.recent_scanouts.len(),
+                last.present_id,
+                last.first_pixel_out_ns,
+                last.time_domain
+            );
+        }
+
+        // --- Shared bottom half: refresh detect, missed-frame detection, FlipInfo assembly ---
+        let frame_duration = self
+            .state
+            .last_present_time
+            .map(|prev| present_time.duration_since(prev));
+
+        if self.state.expected_frame_duration.is_none() {
+            if let Some(dur) = self.state.timing_provider.refresh_cycle_duration() {
+                self.state.expected_frame_duration = Some(dur);
+                info!(
+                    "Refresh cycle duration from provider: {} us ({:.1} Hz)",
+                    dur.as_micros(),
+                    1_000_000.0 / dur.as_micros() as f64
+                );
+            } else if let Some(dur) = frame_duration {
+                self.state.refresh_detect_samples.push(dur);
+                if self.state.refresh_detect_samples.len() >= 10 {
+                    let total: Duration = self.state.refresh_detect_samples.iter().copied().sum();
+                    let avg = total / self.state.refresh_detect_samples.len() as u32;
+                    self.state.expected_frame_duration = Some(avg);
+                }
+            }
+        }
+
+        let expected = self
+            .state
+            .expected_frame_duration
+            .unwrap_or(Duration::from_micros(16_667));
+
+        let (missed, missed_count) = match frame_duration {
+            Some(dur) => {
+                let ratio = dur.as_micros() as f64 / expected.as_micros() as f64;
+                if ratio > 1.5 {
+                    (true, (ratio.round() as u32).saturating_sub(1))
+                } else {
+                    (false, 0)
+                }
+            }
+            None => (false, 0),
+        };
+
+        let flip_info = FlipInfo {
+            frame_number: self.state.frame_number,
+            timing_source: self.state.timing_provider.source(),
+            submit_time,
+            present_time,
+            present_id: outcome.present_id,
+            target_time,
+            on_target: true,
+            missed,
+            missed_count,
+            skipped: false,
+        };
+
+        if let Some(recording) = &mut self.state.recording {
+            recording.on_flip(flip_info.clone());
+        }
+
+        self.state.last_present_time = Some(present_time);
+        self.state.frame_number += 1;
         self.state.input.clear_events();
 
         Ok(flip_info)
@@ -2255,6 +2480,22 @@ impl<'a> RenderContext<'a> {
     /// calibration must correct. See `docs/clock-synchronization.md`.
     pub fn sample_present_calibration(&self) -> Option<crate::timing::CalibrationSample> {
         self.state.timing_provider.sample_present_calibration()
+    }
+
+    /// Read back confirmed per-present scanout timings from the driver's past-timing ring
+    /// (`vkGetPastPresentationTimingEXT`).
+    ///
+    /// Each [`ScanoutFeedback`](crate::core::ScanoutFeedback) carries the correlating `present_id`
+    /// (matching [`FlipInfo::present_id`]) and the `IMAGE_FIRST_PIXEL_OUT` scanout time in the
+    /// driver's present-stage-local domain. Empty on the CPU-estimate path, and for a frame or two
+    /// after a present while the driver has not yet recorded it. Rebasing these to a
+    /// [`ScanoutTimestamp`](crate::timing::ScanoutTimestamp) is B3's job.
+    ///
+    /// Returns the records drained on the most recent `flip()`. The driver's read is *destructive*
+    /// (each record is dequeued once), so `flip()` drains once per frame and caches the result
+    /// here — this accessor never re-drains, and calling it repeatedly returns the same records.
+    pub fn scanout_feedback(&self) -> Vec<crate::core::ScanoutFeedback> {
+        self.state.recent_scanouts.clone()
     }
 
     /// Read the current scanout-clock time — VSE's primary experimental clock.

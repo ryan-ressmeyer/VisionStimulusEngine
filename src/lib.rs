@@ -29,7 +29,7 @@ pub mod prelude {
     pub use crate::core::{
         AcquisitionMethod, BufferedConfig, DeviceSelector, DisplayBackend, FlipEvent, Frame,
         GPUPreference, InputEvent, KeyCode, MonitorInfo, MonitorSelection, MouseButton, NamedKey,
-        PresentMode, RenderContext, SwapchainConfig, SwapchainManager, VSEContext,
+        PresentMode, RenderContext, ScanoutFeedback, SwapchainConfig, SwapchainManager, VSEContext,
         VSEContextBuilder, VSEError, VideoModeInfo, WindowMode,
     };
     pub use crate::data::{
