@@ -1,6 +1,11 @@
 # 3D & VR Stimulus Rendering in VisionStimulusEngine — Landscape, Tradeoffs, and Direction
 
 **Date:** 2026-07-09
+**Updated:** 2026-07-11 — a follow-up research pass (Bevy 0.19 / wgpu 29–30 era, plus local
+driver queries on the reference Intel hardware) corrected several claims and revised the
+recommended GPU-integration topology. Corrections are patched inline and tagged **[2026-07-11]**;
+the substantive additions are §5.4 (integration topology), the renderling entry in §7.4, and the
+revised de-risk list in §8.
 **Status:** Planning / landscape survey (no implementation committed)
 **Scope:** How to add 3D-scene and (eventually) VR-haploscope rendering to VSE **without
 surrendering the hardware-verified presentation-timing guarantee** that is the project's
@@ -427,9 +432,14 @@ for* externally-owned swapchains (OpenXR/SteamVR).
   is the weakest-value option.
 
 `wgpu::Surface` is *not* usable — it wraps `vkQueuePresentKHR` with no `VK_EXT_present_timing`
-hook. Only the below-`Surface` HAL path preserves present control. (Separate-device interop via
-`VK_KHR_external_memory`/`vkGetMemoryFdKHR` exists but is only needed across devices/processes;
-wgpu's texture-side external-memory import is still unfinished — prefer shared-device.)
+hook. Only the below-`Surface` HAL path preserves present control.
+
+> **[2026-07-11] Correction.** This section previously ended: "wgpu's texture-side
+> external-memory import is still unfinished — prefer shared-device." That advice is **reversed**.
+> wgpu's import path is no longer unfinished (`texture_from_dmabuf_fd` shipped in wgpu v30,
+> [CHANGELOG](https://github.com/gfx-rs/wgpu/blob/trunk/CHANGELOG.md)), and a queue-scheduling
+> constraint on the reference hardware makes the *separate-device* topology the recommended
+> default for either B or C. See §5.4.
 
 ### Strategy C — Bevy rendering into *your* image (the recommended primary)
 
@@ -437,13 +447,21 @@ This is the literal "merge": Bevy's mature scene graph, PBR, glTF pipeline, and 
 into a `VkImage` **you own and VSE presents with verified timing**. Mechanically it is
 Strategy B's interop plus Bevy consuming the result:
 
-1. Create wgpu on VSE's `ash` device (Strategy B).
+1. Create wgpu on VSE's `ash` device (Strategy B) — **[2026-07-11]** or, per §5.4 (now
+   recommended), let Bevy create its own stock wgpu device and share only the output image
+   across devices via dmabuf.
 2. Create a `VkImage`, wrap it as a wgpu `Texture`, take a `TextureView`.
-3. Hand that `TextureView` to a Bevy camera as `RenderTarget::TextureView`
-   ([PR #8042](https://github.com/bevyengine/bevy/pull/8042) — the OpenXR/WebXR path).
-4. Run Bevy **headless** (no winit — [without_winit example](https://github.com/bevyengine/bevy/blob/main/examples/app/without_winit.rs)),
+3. Hand that `TextureView` to a Bevy camera as `RenderTarget::TextureView`, registered through
+   the `ManualTextureViews` resource
+   ([PR #8042](https://github.com/bevyengine/bevy/pull/8042) — the OpenXR/WebXR path; still the
+   sanctioned mechanism in Bevy 0.19, whose docs cite exactly this use case
+   ([ManualTextureViews](https://docs.rs/bevy/latest/bevy/prelude/struct.ManualTextureViews.html))).
+4. Run Bevy **headless** (no winit; the maintained upstream example is
+   [headless_renderer](https://github.com/bevyengine/bevy/blob/main/examples/app/headless_renderer.rs)),
    stepping its schedule manually so *you* drive when a frame is produced (render-on-demand,
-   not free-running).
+   not free-running). **[2026-07-11]** Also disable `PipelinedRenderingPlugin` (Bevy's detached
+   render thread) so extract+render run inside `app.update()` on the calling thread — otherwise
+   `update()` returns before the frame's GPU work has even been submitted.
 5. VSE presents the finished image on its own `VK_EXT_present_timing` path.
 
 - **Get for free:** the actual prize — Bevy 0.19's `bevy_pbr`, scene graph, `bevy_asset` glTF
@@ -456,13 +474,45 @@ Strategy B's interop plus Bevy consuming the result:
   path. Because the frame is handed over *before* present (§1), residual nondeterminism
   perturbs *what is ready when*, not *when it appears* — but a stimulus must also be
   *pixel-reproducible*, so temporal/adaptive features must genuinely be off, not just
-  timing-irrelevant.
-- **Integration tax:** high + **upstream risk**. Headless + external-`TextureView` target +
-  manual schedule-stepping is at the frontier of Bevy's supported usage. Bevy's `RenderApp`
-  sub-app expects to own the winit loop; driving it from an external swapchain is a
-  long-standing *unsupported* request
-  ([bevy #12159](https://github.com/bevyengine/bevy/issues/12159)). **This must be de-risked
-  with a spike before it is committed** (see §8).
+  timing-irrelevant. **[2026-07-11]** The concrete claw-back list is now known: set
+  `RenderPlugin { synchronous_pipeline_compilation: true }` (otherwise shader pipelines compile
+  in the background and entities **silently don't draw** for the first frames —
+  [RenderPlugin docs](https://docs.rs/bevy/latest/bevy/render/struct.RenderPlugin.html)) plus
+  warm-up frames touching every material; never enable TAA, motion blur, auto-exposure, or
+  Solari/DLSS (all are per-camera opt-in components, so this is a curated-config problem, not a
+  fork-Bevy problem); note Bevy sorts draw lists with *unstable* sorts, so draw order among
+  items with equal sort keys is undefined
+  ([PR #5049](https://github.com/bevyengine/bevy/pull/5049),
+  [discussion #3773](https://github.com/bevyengine/bevy/discussions/3773)) — give stimuli
+  distinct depths and avoid coincident or blended geometry; and drive all animation from VSE's
+  frame counter, never wall-clock `Time` deltas
+  ([discussion #11809](https://github.com/bevyengine/bevy/discussions/11809)). Bevy makes no
+  engine-level reproducibility promise
+  ([discussion #2480](https://github.com/bevyengine/bevy/discussions/2480)) — enforce it with a
+  framebuffer-hash regression harness (render the same scene state twice, hash, compare) re-run
+  on every dependency bump.
+- **Integration tax:** **[2026-07-11] revised from "high + upstream risk" to "medium — the
+  pattern is production-proven."** The original text called this combination "at the frontier of
+  Bevy's supported usage" and cited
+  [bevy #12159](https://github.com/bevyengine/bevy/issues/12159) as a long-standing unsupported
+  request. Both claims were wrong: #12159 was actually about waking the winit event loop from an
+  external source and was **closed as completed in March 2024**; and the full combination
+  (headless, externally-owned Vulkan images as camera targets, custom frame sequencing, an
+  external party owning the present) is exactly what
+  [`bevy_mod_openxr`](https://github.com/awtterpip/bevy_oxr) ships today — v0.6.0 released one
+  day after Bevy 0.19, tracking wgpu 29 — with the OpenXR runtime playing VSE's role of
+  swapchain-owning presenter. Bevy has since invested in this embedding surface deliberately:
+  the 0.17 crate split was done explicitly "so 3rd party custom renderers can act as drop-in
+  replacements" ([Bevy 0.17 notes](https://bevy.org/news/bevy-0-17/)),
+  [`RenderCreation::Manual`](https://docs.rs/bevy/latest/bevy/render/settings/enum.RenderCreation.html)
+  accepts an externally created wgpu device, and the `raw_vulkan_init` feature
+  ([PR #20565](https://github.com/bevyengine/bevy/pull/20565)) adds hooks for requiring extra
+  Vulkan extensions at device creation. A spike is still required (§8), but for determinism
+  verification and buffer-sharing plumbing, not for feasibility. The remaining *real* tax is
+  release churn: Bevy consumed four wgpu major versions in about a year, and Bevy 0.19 replaced
+  the node-based render graph with ECS schedules
+  ([0.19 notes](https://bevy.org/news/bevy-0-19/)), so custom render-world code must be
+  re-audited on every upgrade.
 - **Best for:** naturalistic immersive environments — the stated near-term driver — without
   writing a renderer.
 
@@ -479,9 +529,77 @@ recommendation.
 | Free rendering systems | none | none | Bevy PBR / scene graph / assets / culling |
 | Systems you build | all | all | ~none (you *disable* features) |
 | Determinism | maximal | maximal | clawed back (main risk) |
-| Integration tax | low | medium | high + upstream risk |
+| Integration tax | low | medium | medium — proven pattern; churn tax (rev. 2026-07-11, was "high + upstream risk") |
 | Present control kept | ✅ | ✅ | ✅ |
 | Best for | parametric 3D | portability hedge / C's substrate | naturalistic scenes |
+
+### 5.4 [2026-07-11] Integration-topology revision: separate devices + dmabuf beats a shared device
+
+Strategies B and C were written assuming the external renderer *adopts VSE's `VkDevice`* (a
+"shared-device" topology). A follow-up research pass — including driver queries on the reference
+hardware — reverses that default. There are two ways to wire the §1 handoff:
+
+- **Topology 1 — shared device.** wgpu adopts VSE's instance/device/queue via the `wgpu-hal`
+  from-raw APIs. No import machinery, but all the costs below.
+- **Topology 2 — separate Vulkan devices on the same GPU (now recommended).** The renderer
+  creates its own ordinary Vulkan device. The offscreen image ring is allocated as *exportable*
+  memory and shared zero-copy via **dmabuf** — the Linux kernel's file-descriptor mechanism for
+  passing GPU buffers between drivers, processes, and devices; on the same GPU an import binds
+  the *same physical memory pages*, so no pixels are copied. Frame completion is signalled with
+  **exported semaphores** (Vulkan's GPU-to-GPU synchronization objects, passed across the device
+  boundary as file descriptors via `VK_KHR_external_semaphore_fd`), so the handoff never
+  round-trips through the CPU.
+
+Why Topology 2 wins:
+
+1. **On a shared device, the present deadline cannot be protected.** Verified locally via
+   `vulkaninfo`: Intel MTL/ANV exposes **one queue family with `queueCount = 1`**. (A *queue
+   family* is a class of hardware command streams; one queue means every submission — the
+   renderer's long scene draw and VSE's small composite+present — executes strictly in
+   submission order. This is "head-of-line blocking": a long job in front delays the short job
+   behind it, and Vulkan offers no within-device way to jump the line.) With **separate
+   devices**, each gets its own kernel GPU context, and VSE can create its queue at elevated
+   **global priority** (`VK_KHR_global_priority` — a driver-level quality-of-service knob that
+   lets the kernel preempt lower-priority GPU work; exposed by both ANV and RADV, verified
+   locally). This is the same mechanism SteamVR and Monado use to keep compositor submissions
+   ahead of app rendering
+   ([Monado frame pacing](https://monado.pages.freedesktop.org/monado/frame-pacing.html),
+   [SteamVR-for-Linux #107](https://github.com/ValveSoftware/SteamVR-for-Linux/issues/107)).
+   Note `REALTIME` priority requires `CAP_SYS_NICE` (Monado documents
+   `setcap 'cap_sys_nice=eip'` for this).
+2. **Fault isolation.** A renderer/wgpu bug or `VK_ERROR_DEVICE_LOST` (Vulkan's "this device is
+   dead" error) kills only the renderer's device; VSE's swapchain, present-timing state, and
+   direct-display lease survive, so a session can freeze the last frame, log loudly, and restart
+   the renderer. On a shared device the same event ends the experiment.
+3. **A far smaller unsafe surface.** The renderer creates its device the normal, supported way —
+   no `device_from_raw` contract (which requires replicating wgpu's exact extension/feature
+   chain at device creation and re-auditing it on every wgpu major release). Only the image ring
+   and semaphores cross the boundary. This also dissolves the §9 "three consumers of one
+   `VkDevice`" lifetime risk.
+4. **Zero steady-state cost.** Same-GPU dmabuf sharing is zero-copy, and synchronization stays
+   on the GPU: wgpu gained `Queue::add_signal_semaphore` in v25
+   ([wgpu #6812](https://github.com/gfx-rs/wgpu/issues/6812),
+   [PR #6813](https://github.com/gfx-rs/wgpu/pull/6813)) and `add_wait_semaphore` +
+   `texture_from_dmabuf_fd` in v30
+   ([CHANGELOG](https://github.com/gfx-rs/wgpu/blob/trunk/CHANGELOG.md)); vulkano 0.35 has
+   `DeviceMemory::import` for dmabuf/opaque-fd memory and `Semaphore::export_fd`/`import_fd`.
+
+The one new obligation is **DRM format modifier** negotiation
+([VK_EXT_image_drm_format_modifier](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_EXT_image_drm_format_modifier.html)).
+A format modifier is the driver's description of how pixels are physically tiled/compressed in
+memory; exporter and importer must agree on one *explicitly*. Never force the linear (untiled)
+layout "for safety" — it costs real memory bandwidth on Intel; tiled and even compressed
+modifiers import fine on the same GPU. Topology 1 stays documented as the fallback if modifier
+negotiation misbehaves on some driver.
+
+Buffering: a **3-image ring** — the renderer writes frame N+1 while VSE composites frame N, with
+one slack slot to absorb renderer jitter. A slot is released when VSE's composite pass finishes
+*sampling* it (semaphore back-edge), not at scanout, so this does not constrain how far ahead
+presents are scheduled. VSE-side, the handoff lands as a **composite pass** (sample the external
+image full-screen, then draw VSE overlays — fixation marks, photodiode patch, future gamma LUT)
+which VSE needs anyway; measured-bandwidth estimates put it at ~0.4–0.5 ms at 1440p and
+~0.8–1.1 ms at 4K RGBA8 on the MTL iGPU — comfortable at 120 Hz, and one more reason the
+priority-separated queue matters at 240 Hz.
 
 ---
 
@@ -576,7 +694,7 @@ Run a real engine purely for **scene → pixels**, share rendered frames to VSE 
   (the spike fails). Otherwise it re-solves solved problems. Keep as the fallback for the rich
   end; keep A as the *actual* near-term path for parametric stimuli regardless.
 
-### 7.4 rend3 / Fyrox / Rafx / hotham as the renderer
+### 7.4 rend3 / Fyrox / Rafx / hotham / renderling as the renderer
 
 - **rend3:** archived read-only (June 2025), last release Feb 2022 — **do not adopt.**
 - **Fyrox 1.0:** whole-application engine, owns the loop, ships its *own OpenGL* renderer —
@@ -587,6 +705,24 @@ Run a real engine purely for **scene → pixels**, share rendered frames to VSE 
 - **hotham:** full OpenXR+Vulkan VR engine (ash + `openxr` crate, `hecs` ECS); owns the
   session/swapchain/loop — all-or-nothing. **Best used as a *reference implementation*** for
   driving OpenXR+ash from Rust, not as a library.
+- **[2026-07-11] renderling** ([repo](https://github.com/schell/renderling)): the one genuinely
+  new candidate from the follow-up pass, and — unlike the four above — **not a rejection**. A
+  pure-Rust, NLnet/NGI-funded wgpu renderer with PBR, full glTF (including skinning, morph
+  targets, and animation), shadow mapping, and image-based lighting, that is a **library, not a
+  loop-owning engine**: headless render-to-texture is its native mode, and its own test suite
+  renders headless and pixel-diffs the output — exactly VSE's determinism-verification posture,
+  and with no temporal features to claw back. It rides the same wgpu seam as Bevy, so the §8
+  spike can evaluate both nearly for free. Risks: alpha maturity, essentially one maintainer.
+  **Status: the credible lighter-weight challenger to Strategy C.** (Also surveyed and rejected
+  in the same pass: Vulkan Scene Graph — cannot adopt external Vulkan handles, no Rust bindings
+  ([VSG #211](https://github.com/vsg-dev/VulkanSceneGraph/issues/211)); Google Filament — cannot
+  import an external `VkImage` and owns its device
+  ([filament #8134](https://github.com/google/filament/discussions/8134)); Godot 4 — headless
+  mode disables the `RenderingDevice` API
+  ([docs](https://docs.godotengine.org/en/stable/classes/class_renderingdevice.html)); Ogre-Next
+  is the only mature C++ engine that verifiably adopts an existing `VkDevice`
+  ([release notes](https://github.com/OGRECave/ogre-next/releases), `Sample_VulkanExternal`) but
+  has zero Rust bindings — the C++ fallback of last resort.)
 
 ---
 
@@ -626,18 +762,30 @@ Concretely:
    entire 3D/VR story stands on; building scene rendering on an unverified present path would
    invert the project's priorities.
 
-### The one thing that must be de-risked before committing to C
+### What must be de-risked before committing to C *(revised 2026-07-11)*
 
-Strategy C's viability rests on an **unproven-for-us** capability: running Bevy **headless**,
-targeting an **externally-owned `TextureView`** backed by a VSE-owned `VkImage` on a
-**shared `ash` device**, with **manual schedule-stepping** for render-on-demand, and with its
-nondeterministic features genuinely disabled. Each piece is individually documented as
-possible; the *combination* is at the frontier of Bevy's supported usage
-([bevy #12159](https://github.com/bevyengine/bevy/issues/12159)). **The next concrete step,
-when 3D work begins, is a throwaway spike proving this end-to-end** — render one Bevy PBR
-scene into a VSE-presented image with a verified scanout timestamp — *before* any design doc
-commits to C. If the spike fails, the documented fallback is Strategy A pushed toward the rich
-end (§7.3), accepting the larger build cost.
+**[2026-07-11]** Strategy C's *feasibility* is no longer the open question. The original text
+here called the combination (headless Bevy, externally-owned camera targets, render-on-demand,
+external present authority) "at the frontier of Bevy's supported usage," citing
+[bevy #12159](https://github.com/bevyengine/bevy/issues/12159) — a mischaracterization; that
+issue concerned winit event-loop wakeups and closed as completed in March 2024. The combination
+is what [`bevy_mod_openxr`](https://github.com/awtterpip/bevy_oxr) ships in production against
+Bevy 0.19 (see §5, Strategy C). What still **must** be proven by a throwaway spike, *before* any
+design doc commits to C:
+
+1. **Pixel determinism** — render the same scene state twice with the determinism contract
+   (§8 item 4 / §5 Strategy C claw-back list) applied, and hash-compare the framebuffers.
+2. **The dmabuf handoff** (§5.4) — exportable image ring + exported semaphores between a stock
+   Bevy/wgpu device and VSE's vulkano device, with explicit DRM-format-modifier negotiation, on
+   the target hardware.
+3. **Queue QoS** — creating VSE's queue at `VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR` succeeds on the
+   target driver and measurably protects the present deadline while the renderer is under load.
+4. **End-to-end verified timing** — one Bevy-rendered PBR scene presented by VSE with a
+   hardware scanout timestamp in `FlipInfo`.
+
+Run the same spike against renderling (§7.4) for marginal extra cost — same wgpu seam, direct
+comparison. If the spike fails, the documented fallback is Strategy A pushed toward the rich end
+(§7.3), accepting the larger build cost.
 
 ---
 
@@ -645,12 +793,24 @@ end (§7.3), accepting the larger build cost.
 
 - **Bevy determinism-clawback (highest risk).** Can every temporal/adaptive feature be
   disabled such that the *same scene state renders the same pixels every run*? Needs
-  measurement (render twice, diff frames) during the spike.
-- **Shared-device object lifetime.** Three consumers of one `VkDevice` (vulkano + present-timing
-  FFI + wgpu-hal). Drop-guard discipline and layout/semaphore correctness across the wgpu↔VSE
-  boundary must be validated with validation layers on.
+  measurement (render twice, diff frames) during the spike. **[2026-07-11]** The known concrete
+  sources and mitigations are now listed in §5 Strategy C's determinism bullet (synchronous
+  pipeline compilation, unstable draw-order sorts, wall-clock animation); the residual risk is
+  what that list *misses*, hence the framebuffer-hash harness.
+- **Shared-device object lifetime.** **[2026-07-11] Dissolved by the §5.4 separate-device
+  topology** — only the image ring and semaphores now cross the boundary. (Original risk, kept
+  for the record: three consumers of one `VkDevice` — vulkano + present-timing FFI + wgpu-hal —
+  with drop-guard and layout/semaphore correctness validated under validation layers. Applies
+  only if the Topology-1 fallback is ever exercised.)
 - **wgpu-hal API instability.** Signatures churn between releases; pin a version and budget for
-  interop-glue maintenance.
+  interop-glue maintenance. **[2026-07-11]** Mitigated (not eliminated) by §5.4: the unsafe
+  surface shrinks to image/semaphore export-import. Bevy consumed four wgpu major versions in
+  about a year; treat each Bevy upgrade as a project, with
+  [`bevy_mod_openxr`](https://github.com/awtterpip/bevy_oxr)'s release cadence (currently
+  days-after-Bevy) as the canary for interop health.
+- **[2026-07-11] DRM format-modifier negotiation (new).** Exporter and importer must agree on an
+  explicit modifier (§5.4); failure modes are driver-specific. The spike must exercise this on
+  the actual target hardware, and Topology 1 remains the documented fallback.
 - **Per-eye synchronization on custom panels.** Two direct-display swapchains, two present
   timelines — inter-ocular sync becomes a first-class timing problem (both eyes targeting the
   same absolute onset). VSE's calibrated single clock domain is the right substrate, but the
@@ -671,6 +831,8 @@ end (§7.3), accepting the larger build cost.
 - `docs/plans/2026-07-09-ext-present-timing-design.md` — the present-timing foundation.
 - `docs/timing.md` — timing philosophy and tiers.
 - `docs/guides/display_backends.md` — direct-display (`VK_KHR_display`) architecture.
+- `docs/gpu-vendor-selection.md` — **[2026-07-11]** AMD vs. NVIDIA for the experiment rig
+  (expands §3.5's "prefer Mesa AMD/Intel" note into full guidance).
 
 ### Game-engine timing
 - Epic — [Parallel Rendering Overview](https://dev.epicgames.com/documentation/unreal-engine/parallel-rendering-overview-for-unreal-engine),
@@ -726,12 +888,46 @@ end (§7.3), accepting the larger build cost.
 - Rust crates — [wgpu](https://github.com/gfx-rs/wgpu) ([HAL interop PR #1850](https://github.com/gfx-rs/wgpu/pull/1850),
   [issue #6142](https://github.com/gfx-rs/wgpu/issues/6142)),
   [Bevy 0.19](https://bevy.org/news/bevy-0-19/) ([RenderTarget::TextureView PR #8042](https://github.com/bevyengine/bevy/pull/8042),
-  [without_winit](https://github.com/bevyengine/bevy/blob/main/examples/app/without_winit.rs),
-  [external-swapchain issue #12159](https://github.com/bevyengine/bevy/issues/12159)),
+  [headless_renderer example](https://github.com/bevyengine/bevy/blob/main/examples/app/headless_renderer.rs),
+  [winit-wakeup issue #12159](https://github.com/bevyengine/bevy/issues/12159) — *closed 2024;
+  previously mislabeled here as an external-swapchain request*,
+  [RenderCreation::Manual](https://docs.rs/bevy/latest/bevy/render/settings/enum.RenderCreation.html),
+  [raw_vulkan_init PR #20565](https://github.com/bevyengine/bevy/pull/20565),
+  [Bevy 0.17 crate split](https://bevy.org/news/bevy-0-17/)),
   [glam](https://docs.rs/glam), [gltf-rs](https://github.com/gltf-rs/gltf),
   [rapier](https://lib.rs/crates/rapier3d), [parry](https://github.com/dimforge/parry),
   [hotham](https://github.com/leetvr/hotham), [openxrs](https://github.com/Ralith/openxrs),
   [rend3 (archived)](https://github.com/bve-reborn/rend3), [Fyrox](https://github.com/FyroxEngine/Fyrox).
+
+### [2026-07-11] Follow-up pass sources
+- [bevy_mod_openxr / bevy_mod_xr](https://github.com/awtterpip/bevy_oxr) — production proof of
+  headless Bevy → externally-owned Vulkan images → external present authority (see
+  `crates/bevy_openxr/src/openxr/graphics/vulkan.rs` and `render.rs`).
+- [renderling](https://github.com/schell/renderling) — pure-Rust wgpu PBR/glTF renderer,
+  headless-native (§7.4).
+- wgpu external-object interop —
+  [Queue::add_signal_semaphore issue #6812](https://github.com/gfx-rs/wgpu/issues/6812) /
+  [PR #6813](https://github.com/gfx-rs/wgpu/pull/6813),
+  [CHANGELOG: add_wait_semaphore + texture_from_dmabuf_fd in v30](https://github.com/gfx-rs/wgpu/blob/trunk/CHANGELOG.md),
+  [CommandEncoder::transition_resources](https://docs.rs/wgpu/latest/wgpu/struct.CommandEncoder.html).
+- vulkano external memory/semaphores —
+  [DeviceMemory::import](https://docs.rs/vulkano/latest/vulkano/memory/struct.DeviceMemory.html),
+  [Semaphore export/import](https://docs.rs/vulkano/latest/vulkano/sync/semaphore/struct.Semaphore.html).
+- Buffer sharing & queue QoS —
+  [VK_EXT_image_drm_format_modifier](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_EXT_image_drm_format_modifier.html),
+  [SteamVR-for-Linux #107 (global priority / CAP_SYS_NICE)](https://github.com/ValveSoftware/SteamVR-for-Linux/issues/107),
+  [Monado u_pacing_compositor](https://monado.pages.freedesktop.org/monado/u__pacing__compositor_8c.html),
+  [ANV Xe low-latency hint (Phoronix)](https://www.phoronix.com/news/Intel-ANV-Xe-Low-Latency-Hint).
+- Bevy determinism —
+  [unstable sort PR #5049](https://github.com/bevyengine/bevy/pull/5049),
+  [draw-order discussion #3773](https://github.com/bevyengine/bevy/discussions/3773),
+  [frame-counter animation discussion #11809](https://github.com/bevyengine/bevy/discussions/11809),
+  [determinism discussion #2480](https://github.com/bevyengine/bevy/discussions/2480),
+  [RenderPlugin::synchronous_pipeline_compilation](https://docs.rs/bevy/latest/bevy/render/struct.RenderPlugin.html).
+- Alternatives pass — [VSG #211 (no external handles)](https://github.com/vsg-dev/VulkanSceneGraph/issues/211),
+  [Filament #8134 (no VkImage import)](https://github.com/google/filament/discussions/8134),
+  [Godot RenderingDevice headless limitation](https://docs.godotengine.org/en/stable/classes/class_renderingdevice.html),
+  [Ogre-Next external-VkDevice support](https://github.com/OGRECave/ogre-next/releases).
 
 ### Scientific stimulus tools & timing
 - [Kleiner et al. 2007 — What's new in Psychtoolbox-3](https://pure.mpg.de/rest/items/item_1790332/component/file_3136265/content);
