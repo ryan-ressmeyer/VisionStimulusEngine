@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/vse-external-frame", "crates/vse-bevy"]
+resolver = "2"
+
 [package]
 name = "vision_stimulus_engine"
 version = "0.1.0"
@@ -8,6 +12,9 @@ license = "MIT"
 authors = ["Ryan A. Ressmeyer"]
 
 [dependencies]
+# External-renderer handoff wire types (ring state machine, format negotiation)
+vse-external-frame = { path = "crates/vse-external-frame" }
+
 # Vulkan abstraction - Core rendering
 vulkano = "0.35"
 

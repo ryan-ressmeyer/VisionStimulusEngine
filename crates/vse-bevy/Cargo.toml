@@ -1,0 +1,15 @@
+[package]
+name = "vse-bevy"
+version = "0.1.0"
+edition = "2021"
+description = "Headless Bevy producer for VSE's external-renderer handoff seam"
+license = "MIT"
+authors = ["Ryan A. Ressmeyer"]
+
+[dependencies]
+vse-external-frame = { path = "../vse-external-frame" }
+thiserror = "1.0"
+# bevy / wgpu / ash are added at the spike step with exact pins.
+
+[dev-dependencies]
+vision_stimulus_engine = { path = "../.." }
