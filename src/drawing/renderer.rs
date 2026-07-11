@@ -5,11 +5,12 @@ use thiserror::Error;
 
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage},
+    buffer::Subbuffer,
     command_buffer::{
         allocator::{CommandBufferAllocator, StandardCommandBufferAllocator},
-        AutoCommandBufferBuilder, CommandBufferUsage as CmdBufUsage, CopyBufferToImageInfo,
-        PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract, RenderingAttachmentInfo,
-        RenderingInfo,
+        AutoCommandBufferBuilder, BlitImageInfo, CommandBufferUsage as CmdBufUsage,
+        CopyBufferToImageInfo, CopyImageToBufferInfo, PrimaryAutoCommandBuffer,
+        PrimaryCommandBufferAbstract, RenderingAttachmentInfo, RenderingInfo,
     },
     descriptor_set::{
         allocator::{DescriptorSetAllocator, StandardDescriptorSetAllocator},
@@ -48,6 +49,16 @@ use vulkano::{
 use super::primitives::{
     circle_vertices, line_vertices, rect_vertices, textured_quad_vertices, DrawCommand,
 };
+
+/// An external frame consumed as the background of one rendered frame
+/// (see `core::external_frame`).
+pub(crate) struct ExternalUnderlay {
+    /// The imported external image to place under VSE's draw commands.
+    pub image: Arc<Image>,
+    /// When set, the external image is additionally copied into this
+    /// host-visible buffer (determinism-harness readback).
+    pub readback: Option<Subbuffer<[u8]>>,
+}
 use super::stimuli::WaveType;
 use super::texture::TextureHandle;
 use super::vertex::{DotInstance, TexturedVertex, Vertex2D};
@@ -227,7 +238,29 @@ impl Renderer {
         clear_color: [f32; 4],
         viewport_extent: [u32; 2],
     ) -> Result<Arc<PrimaryAutoCommandBuffer>, RendererError> {
-        let image_view = ImageView::new_default(target_image)
+        self.render_with_underlay(target_image, clear_color, viewport_extent, None)
+    }
+
+    /// Like [`render`](Self::render), but optionally consumes an external frame
+    /// as an *underlay*: the external image is blitted into the target before
+    /// VSE's queued draw commands, which then composite on top (fixation marks,
+    /// photodiode patches, ...). The handoff mechanism (blit today, a sampled
+    /// composite quad later) is an implementation detail of this function —
+    /// consumers of the seam never depend on it.
+    ///
+    /// Everything records into one `AutoCommandBufferBuilder`, so vulkano
+    /// inserts all image-layout transitions: swapchain `PresentSrc →
+    /// TransferDst → ColorAttachment → PresentSrc`, external image
+    /// `ColorAttachmentOptimal → TransferSrc → ColorAttachmentOptimal` (the
+    /// layout contract in `core::external_frame`).
+    pub fn render_with_underlay(
+        &mut self,
+        target_image: Arc<Image>,
+        clear_color: [f32; 4],
+        viewport_extent: [u32; 2],
+        underlay: Option<&ExternalUnderlay>,
+    ) -> Result<Arc<PrimaryAutoCommandBuffer>, RendererError> {
+        let image_view = ImageView::new_default(target_image.clone())
             .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
 
         let mut builder = AutoCommandBufferBuilder::primary(
@@ -237,13 +270,40 @@ impl Renderer {
         )
         .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
 
-        // Begin rendering with clear
+        if let Some(underlay) = underlay {
+            // Full-image blit (not copy): handles RGBA↔BGRA channel reordering
+            // and extent mismatches; Linear filtering only matters when scaling.
+            builder
+                .blit_image(BlitImageInfo {
+                    filter: Filter::Linear,
+                    ..BlitImageInfo::images(underlay.image.clone(), target_image.clone())
+                })
+                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+            if let Some(readback) = &underlay.readback {
+                // Determinism-harness hook: capture the imported external image
+                // exactly as consumed (through export/import + semaphore wait).
+                builder
+                    .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+                        underlay.image.clone(),
+                        readback.clone(),
+                    ))
+                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+            }
+        }
+
+        // Begin rendering; the underlay (when present) is the background, so
+        // load instead of clear.
+        let (load_op, clear_value) = if underlay.is_some() {
+            (AttachmentLoadOp::Load, None)
+        } else {
+            (AttachmentLoadOp::Clear, Some(ClearValue::Float(clear_color)))
+        };
         builder
             .begin_rendering(RenderingInfo {
                 color_attachments: vec![Some(RenderingAttachmentInfo {
-                    load_op: AttachmentLoadOp::Clear,
+                    load_op,
                     store_op: AttachmentStoreOp::Store,
-                    clear_value: Some(ClearValue::Float(clear_color)),
+                    clear_value,
                     ..RenderingAttachmentInfo::image_view(image_view)
                 })],
                 ..Default::default()

@@ -86,6 +86,10 @@ pub enum VSEError {
     #[error("record_frame() called before flip() — call flip() first")]
     NoFlipPending,
 
+    /// External-renderer frame source error (see `core::external_frame`).
+    #[error("External frame error: {0}")]
+    ExternalFrame(#[from] crate::core::external_frame::ExternalFrameError),
+
     /// No ExperimentSession attached. Call VSEContextBuilder::with_session() to enable recording.
     #[error("no ExperimentSession attached — call .with_session() on the builder")]
     NoSession,
@@ -498,6 +502,18 @@ struct VSEState {
     /// Tracks whether record_frame() was called during the current Presented callback.
     /// Reset to false before each Presented callback by run_buffered().
     buffered_record_called_this_presented: bool,
+
+    /// Present-timing sub-features enabled at device creation (`Some` on the EXT backend).
+    /// Carries the queue global-priority outcome into host-info snapshots.
+    ext_features: Option<crate::core::present_timing_ext::EnabledPresentTimingFeatures>,
+
+    /// Imported external-renderer frame ring (see `core::external_frame`).
+    /// `None` unless a source was attached via `attach_external_frame_source`.
+    external_source: Option<crate::core::external_frame::ExternalFrameRing>,
+
+    /// One-shot readback buffer for the next consumed external frame
+    /// (determinism-harness hook, armed via `arm_external_readback`).
+    external_readback: Option<vulkano::buffer::Subbuffer<[u8]>>,
 }
 
 /// Main VisionStimulusEngine context
@@ -1130,6 +1146,9 @@ impl VSEContext {
             in_buffered_mode: false,
             buffered_in_flight: std::collections::VecDeque::new(),
             buffered_record_called_this_presented: false,
+            ext_features,
+            external_source: None,
+            external_readback: None,
         })
     }
 
@@ -1256,6 +1275,9 @@ impl VSEContext {
             in_buffered_mode: false,
             buffered_in_flight: std::collections::VecDeque::new(),
             buffered_record_called_this_presented: false,
+            ext_features,
+            external_source: None,
+            external_readback: None,
         })
     }
 
@@ -2330,10 +2352,27 @@ impl<'a> RenderContext<'a> {
             self.state.swapchain.mark_needs_recreation();
         }
 
+        // --- External frame source: release completed slots, take this frame's underlay ---
+        if let Some(src) = self.state.external_source.as_mut() {
+            src.pump_releases();
+        }
+        let ext_frame = self
+            .state
+            .external_source
+            .as_mut()
+            .and_then(|src| src.take_frame());
+        let underlay = ext_frame.as_ref().map(|f| crate::drawing::renderer::ExternalUnderlay {
+            image: f.image.clone(),
+            readback: self.state.external_readback.take(),
+        });
+
         // --- Render into the acquired image ---
         let image = self.state.swapchain.images()[image_index as usize].clone();
         let extent = self.state.swapchain.extent();
-        let command_buffer = self.state.renderer.render(image, clear_color, extent)?;
+        let command_buffer =
+            self.state
+                .renderer
+                .render_with_underlay(image, clear_color, extent, underlay.as_ref())?;
 
         // Hardware scheduling: express the target (scanout-domain µs) as an absolute scanout time
         // for `VkPresentTimingInfoEXT.targetTime`. Falls back to unscheduled when the scanout
@@ -2354,6 +2393,7 @@ impl<'a> RenderContext<'a> {
 
         // --- Submit + raw present with the timing pNext chain ---
         let queue = self.state.queue.clone();
+        let external_waits: Vec<_> = ext_frame.iter().filter_map(|f| f.wait.clone()).collect();
         let outcome = self
             .state
             .present_engine
@@ -2366,10 +2406,16 @@ impl<'a> RenderContext<'a> {
                 slot,
                 command_buffer,
                 scheduled,
+                &external_waits,
             )
             .map_err(SwapchainError::PresentFailed)?;
         if outcome.suboptimal {
             self.state.swapchain.mark_needs_recreation();
+        }
+        // Release back-edge: the slot returns to the producer once this submit's
+        // fence signals (pumped at the top of the next flip).
+        if let (Some(f), Some(src)) = (ext_frame, self.state.external_source.as_mut()) {
+            src.on_consumed(f.slot, outcome.fence.clone());
         }
 
         // Synchronous flip(): block on the render fence (GPU render done) before sampling — cheap,
@@ -2675,10 +2721,27 @@ impl<'a> RenderContext<'a> {
             self.state.swapchain.mark_needs_recreation();
         }
 
+        // --- External frame source: release completed slots, take this frame's underlay ---
+        if let Some(src) = self.state.external_source.as_mut() {
+            src.pump_releases();
+        }
+        let ext_frame = self
+            .state
+            .external_source
+            .as_mut()
+            .and_then(|src| src.take_frame());
+        let underlay = ext_frame.as_ref().map(|f| crate::drawing::renderer::ExternalUnderlay {
+            image: f.image.clone(),
+            readback: self.state.external_readback.take(),
+        });
+
         // --- Render ---
         let image = self.state.swapchain.images()[image_index as usize].clone();
         let extent = self.state.swapchain.extent();
-        let command_buffer = self.state.renderer.render(image, clear_color, extent)?;
+        let command_buffer =
+            self.state
+                .renderer
+                .render_with_underlay(image, clear_color, extent, underlay.as_ref())?;
 
         // Hardware scheduling (no CPU spin): express the target as an absolute scanout time for
         // the driver. Falls back to unscheduled before the scanout epoch/domain is known.
@@ -2688,6 +2751,7 @@ impl<'a> RenderContext<'a> {
 
         // --- Submit + raw present (non-blocking) ---
         let queue = self.state.queue.clone();
+        let external_waits: Vec<_> = ext_frame.iter().filter_map(|f| f.wait.clone()).collect();
         let outcome = self
             .state
             .present_engine
@@ -2700,10 +2764,16 @@ impl<'a> RenderContext<'a> {
                 slot,
                 command_buffer,
                 scheduled,
+                &external_waits,
             )
             .map_err(SwapchainError::PresentFailed)?;
         if outcome.suboptimal {
             self.state.swapchain.mark_needs_recreation();
+        }
+        // Release back-edge: the slot returns to the producer once this submit's
+        // fence signals (pumped at the top of the next flip).
+        if let (Some(f), Some(src)) = (&ext_frame, self.state.external_source.as_mut()) {
+            src.on_consumed(f.slot, outcome.fence.clone());
         }
 
         let estimated_present = self.state.clock.now();
@@ -2919,6 +2989,79 @@ impl<'a> RenderContext<'a> {
     }
 
     /// Get the current frame number (before the next flip).
+    /// Attach an external-renderer frame source (see `core::external_frame`).
+    ///
+    /// Imports the producer's exported image ring + ready semaphores onto VSE's
+    /// device. Subsequent flips consume queued external frames as a full-screen
+    /// underlay beneath VSE's own draw commands; VSE remains sole present
+    /// authority and `FlipInfo` is computed exactly as without a source.
+    ///
+    /// Requires the `ExtPresentTiming` backend (the CPU-estimate path has no
+    /// seam for cross-device semaphore waits).
+    ///
+    /// `release_tx` is the consumer→producer slot-release back-edge: pass the
+    /// sender half of [`vse_external_frame::release_channel`] and give the
+    /// receiver to the producer.
+    pub fn attach_external_frame_source(
+        &mut self,
+        desc: vse_external_frame::ExternalRingDesc,
+        release_tx: vse_external_frame::SlotReleaseTx,
+    ) -> Result<(), VSEError> {
+        use crate::core::external_frame::{ExternalFrameError, ExternalFrameRing};
+        if self.state.present_engine.is_none() {
+            return Err(ExternalFrameError::Unsupported(
+                "external frame sources require the ExtPresentTiming backend \
+                 (CPU-estimate timing path active)"
+                    .into(),
+            )
+            .into());
+        }
+        if self.state.external_source.is_some() {
+            return Err(ExternalFrameError::Unsupported(
+                "an external frame source is already attached".into(),
+            )
+            .into());
+        }
+        let ring =
+            ExternalFrameRing::import(&self.state.device, &self.state.queue, desc, release_tx)?;
+        tracing::info!(
+            "external frame source attached: {} slots, {:?}, {:?}, {}x{}",
+            ring.ring_len(),
+            ring.format(),
+            ring.sync(),
+            ring.extent()[0],
+            ring.extent()[1],
+        );
+        self.state.external_source = Some(ring);
+        Ok(())
+    }
+
+    /// Queue the external frame in `slot` for consumption by the next flip.
+    ///
+    /// Call after the producer finishes rendering into `slot` (and signals its
+    /// ready semaphore), before `flip`/`flip_with_payload`. Slots must be
+    /// queued in the order the producer acquired them.
+    pub fn queue_external_frame(
+        &mut self,
+        slot: vse_external_frame::SlotIndex,
+    ) -> Result<(), VSEError> {
+        let src = self.state.external_source.as_mut().ok_or_else(|| {
+            crate::core::external_frame::ExternalFrameError::Unsupported(
+                "no external frame source attached".into(),
+            )
+        })?;
+        src.note_ready(slot)?;
+        Ok(())
+    }
+
+    /// Arm a one-shot readback of the next consumed external frame into
+    /// `buffer` (determinism-harness hook). The copy is recorded in the same
+    /// command buffer as the underlay consumption; the buffer is safe to read
+    /// once that flip is confirmed (fence signaled / `Presented` delivered).
+    pub fn arm_external_readback(&mut self, buffer: vulkano::buffer::Subbuffer<[u8]>) {
+        self.state.external_readback = Some(buffer);
+    }
+
     pub fn frame_number(&self) -> u64 {
         self.state.frame_number
     }
@@ -3193,6 +3336,7 @@ impl<'a> RenderContext<'a> {
                 // Enforcement is not auto-probed (it disrupts frames); `None` here. The
                 // direct-display characterization example measures and reports it.
                 absolute_scheduling_enforced: None,
+                queue_global_priority: self.state.ext_features.map(|f| f.queue_priority),
             },
         )
     }

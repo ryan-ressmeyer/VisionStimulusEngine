@@ -24,6 +24,11 @@ pub mod drawing;
 pub mod host;
 pub mod timing;
 
+/// External-renderer handoff wire types (ring descriptors, slot state machine,
+/// format negotiation), re-exported so consumers name one crate. See
+/// `core::external_frame` for the VSE-side seam.
+pub use vse_external_frame as external_frame;
+
 // Re-export commonly used types
 pub mod prelude {
     pub use crate::core::{

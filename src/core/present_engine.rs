@@ -187,6 +187,7 @@ impl PresentEngine {
     /// attaches the timing `pNext` chain: [`PresentChain::scheduled`] with `target`'s absolute
     /// scanout time when `Some` (hardware scheduling), else [`PresentChain::unscheduled`]
     /// (present-id + scanout timing request only).
+    #[allow(clippy::too_many_arguments)] // mirrors the submit's actual shape; bundling obscures it
     pub fn submit_and_present(
         &mut self,
         queue: &Arc<Queue>,
@@ -195,14 +196,28 @@ impl PresentEngine {
         slot: usize,
         command_buffer: Arc<dyn PrimaryCommandBufferAbstract>,
         target: Option<ScheduledTarget>,
+        external_waits: &[(Arc<vulkano::sync::semaphore::Semaphore>, Option<u64>)],
     ) -> Result<PresentOutcome, String> {
         // --- Submit: wait acquire@COLOR_ATTACHMENT_OUTPUT, run cmd buf, signal render + fence ---
         let mut wait =
             vulkano::command_buffer::SemaphoreSubmitInfo::new(self.ring[slot].acquire.clone());
         wait.stages = PipelineStages::COLOR_ATTACHMENT_OUTPUT;
 
+        let mut wait_semaphores = vec![wait];
+        // External-renderer ready semaphores (see core::external_frame): gate the
+        // transfer stage — the underlay blit must not sample the external image
+        // before the producer's render completes.
+        for (sem, value) in external_waits {
+            let mut w = vulkano::command_buffer::SemaphoreSubmitInfo::new(sem.clone());
+            w.stages = PipelineStages::ALL_TRANSFER;
+            if let Some(v) = *value {
+                w.value = v;
+            }
+            wait_semaphores.push(w);
+        }
+
         let submit_info = SubmitInfo {
-            wait_semaphores: vec![wait],
+            wait_semaphores,
             command_buffers: vec![CommandBufferSubmitInfo::new(command_buffer.clone())],
             signal_semaphores: vec![vulkano::command_buffer::SemaphoreSubmitInfo::new(
                 self.ring[slot].render_finished.clone(),

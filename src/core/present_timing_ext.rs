@@ -563,6 +563,40 @@ pub fn probe_support(
 
 // ─── Raw device creation + vulkano adoption ─────────────────────────────────
 
+/// Outcome of requesting elevated queue global priority (`VK_KHR_global_priority`)
+/// at device creation. Elevated priority lets the kernel GPU scheduler preempt
+/// other contexts (e.g. an external renderer's device) so VSE's composite+present
+/// submissions meet their deadline — the same mechanism VR compositors use.
+///
+/// Recorded (never assumed) per VSE's driver-conformance posture: a run's host
+/// snapshot says what the driver actually granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuePriorityOutcome {
+    /// `HIGH` global priority requested and device creation succeeded.
+    HighGranted,
+    /// The chain was attempted but `vkCreateDevice` failed with this result;
+    /// the device was re-created without elevated priority.
+    Denied(ash::vk::Result),
+    /// `VK_KHR_global_priority` not advertised, or `HIGH` not offered for the
+    /// graphics queue family.
+    Unavailable,
+    /// This code path does not attempt elevation (e.g. the non-EXT fallback
+    /// device, which vulkano creates and cannot chain the struct).
+    NotAttempted,
+}
+
+impl QueuePriorityOutcome {
+    /// Stable string for host-info JSON snapshots.
+    pub fn label(&self) -> String {
+        match self {
+            QueuePriorityOutcome::HighGranted => "high_granted".into(),
+            QueuePriorityOutcome::Denied(e) => format!("denied({e:?})"),
+            QueuePriorityOutcome::Unavailable => "unavailable".into(),
+            QueuePriorityOutcome::NotAttempted => "not_attempted".into(),
+        }
+    }
+}
+
 /// Which present-timing sub-features were actually enabled on the created device.
 #[derive(Debug, Clone, Copy)]
 pub struct EnabledPresentTimingFeatures {
@@ -570,6 +604,13 @@ pub struct EnabledPresentTimingFeatures {
     pub present_at_absolute_time: bool,
     pub present_id2: bool,
     pub present_wait2: bool,
+    /// Whether the queue was created at elevated global priority (see
+    /// [`QueuePriorityOutcome`]).
+    pub queue_priority: QueuePriorityOutcome,
+    /// `VK_KHR_external_memory_fd` + `VK_KHR_external_semaphore_fd` enabled —
+    /// required to import an external renderer's image ring (see
+    /// `crate::core::external_frame`).
+    pub external_handles: bool,
 }
 
 /// Create a logical device with the present-timing extension family enabled, then adopt it
@@ -621,6 +662,27 @@ pub unsafe fn create_device_with_present_timing(
     };
     let advertise_dynamic_rendering = has_ext(b"VK_KHR_dynamic_rendering\0");
     let advertise_calibrated = has_ext(b"VK_EXT_calibrated_timestamps\0");
+    // External-renderer handoff: importing another device's image ring + semaphores.
+    // The base VK_KHR_external_memory / VK_KHR_external_semaphore are core since 1.1.
+    let advertise_external_handles =
+        has_ext(b"VK_KHR_external_memory_fd\0") && has_ext(b"VK_KHR_external_semaphore_fd\0");
+
+    // Queue QoS: does the driver advertise global priority, and is HIGH offered for our
+    // queue family? Checked up front so a denial is a driver decision, not a blind guess.
+    let advertise_global_priority = has_ext(b"VK_KHR_global_priority\0");
+    let high_priority_offered = advertise_global_priority && {
+        let count =
+            ash_instance.get_physical_device_queue_family_properties2_len(phys);
+        let mut prio_props = ash::vk::QueueFamilyGlobalPriorityPropertiesKHR::default();
+        let mut props2: Vec<ash::vk::QueueFamilyProperties2> =
+            (0..count).map(|_| Default::default()).collect();
+        if let Some(entry) = props2.get_mut(graphics_queue_family_index as usize) {
+            entry.p_next = &mut prio_props as *mut _ as *mut c_void;
+        }
+        ash_instance.get_physical_device_queue_family_properties2(phys, &mut props2);
+        prio_props.priorities[..prio_props.priority_count as usize]
+            .contains(&ash::vk::QueueGlobalPriorityKHR::HIGH)
+    };
 
     // --- Discover supported sub-features via vkGetPhysicalDeviceFeatures2 ---
     let mut dyn_render = ash::vk::PhysicalDeviceDynamicRenderingFeatures::default();
@@ -653,11 +715,18 @@ pub unsafe fn create_device_with_present_timing(
     features2.p_next = &mut dyn_render as *mut _ as *mut c_void;
     ash_instance.get_physical_device_features2(phys, &mut features2);
 
-    let enabled = EnabledPresentTimingFeatures {
+    let mut enabled = EnabledPresentTimingFeatures {
         present_timing: f_timing.present_timing != 0,
         present_at_absolute_time: f_timing.present_at_absolute_time != 0,
         present_id2: f_id2.present_id2 != 0,
         present_wait2: support.present_wait2 && f_wait2.present_wait2 != 0,
+        queue_priority: if high_priority_offered {
+            // Provisional; downgraded to Denied if creation fails below.
+            QueuePriorityOutcome::HighGranted
+        } else {
+            QueuePriorityOutcome::Unavailable
+        },
+        external_handles: advertise_external_handles,
     };
 
     if !enabled.present_timing || !enabled.present_id2 {
@@ -697,15 +766,27 @@ pub unsafe fn create_device_with_present_timing(
     if advertise_calibrated {
         ext_names.push(b"VK_EXT_calibrated_timestamps\0".as_ptr() as *const c_char);
     }
+    if advertise_external_handles {
+        ext_names.push(b"VK_KHR_external_memory_fd\0".as_ptr() as *const c_char);
+        ext_names.push(b"VK_KHR_external_semaphore_fd\0".as_ptr() as *const c_char);
+    }
+    if high_priority_offered {
+        ext_names.push(b"VK_KHR_global_priority\0".as_ptr() as *const c_char);
+    }
 
     // --- Queue + device create info ---
     let queue_priorities = [1.0f32];
-    let queue_ci = ash::vk::DeviceQueueCreateInfo {
+    let queue_prio = ash::vk::DeviceQueueGlobalPriorityCreateInfoKHR::default()
+        .global_priority(ash::vk::QueueGlobalPriorityKHR::HIGH);
+    let mut queue_ci = ash::vk::DeviceQueueCreateInfo {
         queue_family_index: graphics_queue_family_index,
         queue_count: 1,
         p_queue_priorities: queue_priorities.as_ptr(),
         ..Default::default()
     };
+    if high_priority_offered {
+        queue_ci.p_next = &queue_prio as *const _ as *const c_void;
+    }
 
     let mut device_ci = ash::vk::DeviceCreateInfo::default();
     device_ci.queue_create_info_count = 1;
@@ -714,9 +795,28 @@ pub unsafe fn create_device_with_present_timing(
     device_ci.pp_enabled_extension_names = ext_names.as_ptr();
     device_ci.p_next = &dyn_render as *const _ as *const c_void;
 
-    let ash_device = ash_instance
-        .create_device(phys, &device_ci, None)
-        .map_err(|e| format!("raw vkCreateDevice failed: {e:?}"))?;
+    let ash_device = match ash_instance.create_device(phys, &device_ci, None) {
+        Ok(d) => d,
+        // A denial of elevated queue priority (typically ERROR_NOT_PERMITTED_KHR) must not
+        // cost the timing backend: retry once without the chain and record the denial.
+        Err(e) if high_priority_offered => {
+            warn!(
+                "queue global priority HIGH denied ({e:?}); retrying at default priority — \
+                 present-deadline QoS reduced"
+            );
+            enabled.queue_priority = QueuePriorityOutcome::Denied(e);
+            queue_ci.p_next = std::ptr::null();
+            ext_names.retain(|p| {
+                CStr::from_ptr(*p) != CStr::from_bytes_with_nul_unchecked(b"VK_KHR_global_priority\0")
+            });
+            device_ci.enabled_extension_count = ext_names.len() as u32;
+            device_ci.pp_enabled_extension_names = ext_names.as_ptr();
+            ash_instance
+                .create_device(phys, &device_ci, None)
+                .map_err(|e| format!("raw vkCreateDevice failed: {e:?}"))?
+        }
+        Err(e) => return Err(format!("raw vkCreateDevice failed: {e:?}")),
+    };
     let device_handle = ash_device.handle();
     // vulkano takes ownership of the handle below; don't let ash's Drop destroy it.
     std::mem::forget(ash_device);
@@ -731,6 +831,10 @@ pub unsafe fn create_device_with_present_timing(
             khr_swapchain: true,
             khr_dynamic_rendering: advertise_dynamic_rendering,
             ext_calibrated_timestamps: advertise_calibrated,
+            // Mirrored so vulkano's validated DeviceMemory::import / Semaphore::import_fd
+            // accept the external-frame ring (crate::core::external_frame).
+            khr_external_memory_fd: advertise_external_handles,
+            khr_external_semaphore_fd: advertise_external_handles,
             ..DeviceExtensions::empty()
         },
         enabled_features: DeviceFeatures {
@@ -767,6 +871,19 @@ const _: () = {
 mod tests {
     use super::*;
     use std::ptr;
+
+    #[test]
+    fn queue_priority_outcome_labels_are_stable() {
+        // These strings land in HostInfo JSON snapshots; changing them breaks
+        // downstream analysis of a run's timing pedigree.
+        assert_eq!(QueuePriorityOutcome::HighGranted.label(), "high_granted");
+        assert_eq!(
+            QueuePriorityOutcome::Denied(ash::vk::Result::ERROR_NOT_PERMITTED_KHR).label(),
+            "denied(ERROR_NOT_PERMITTED_KHR)"
+        );
+        assert_eq!(QueuePriorityOutcome::Unavailable.label(), "unavailable");
+        assert_eq!(QueuePriorityOutcome::NotAttempted.label(), "not_attempted");
+    }
 
     #[test]
     fn swapchain_present_opt_in_flag_bits_match_spec() {

@@ -469,8 +469,12 @@ impl DeviceSelector {
                 Ok((device, queue, enabled)) => {
                     info!(
                         "Timing backend: ExtPresentTiming (VK_EXT_present_timing; \
-                         scheduling={}, present_wait2={})",
-                        enabled.present_at_absolute_time, enabled.present_wait2
+                         scheduling={}, present_wait2={}, queue_priority={}, \
+                         external_handles={})",
+                        enabled.present_at_absolute_time,
+                        enabled.present_wait2,
+                        enabled.queue_priority.label(),
+                        enabled.external_handles
                     );
                     return Ok((device, queue, Some(enabled)));
                 }

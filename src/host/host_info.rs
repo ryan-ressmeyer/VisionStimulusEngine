@@ -134,6 +134,13 @@ pub struct TimingCapabilities {
     /// `docs/clock-synchronization.md`.
     #[serde(default)]
     pub absolute_scheduling_enforced: Option<bool>,
+    /// Whether VSE's queue was created at elevated global priority
+    /// (`VK_KHR_global_priority`), protecting the present deadline against other GPU
+    /// contexts (e.g. an external renderer's device). Stable labels from
+    /// `QueuePriorityOutcome::label()`: `"high_granted"`, `"denied(..)"`,
+    /// `"unavailable"`, `"not_attempted"`. `None` on the CPU-estimate backend.
+    #[serde(default)]
+    pub queue_global_priority: Option<String>,
 }
 
 /// Display/monitor information from winit

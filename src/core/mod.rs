@@ -11,6 +11,7 @@ mod device;
 pub(crate) mod direct_display;
 #[cfg(target_os = "linux")]
 pub(crate) mod evdev_input;
+pub(crate) mod external_frame;
 mod frame;
 pub(crate) mod input;
 pub(crate) mod present_engine;
@@ -21,6 +22,7 @@ mod swapchain;
 pub use buffered::{BufferedConfig, FlipEvent};
 pub use context::{RenderContext, VSEConfig, VSEContext, VSEContextBuilder, VSEError};
 pub use device::{DeviceError, DeviceSelector, GPUPreference};
+pub use external_frame::{ExternalFrameError, ExternalFrameRing};
 pub use frame::{Frame, FrameError};
 pub use input::{
     AcquisitionMethod, DisplayBackend, InputEvent, Key, KeyCode, MonitorInfo, MonitorSelection,
