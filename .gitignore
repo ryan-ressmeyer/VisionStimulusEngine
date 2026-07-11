@@ -19,5 +19,9 @@ Thumbs.db
 *.csv
 *.json
 
+# Demo outputs (metacontrast masking example)
+metacontrast_*.png
+stimulus_*.png
+
 # Git worktrees
 .worktrees/
