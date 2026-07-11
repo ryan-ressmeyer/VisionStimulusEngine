@@ -1620,6 +1620,12 @@ impl VSEContext {
                                 // after the callback — not before — or it would erase those events
                                 // before the callback ever sees them.
                                 s.input.begin_frame();
+
+                                // Honor a callback's request_exit(): break the loop after this
+                                // frame, mirroring the buffered and direct-display paths.
+                                if s.should_close {
+                                    elwt.exit();
+                                }
                             }
                             _ => {}
                         }
