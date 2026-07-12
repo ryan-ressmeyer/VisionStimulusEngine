@@ -15,6 +15,13 @@
 //!
 //! Run with:
 //! `CARGO_INCREMENTAL=0 cargo run -p vse-bevy --release --example 01_bevy_ring_demo [frames]`
+//!
+//! Measured 2026-07-12 (Intel MTL/ANV/Mesa 26.1, windowed Wayland 60 Hz, release profile,
+//! CpuBlocking sync): 999/1000 presented (1 startup skip), 999/999 on_target, mean
+//! inter-present 16.64 ms, 3–15 missed frames per 999 across runs. The no-producer baseline
+//! (examples/12) missed 151–253/999 under identical conditions — the external-frame handoff
+//! is not the limiting factor; windowed-compositor jitter is. Zero-missed runs are a
+//! direct-display measurement (out of scope for the windowed demo).
 
 use std::cell::RefCell;
 use std::rc::Rc;

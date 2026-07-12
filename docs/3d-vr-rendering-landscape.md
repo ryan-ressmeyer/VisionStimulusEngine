@@ -787,6 +787,32 @@ Run the same spike against renderling (§7.4) for marginal extra cost — same w
 comparison. If the spike fails, the documented fallback is Strategy A pushed toward the rich end
 (§7.3), accepting the larger build cost.
 
+**[2026-07-12] Spike results (branch `feat/3d-external-frame-seam`, Intel MTL/ANV/Mesa 26.1,
+windowed 60 Hz).** The spike ran with OPAQUE_FD external memory (same-driver shortcut; dmabuf +
+explicit modifiers remains the cross-process/cross-vendor path) and a blit handoff (a composite
+pass slots in behind the same `ExternalFrameRing` API):
+
+1. **Pixel determinism: PASS.** Frames 120–122 hashed byte-identical across two independent
+   runs (and pairwise distinct — live animation), hashed VSE-side from the *imported* image in
+   the same command buffer that consumes it, so the hash covers Bevy's render + export/import +
+   sync. `crates/vse-bevy/examples/02_verify_determinism.rs`.
+2. **The handoff: PASS with one conformance finding.** Image memory export/import works as
+   designed (wgpu-hal 29 enables `VK_KHR_external_memory_fd`). **Semaphore-fd export does not
+   work on wgpu 29**: wgpu-hal never enables `VK_KHR_external_semaphore_fd`, and the Vulkan
+   loader filters `vkGetSemaphoreFdKHR` by enablement (probed `NULL`). The seam fell back to
+   `CpuBlocking` (producer stalls until its GPU work completes; correct but unpipelined).
+   Fix candidates: Bevy 0.19's `raw_vulkan_init` feature (request the extension at device
+   creation) or wgpu 30. The `SyncKind` wire type keeps this a drop-in change.
+3. **Queue QoS: fallback path exercised and recorded.** Unprivileged ANV on MTL advertises only
+   `[LOW, MEDIUM]` global priorities — Mesa adds HIGH only with `CAP_SYS_NICE` (the reason
+   SteamVR documents `setcap`). Outcome recorded as `queue_global_priority: "unavailable"` in
+   `HostInfo.timing`; the deadline-protection measurement needs a privileged run or the AMD rig.
+4. **End-to-end verified timing: PASS.** The Bevy PBR scene presented under `run_buffered` on
+   the EXT present-timing backend; sustained-run stats in
+   `crates/vse-bevy/examples/01_bevy_ring_demo.rs` (header).
+
+Khronos validation layers are not installed on the dev laptop, so that check has not run yet.
+
 ---
 
 ## 9. Open questions / risks
