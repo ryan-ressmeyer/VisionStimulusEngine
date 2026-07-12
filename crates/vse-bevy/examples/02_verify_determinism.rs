@@ -52,7 +52,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pending: Rc<RefCell<BTreeMap<u64, vulkano::buffer::Subbuffer<[u8]>>>> =
         Rc::new(RefCell::new(BTreeMap::new()));
     let hashes: Rc<RefCell<BTreeMap<u64, u64>>> = Rc::new(RefCell::new(BTreeMap::new()));
-    let (pend, hsh) = (pending.clone(), hashes.clone());
+    let captured: Rc<RefCell<Option<Vec<u8>>>> = Rc::new(RefCell::new(None));
+    let (pend, hsh, cap) = (pending.clone(), hashes.clone(), captured.clone());
     let mut attached = false;
 
     context.run_buffered::<u64, _>(BufferedConfig::default(), move |event, vse| {
@@ -106,6 +107,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut hasher = DefaultHasher::new();
                     content.hash(&mut hasher);
                     hsh.borrow_mut().insert(payload, hasher.finish());
+                    if cap.borrow().is_none() {
+                        *cap.borrow_mut() = Some(content.to_vec());
+                    }
                 }
             }
             _ => {}
@@ -117,6 +121,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (frame, hash) in hashes.iter() {
         println!("hash frame {frame}: {hash:#018x}");
     }
+    // Distinct animation frames must hash differently — identical hashes here
+    // would mean the ring is carrying a stale/blank image, not the scene.
+    let distinct: std::collections::BTreeSet<_> = hashes.values().collect();
+    if hashes.len() > 1 && distinct.len() == 1 {
+        println!("FAIL x  all sampled frames hash identically — no animated content in the ring");
+        return Ok(());
+    }
+    // Visual evidence: dump the first captured frame as PPM (view with any image viewer).
+    if let Some(buffer) = captured.borrow().as_ref() {
+        let path = "bevy_ring_frame.ppm";
+        write_ppm(path, extent, buffer)?;
+        println!("frame image written: {path}");
+    }
     if hashes.len() == HASH_FRAMES.len() {
         println!("OK  captured {} frame hashes — compare across two runs", hashes.len());
     } else {
@@ -125,6 +142,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hashes.len(),
             HASH_FRAMES.len()
         );
+    }
+    Ok(())
+}
+
+/// Minimal PPM (P6) writer: RGBA8 bytes → RGB, no dependencies.
+fn write_ppm(path: &str, extent: [u32; 2], rgba: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    write!(f, "P6\n{} {}\n255\n", extent[0], extent[1])?;
+    for px in rgba.chunks_exact(4) {
+        f.write_all(&px[..3])?;
     }
     Ok(())
 }

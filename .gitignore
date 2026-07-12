@@ -25,3 +25,4 @@ stimulus_*.png
 
 # Git worktrees
 .worktrees/
+bevy_ring_frame.ppm
