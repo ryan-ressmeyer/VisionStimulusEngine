@@ -273,6 +273,10 @@ impl BevyProducer {
         }
 
         self.machine.mark_ready(slot)?;
+        // Hand-off: the slot now belongs to the consumer until it comes back
+        // over the release channel (Ready → Consuming on this side's mirror).
+        let handed = self.machine.take_ready().expect("slot marked ready above");
+        debug_assert_eq!(handed, slot, "producer hand-off must be FIFO");
         Ok(slot)
     }
 }

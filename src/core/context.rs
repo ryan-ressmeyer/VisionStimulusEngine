@@ -2356,12 +2356,12 @@ impl<'a> RenderContext<'a> {
         if let Some(src) = self.state.external_source.as_mut() {
             src.pump_releases();
         }
-        let ext_frame = self
+        let ext_frames = self
             .state
             .external_source
             .as_mut()
-            .and_then(|src| src.take_frame());
-        let underlay = ext_frame.as_ref().map(|f| crate::drawing::renderer::ExternalUnderlay {
+            .and_then(|src| src.take_frames());
+        let underlay = ext_frames.as_ref().map(|f| crate::drawing::renderer::ExternalUnderlay {
             image: f.image.clone(),
             readback: self.state.external_readback.take(),
         });
@@ -2393,7 +2393,10 @@ impl<'a> RenderContext<'a> {
 
         // --- Submit + raw present with the timing pNext chain ---
         let queue = self.state.queue.clone();
-        let external_waits: Vec<_> = ext_frame.iter().filter_map(|f| f.wait.clone()).collect();
+        let external_waits: Vec<_> = ext_frames
+            .as_ref()
+            .map(|f| f.waits.clone())
+            .unwrap_or_default();
         let outcome = self
             .state
             .present_engine
@@ -2412,10 +2415,10 @@ impl<'a> RenderContext<'a> {
         if outcome.suboptimal {
             self.state.swapchain.mark_needs_recreation();
         }
-        // Release back-edge: the slot returns to the producer once this submit's
+        // Release back-edge: the slots return to the producer once this submit's
         // fence signals (pumped at the top of the next flip).
-        if let (Some(f), Some(src)) = (ext_frame, self.state.external_source.as_mut()) {
-            src.on_consumed(f.slot, outcome.fence.clone());
+        if let (Some(f), Some(src)) = (ext_frames, self.state.external_source.as_mut()) {
+            src.on_consumed(&f.slots, outcome.fence.clone());
         }
 
         // Synchronous flip(): block on the render fence (GPU render done) before sampling — cheap,
@@ -2725,12 +2728,12 @@ impl<'a> RenderContext<'a> {
         if let Some(src) = self.state.external_source.as_mut() {
             src.pump_releases();
         }
-        let ext_frame = self
+        let ext_frames = self
             .state
             .external_source
             .as_mut()
-            .and_then(|src| src.take_frame());
-        let underlay = ext_frame.as_ref().map(|f| crate::drawing::renderer::ExternalUnderlay {
+            .and_then(|src| src.take_frames());
+        let underlay = ext_frames.as_ref().map(|f| crate::drawing::renderer::ExternalUnderlay {
             image: f.image.clone(),
             readback: self.state.external_readback.take(),
         });
@@ -2751,7 +2754,10 @@ impl<'a> RenderContext<'a> {
 
         // --- Submit + raw present (non-blocking) ---
         let queue = self.state.queue.clone();
-        let external_waits: Vec<_> = ext_frame.iter().filter_map(|f| f.wait.clone()).collect();
+        let external_waits: Vec<_> = ext_frames
+            .as_ref()
+            .map(|f| f.waits.clone())
+            .unwrap_or_default();
         let outcome = self
             .state
             .present_engine
@@ -2770,10 +2776,10 @@ impl<'a> RenderContext<'a> {
         if outcome.suboptimal {
             self.state.swapchain.mark_needs_recreation();
         }
-        // Release back-edge: the slot returns to the producer once this submit's
+        // Release back-edge: the slots return to the producer once this submit's
         // fence signals (pumped at the top of the next flip).
-        if let (Some(f), Some(src)) = (&ext_frame, self.state.external_source.as_mut()) {
-            src.on_consumed(f.slot, outcome.fence.clone());
+        if let (Some(f), Some(src)) = (&ext_frames, self.state.external_source.as_mut()) {
+            src.on_consumed(&f.slots, outcome.fence.clone());
         }
 
         let estimated_present = self.state.clock.now();

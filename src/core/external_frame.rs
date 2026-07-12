@@ -81,13 +81,21 @@ fn vk_format(format: RingFormat) -> vulkano::format::Format {
     }
 }
 
-/// A ready external frame handed to the flip seam for consumption this frame.
-pub(crate) struct ConsumableFrame {
+/// The external frame(s) consumed by one flip.
+///
+/// Normally one slot; more when previous flips were skipped (swapchain
+/// recreation) and ready frames accumulated. Only the **newest** image is
+/// shown, but every slot's semaphore is waited by the consuming submit — a
+/// signaled binary semaphore must be waited before its slot can be reused, so
+/// skipped frames' signals ride along on the next successful submit.
+pub(crate) struct ConsumableFrames {
+    /// Newest ready image (the one to display).
     pub image: Arc<Image>,
-    /// Semaphore VSE's submit must wait on before sampling `image` (`None`
-    /// under [`SyncKind::CpuBlocking`]), with the timeline value if any.
-    pub wait: Option<(Arc<Semaphore>, Option<u64>)>,
-    pub slot: SlotIndex,
+    /// All semaphores the consuming submit must wait on (empty under
+    /// [`SyncKind::CpuBlocking`]), with timeline values if any.
+    pub waits: Vec<(Arc<Semaphore>, Option<u64>)>,
+    /// Every slot consumed by this flip, released together on its fence.
+    pub slots: Vec<SlotIndex>,
 }
 
 /// The imported external image ring: VSE-side consumer state.
@@ -330,26 +338,31 @@ impl ExternalFrameRing {
         Ok(())
     }
 
-    /// Take the frame to consume this flip, if any.
-    pub(crate) fn take_frame(&mut self) -> Option<ConsumableFrame> {
-        let slot = self.machine.take_ready()?;
-        let wait = match self.sync {
-            SyncKind::BinaryPerSlot => Some((self.ready_sems[slot.0].clone(), None)),
-            SyncKind::CpuBlocking => None,
-            SyncKind::Timeline => unreachable!("rejected at import"),
-        };
-        Some(ConsumableFrame {
-            image: self.images[slot.0].clone(),
-            wait,
-            slot,
+    /// Take everything ready for this flip (see [`ConsumableFrames`]).
+    pub(crate) fn take_frames(&mut self) -> Option<ConsumableFrames> {
+        let mut slots = Vec::new();
+        let mut waits = Vec::new();
+        while let Some(slot) = self.machine.take_ready() {
+            if self.sync == SyncKind::BinaryPerSlot {
+                waits.push((self.ready_sems[slot.0].clone(), None));
+            }
+            slots.push(slot);
+        }
+        let newest = *slots.last()?;
+        Some(ConsumableFrames {
+            image: self.images[newest.0].clone(),
+            waits,
+            slots,
         })
     }
 
-    /// The flip seam consumed `slot` in a submit guarded by `fence`; when that
-    /// fence signals, the blit has executed (and with it the semaphore wait),
-    /// so the slot becomes re-signalable and is released to the producer.
-    pub(crate) fn on_consumed(&mut self, slot: SlotIndex, fence: Arc<Fence>) {
-        self.in_flight.push_back((fence, slot));
+    /// The flip seam consumed `slots` in a submit guarded by `fence`; when
+    /// that fence signals, the blit has executed (and with it every semaphore
+    /// wait), so the slots become re-signalable and are released.
+    pub(crate) fn on_consumed(&mut self, slots: &[SlotIndex], fence: Arc<Fence>) {
+        for slot in slots {
+            self.in_flight.push_back((fence.clone(), *slot));
+        }
     }
 
     /// Poll in-flight fences and send completed slots back to the producer.
