@@ -9,7 +9,30 @@ authors = ["Ryan A. Ressmeyer"]
 [dependencies]
 vse-external-frame = { path = "../vse-external-frame" }
 thiserror = "1.0"
-# bevy / wgpu / ash are added at the spike step with exact pins.
+tracing = "0.1"
+
+# Headless 3D producer. Trimmed features: no winit, no audio, no UI, no image
+# formats beyond png (PBR demo scene is procedural).
+bevy = { version = "=0.19.0", default-features = false, features = [
+    "std",
+    "bevy_asset",
+    "bevy_color",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_render",
+    "bevy_window",
+    "bevy_log",
+    "multi_threaded",
+] }
+
+# Must match the wgpu Bevy 0.19 pins (same version ⇒ same crate instance ⇒
+# type identity with bevy's wgpu objects). ash matches wgpu-hal 29's ash
+# (and the VSE core's), so raw Vulkan handles interchange directly.
+wgpu = { version = "=29.0.4", default-features = false, features = ["vulkan"] }
+ash = "0.38"
 
 [dev-dependencies]
 vision_stimulus_engine = { path = "../.." }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Same version as the core crate — examples create readback buffers on VSE's device.
+vulkano = "0.35"

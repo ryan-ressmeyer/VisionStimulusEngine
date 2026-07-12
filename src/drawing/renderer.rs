@@ -231,6 +231,12 @@ impl Renderer {
         self.draw_commands.push(command);
     }
 
+    /// The renderer's device memory allocator (for callers that need to create
+    /// buffers on VSE's device, e.g. external-frame readbacks).
+    pub(crate) fn memory_allocator(&self) -> Arc<StandardMemoryAllocator> {
+        self.memory_allocator.clone()
+    }
+
     /// Render all queued commands into a command buffer.
     pub fn render(
         &mut self,

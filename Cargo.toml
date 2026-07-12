@@ -127,3 +127,12 @@ opt-level = 1
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# Fast-iteration profile: release-grade optimization without the fat-LTO link
+# (which re-runs a single-threaded cross-crate pass over all of Bevy on every
+# example relink). Use for development (`cargo run --profile demo ...`);
+# final timing-verification runs still use the real release profile.
+[profile.demo]
+inherits = "release"
+lto = false
+codegen-units = 16

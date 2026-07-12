@@ -3062,6 +3062,14 @@ impl<'a> RenderContext<'a> {
         self.state.external_readback = Some(buffer);
     }
 
+    /// VSE's device memory allocator, for creating buffers on VSE's device
+    /// (e.g. an external-frame readback target).
+    pub fn memory_allocator(
+        &self,
+    ) -> std::sync::Arc<vulkano::memory::allocator::StandardMemoryAllocator> {
+        self.state.renderer.memory_allocator()
+    }
+
     pub fn frame_number(&self) -> u64 {
         self.state.frame_number
     }
