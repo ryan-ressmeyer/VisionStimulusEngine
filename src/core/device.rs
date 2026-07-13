@@ -156,6 +156,9 @@ impl DeviceSelector {
             khr_display: true,
             ext_acquire_drm_display: true,
             ext_acquire_xlib_display: true,
+            // Declared dependency of the present-timing device-extension family
+            // (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
+            khr_get_surface_capabilities2: true,
             ..InstanceExtensions::empty()
         };
 
@@ -210,8 +213,13 @@ impl DeviceSelector {
         info!("Vulkan library loaded successfully");
 
         // Get required extensions for windowing
-        let required_extensions = Surface::required_extensions(window.as_ref())
+        let mut required_extensions = Surface::required_extensions(window.as_ref())
             .map_err(|e| DeviceError::InstanceCreationFailed(e.to_string()))?;
+        // Declared dependency of the present-timing device-extension family
+        // (VK_EXT_present_timing / VK_KHR_present_id2 / VK_KHR_present_wait2);
+        // VUID-vkCreateDevice-ppEnabledExtensionNames-01387 fires without it.
+        required_extensions.khr_get_surface_capabilities2 =
+            library.supported_extensions().khr_get_surface_capabilities2;
 
         let instance = Instance::new(
             library,

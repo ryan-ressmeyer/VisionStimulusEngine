@@ -662,6 +662,10 @@ pub unsafe fn create_device_with_present_timing(
     };
     let advertise_dynamic_rendering = has_ext(b"VK_KHR_dynamic_rendering\0");
     let advertise_calibrated = has_ext(b"VK_EXT_calibrated_timestamps\0");
+    // The KHR promotion is a declared dependency of VK_EXT_present_timing
+    // (VUID-vkCreateDevice-ppEnabledExtensionNames-01387), so it must be in the
+    // device list whenever present timing is — not just when the clock bridge is.
+    let advertise_calibrated_khr = has_ext(b"VK_KHR_calibrated_timestamps\0");
     // External-renderer handoff: importing another device's image ring + semaphores.
     // The base VK_KHR_external_memory / VK_KHR_external_semaphore are core since 1.1.
     let advertise_external_handles =
@@ -766,6 +770,9 @@ pub unsafe fn create_device_with_present_timing(
     if advertise_calibrated {
         ext_names.push(b"VK_EXT_calibrated_timestamps\0".as_ptr() as *const c_char);
     }
+    if advertise_calibrated_khr {
+        ext_names.push(b"VK_KHR_calibrated_timestamps\0".as_ptr() as *const c_char);
+    }
     if advertise_external_handles {
         ext_names.push(b"VK_KHR_external_memory_fd\0".as_ptr() as *const c_char);
         ext_names.push(b"VK_KHR_external_semaphore_fd\0".as_ptr() as *const c_char);
@@ -831,6 +838,7 @@ pub unsafe fn create_device_with_present_timing(
             khr_swapchain: true,
             khr_dynamic_rendering: advertise_dynamic_rendering,
             ext_calibrated_timestamps: advertise_calibrated,
+            khr_calibrated_timestamps: advertise_calibrated_khr,
             // Mirrored so vulkano's validated DeviceMemory::import / Semaphore::import_fd
             // accept the external-frame ring (crate::core::external_frame).
             khr_external_memory_fd: advertise_external_handles,
