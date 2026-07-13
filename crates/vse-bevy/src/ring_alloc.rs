@@ -6,13 +6,14 @@
 //! `texture_from_raw` + `create_texture_from_hal`. Legal: wgpu-hal 29 enables
 //! `VK_KHR_external_memory_fd` on its device whenever the driver supports it.
 //!
-//! Semaphore export is the one off-spec corner: wgpu-hal 29 does **not**
-//! enable `VK_KHR_external_semaphore_fd` (semaphore *creation* with an export
-//! chain is core 1.1; only the fd-export entry point is extension-gated).
-//! Mesa resolves and honors `vkGetSemaphoreFdKHR` regardless; we probe the
-//! entry point and exportability explicitly and fall back to
-//! [`SyncKind::CpuBlocking`] loudly if either check fails — matching VSE's
-//! never-assume-an-advertised-feature posture.
+//! Semaphore export: wgpu-hal 29 does **not** enable
+//! `VK_KHR_external_semaphore_fd` itself (semaphore *creation* with an export
+//! chain is core 1.1; only the fd-export entry point is extension-gated), so
+//! `BevyProducer::new` appends it at device creation via Bevy's
+//! `raw_vulkan_init` hook (see docs/upstream-watch.md item 2 for the upstream
+//! fix). We still probe the entry point and exportability explicitly and fall
+//! back to [`SyncKind::CpuBlocking`] loudly if either check fails — matching
+//! VSE's never-assume-an-advertised-feature posture.
 
 use std::os::fd::{FromRawFd, OwnedFd};
 
@@ -260,6 +261,15 @@ pub(crate) fn allocate_ring(
 /// # Safety
 /// `hal` must be a live wgpu-hal Vulkan device guard.
 unsafe fn probe_semaphore_export(hal: &wgpu::hal::vulkan::Device) -> SyncKind {
+    // Escape hatch for A/B timing comparisons and driver trouble: the two sync
+    // modes are pixel-identical but pace the present loop differently under a
+    // windowed compositor (CpuBlocking's per-frame stall reduces presents in
+    // flight; see 01_bevy_ring_demo header).
+    if std::env::var_os("VSE_BEVY_FORCE_CPU_BLOCKING").is_some() {
+        warn!("VSE_BEVY_FORCE_CPU_BLOCKING set — skipping semaphore export probe");
+        return SyncKind::CpuBlocking;
+    }
+
     let instance = hal.shared_instance().raw_instance();
     let phys = hal.raw_physical_device();
 
@@ -280,20 +290,23 @@ unsafe fn probe_semaphore_export(hal: &wgpu::hal::vulkan::Device) -> SyncKind {
     }
 
     // 2. The entry point actually resolves on wgpu's device. wgpu-hal 29 does
-    //    not enable VK_KHR_external_semaphore_fd, so per spec this may return
-    //    NULL; Mesa resolves it regardless. Record which world we live in.
+    //    not enable VK_KHR_external_semaphore_fd itself; BevyProducer::new
+    //    appends it via the raw_vulkan_init device callback. If that hook ever
+    //    stops running (bevy feature regression, non-raw init path), the
+    //    loader returns NULL here and we fall back rather than assume.
     let name = c"vkGetSemaphoreFdKHR";
     let fp = instance.get_device_proc_addr(hal.raw_device().handle(), name.as_ptr());
     if fp.is_none() {
         warn!(
-            "vkGetSemaphoreFdKHR not resolvable on wgpu's device (extension not \
-             enabled by wgpu 29) — falling back to CpuBlocking frame sync"
+            "vkGetSemaphoreFdKHR not resolvable on wgpu's device \
+             (VK_KHR_external_semaphore_fd not enabled — raw_vulkan_init hook \
+             did not run?) — falling back to CpuBlocking frame sync"
         );
         return SyncKind::CpuBlocking;
     }
     tracing::info!(
         "semaphore export probe: OPAQUE_FD exportable + vkGetSemaphoreFdKHR resolved \
-         (note: wgpu 29 does not enable VK_KHR_external_semaphore_fd; driver honors it)"
+         (VK_KHR_external_semaphore_fd enabled via raw_vulkan_init) — BinaryPerSlot"
     );
     SyncKind::BinaryPerSlot
 }

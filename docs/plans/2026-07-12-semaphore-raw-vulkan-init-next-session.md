@@ -1,5 +1,16 @@
 # Next session: GPU semaphores for the external-frame ring via Bevy `raw_vulkan_init`
 
+> **OUTCOME (2026-07-12, later session): DONE.** Probe selects `BinaryPerSlot`; determinism
+> PASS (hashes also identical across sync modes); no new validation errors; the three
+> `vkCreateDevice` 01387 errors fixed (step 5 — note the actual missing deps were
+> `VK_KHR_get_surface_capabilities2` on the *instance* and `VK_KHR_calibrated_timestamps`
+> (KHR, not EXT) on the device). Timing caveat: the 3–15 missed/999 CpuBlocking baseline did
+> not reproduce even with CpuBlocking forced (185–194 same binary, later desktop session) —
+> windowed miss counts are environment-dominated. BinaryPerSlot matches the no-producer
+> baseline (~222–256 vs 241), so the handoff adds no timing cost.
+> `VSE_BEVY_FORCE_CPU_BLOCKING=1` added as an escape hatch. See
+> `crates/vse-bevy/examples/01_bevy_ring_demo.rs` header and landscape doc §8.
+
 ## Session goal
 
 Replace the `SyncKind::CpuBlocking` fallback in the Bevy→VSE external-frame handoff with the

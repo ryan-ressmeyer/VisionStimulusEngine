@@ -23,6 +23,10 @@ bevy = { version = "=0.19.0", default-features = false, features = [
     "bevy_window",
     "bevy_log",
     "multi_threaded",
+    # Device-creation hook: lets us enable VK_KHR_external_semaphore_fd on
+    # wgpu's device (wgpu 29 never requests it — see docs/upstream-watch.md
+    # item 2), which the GPU-semaphore frame-sync path needs.
+    "raw_vulkan_init",
 ] }
 
 # Must match the wgpu Bevy 0.19 pins (same version ⇒ same crate instance ⇒

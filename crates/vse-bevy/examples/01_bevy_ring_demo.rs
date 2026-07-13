@@ -17,11 +17,16 @@
 //! `CARGO_INCREMENTAL=0 cargo run -p vse-bevy --release --example 01_bevy_ring_demo [frames]`
 //!
 //! Measured 2026-07-12 (Intel MTL/ANV/Mesa 26.1, windowed Wayland 60 Hz, release profile,
-//! CpuBlocking sync): 999/1000 presented (1 startup skip), 999/999 on_target, mean
-//! inter-present 16.64 ms, 3–15 missed frames per 999 across runs. The no-producer baseline
-//! (examples/12) missed 151–253/999 under identical conditions — the external-frame handoff
-//! is not the limiting factor; windowed-compositor jitter is. Zero-missed runs are a
-//! direct-display measurement (out of scope for the windowed demo).
+//! BinaryPerSlot sync via the raw_vulkan_init shim): 999/1000 presented (1 startup skip),
+//! 999/999 on_target, 222–256 missed per 999 — statistically identical to the same-session
+//! no-producer baseline (examples/12: 241/999), so the handoff adds no measurable timing
+//! cost. Forcing CpuBlocking (`VSE_BEVY_FORCE_CPU_BLOCKING=1`) measured 185–194 in the same
+//! session: the per-frame stall paces the windowed loop slightly better by keeping fewer
+//! presents in flight. Caution comparing across desktop sessions: an earlier same-day
+//! CpuBlocking measurement gave 3–15/999 — windowed miss counts swing >10× with compositor/
+//! power state and are not a stimulus-quality metric. Zero-missed runs are a direct-display
+//! measurement (out of scope for the windowed demo). Both sync modes are pixel-identical
+//! (02_verify_determinism hashes match across modes).
 
 use std::cell::RefCell;
 use std::rc::Rc;

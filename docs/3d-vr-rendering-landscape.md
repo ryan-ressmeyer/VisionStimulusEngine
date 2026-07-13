@@ -796,13 +796,19 @@ pass slots in behind the same `ExternalFrameRing` API):
    runs (and pairwise distinct — live animation), hashed VSE-side from the *imported* image in
    the same command buffer that consumes it, so the hash covers Bevy's render + export/import +
    sync. `crates/vse-bevy/examples/02_verify_determinism.rs`.
-2. **The handoff: PASS with one conformance finding.** Image memory export/import works as
-   designed (wgpu-hal 29 enables `VK_KHR_external_memory_fd`). **Semaphore-fd export does not
-   work on wgpu 29**: wgpu-hal never enables `VK_KHR_external_semaphore_fd`, and the Vulkan
-   loader filters `vkGetSemaphoreFdKHR` by enablement (probed `NULL`). The seam fell back to
-   `CpuBlocking` (producer stalls until its GPU work completes; correct but unpipelined).
-   Fix candidates: Bevy 0.19's `raw_vulkan_init` feature (request the extension at device
-   creation) or wgpu 30. The `SyncKind` wire type keeps this a drop-in change.
+2. **The handoff: PASS.** Image memory export/import works as designed (wgpu-hal 29 enables
+   `VK_KHR_external_memory_fd`). **Semaphore-fd export does not work on stock wgpu 29**
+   (wgpu-hal never enables `VK_KHR_external_semaphore_fd`; the loader filters
+   `vkGetSemaphoreFdKHR` by enablement, probed `NULL`), which initially forced the
+   `CpuBlocking` fallback. **Resolved same day** via Bevy 0.19's `raw_vulkan_init` device
+   callback appending the extension at `vkCreateDevice` (`BevyProducer::new`); the probe now
+   selects `BinaryPerSlot` and the GPU-semaphore path carries every frame. Pixel-identical to
+   CpuBlocking (determinism hashes match across sync modes); no semaphore lifecycle validation
+   errors over a full run. Windowed missed-frame counts match the no-producer baseline
+   (~222–256 vs 241 per 999 same-session), i.e. the handoff adds no measurable timing cost;
+   `VSE_BEVY_FORCE_CPU_BLOCKING=1` remains as an escape hatch (its stall paces a windowed
+   compositor slightly better: 185–194 same-session). `docs/upstream-watch.md` item 2 tracks
+   deleting the shim when wgpu enables the extension itself.
 3. **Queue QoS: fallback path exercised and recorded.** Unprivileged ANV on MTL advertises only
    `[LOW, MEDIUM]` global priorities — Mesa adds HIGH only with `CAP_SYS_NICE` (the reason
    SteamVR documents `setcap`). Outcome recorded as `queue_global_priority: "unavailable"` in
@@ -811,7 +817,13 @@ pass slots in behind the same `ExternalFrameRing` API):
    the EXT present-timing backend; sustained-run stats in
    `crates/vse-bevy/examples/01_bevy_ring_demo.rs` (header).
 
-Khronos validation layers are not installed on the dev laptop, so that check has not run yet.
+Validation-layer runs (added later on 2026-07-12): no external-memory or semaphore lifecycle
+errors on the seam. Three pre-existing `VUID-vkCreateDevice-ppEnabledExtensionNames-01387`
+errors in the core present-timing device creation (missing `VK_KHR_get_surface_capabilities2`
+on the instance and `VK_KHR_calibrated_timestamps` on the device) were fixed the same day;
+remaining baseline: `VUID-StandaloneSpirv-None-10684` ×10 (shader layout pedantry, untriaged),
+`VUID-vkSetSwapchainPresentTimingQueueSizeEXT-swapchain-12229` ×2 (B3 quirk),
+`VUID-vkAcquireNextImageKHR-swapchain-parameter` ×1 (swapchain recreation edge).
 
 ---
 
