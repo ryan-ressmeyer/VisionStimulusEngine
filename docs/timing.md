@@ -178,6 +178,6 @@ VisionStimulusEngine's use of `VK_EXT_present_timing` replaces these CPU-intensi
 
 * **Kleiner M, et al. (2007).** *What's new in Psychtoolbox-3?* (Describes the beam-position method).
 * **Brainard, D. H. (1997).** *The Psychophysics Toolbox.* Spatial Vision.
-* **Peirce, J. W. (2007).** *PsychoPy: Psychophysics software in Python.* J. Neurosci. Methods. (See `docs/refs/Peirce2006.pdf`).
+* **Peirce, J. W. (2007).** *PsychoPy: Psychophysics software in Python.* J. Neurosci. Methods.
 References:
 

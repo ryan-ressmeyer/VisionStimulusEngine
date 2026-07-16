@@ -111,7 +111,7 @@ Three distinct error terms, smallest to largest in typical impact:
    which the API only *estimates* via `IMAGE_FIRST_PIXEL_VISIBLE`. This term dominates the
    others and **cannot be measured by software** — it requires a **photodiode**. For any
    experiment where onset timing to the eye matters, a photodiode on a corner patch, logged on
-   the acquisition clock, remains the ground truth (as in Psychtoolbox; see `docs/refs/`).
+   the acquisition clock, remains the ground truth, matching the Psychtoolbox timing model.
 
 **Takeaway:** the software calibration (terms 1–2) gets stimulus onset onto the CPU/ephys
 timeline to well within a frame — good enough that the display panel (term 3), not the clock
