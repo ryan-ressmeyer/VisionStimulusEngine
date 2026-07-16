@@ -8,7 +8,6 @@
 //! Timing-only rows arriving before the first payload are buffered in
 //! memory and flushed once the schema is known.
 
-use std::io::Write;
 use std::path::PathBuf;
 
 use crate::data::messages::{AnnotationMessage, EventMessage, FrameMessage};
@@ -36,9 +35,9 @@ pub struct CsvDataWriter {
     /// CSV column names derived from the first user payload (excluding timing cols).
     user_columns: Option<Vec<String>>,
     /// Writer for frames.csv, opened lazily on first flush/write.
-    frames_file: Option<std::fs::File>,
+    frames_file: Option<csv::Writer<std::fs::File>>,
     /// Writer for events.csv, opened lazily on first event.
-    events_file: Option<std::fs::File>,
+    events_file: Option<csv::Writer<std::fs::File>>,
     events_header_written: bool,
 }
 
@@ -74,56 +73,58 @@ impl CsvDataWriter {
         Ok(())
     }
 
-    fn frames_file(&mut self) -> Result<&mut std::fs::File, DataError> {
+    fn frames_file(&mut self) -> Result<&mut csv::Writer<std::fs::File>, DataError> {
         if self.frames_file.is_none() {
             self.ensure_output_dir()?;
             let path = self.output_dir.join("frames.csv");
-            self.frames_file = Some(std::fs::File::create(path)?);
+            let file = std::fs::File::create(path)?;
+            self.frames_file = Some(csv::Writer::from_writer(file));
         }
         Ok(self.frames_file.as_mut().unwrap())
     }
 
-    fn events_file(&mut self) -> Result<&mut std::fs::File, DataError> {
+    fn events_file(&mut self) -> Result<&mut csv::Writer<std::fs::File>, DataError> {
         if self.events_file.is_none() {
             self.ensure_output_dir()?;
             let path = self.output_dir.join("events.csv");
-            self.events_file = Some(std::fs::File::create(path)?);
+            let file = std::fs::File::create(path)?;
+            self.events_file = Some(csv::Writer::from_writer(file));
         }
         Ok(self.events_file.as_mut().unwrap())
     }
 
     /// Write the frames.csv header once the user column schema is known.
     fn write_frames_header(&mut self, user_cols: &[String]) -> Result<(), DataError> {
-        let file = self.frames_file()?;
         let header = TIMING_COLUMNS
             .iter()
-            .map(|s| *s)
-            .chain(user_cols.iter().map(|s| s.as_str()))
-            .collect::<Vec<_>>()
-            .join(",");
-        writeln!(file, "{}", header)?;
+            .map(|s| s.to_string())
+            .chain(user_cols.iter().cloned())
+            .collect::<Vec<_>>();
+        self.frames_file()?
+            .write_record(header)
+            .map_err(|e| DataError::Backend(e.to_string()))?;
         Ok(())
     }
 
-    /// Serialize a FlipInfo into timing CSV columns (without skipped).
-    fn flip_to_csv(flip: &FlipInfo) -> String {
+    /// Serialize a FlipInfo into timing CSV fields.
+    fn flip_to_fields(flip: &FlipInfo) -> Vec<String> {
         // Empty cell for an unscheduled (immediate) present.
         let target = flip
             .target_time
             .map(|t| t.as_micros().to_string())
             .unwrap_or_default();
-        format!(
-            "{},{},{},{},{},{},{},{},{}",
-            flip.frame_number,
-            flip.present_time.as_micros(),
-            flip.submit_time.as_micros(),
-            flip.timing_source,
-            flip.present_id,
+        vec![
+            flip.frame_number.to_string(),
+            flip.present_time.as_micros().to_string(),
+            flip.submit_time.as_micros().to_string(),
+            flip.timing_source.to_string(),
+            flip.present_id.to_string(),
             target,
-            flip.on_target,
-            flip.missed,
-            flip.missed_count,
-        )
+            flip.on_target.to_string(),
+            flip.missed.to_string(),
+            flip.missed_count.to_string(),
+            flip.skipped.to_string(),
+        ]
     }
 
     /// Write a timing-only row (empty user columns).
@@ -132,10 +133,11 @@ impl CsvDataWriter {
         flip: &FlipInfo,
         n_user_cols: usize,
     ) -> Result<(), DataError> {
-        let file = self.frames_file()?;
-        let timing = Self::flip_to_csv(flip);
-        let empties = ",".repeat(n_user_cols);
-        writeln!(file, "{},{}{}", timing, flip.skipped, empties)?;
+        let mut row = Self::flip_to_fields(flip);
+        row.extend(std::iter::repeat(String::new()).take(n_user_cols));
+        self.frames_file()?
+            .write_record(row)
+            .map_err(|e| DataError::Backend(e.to_string()))?;
         Ok(())
     }
 
@@ -151,8 +153,9 @@ impl CsvDataWriter {
 
     fn ensure_events_header(&mut self) -> Result<(), DataError> {
         if !self.events_header_written {
-            let file = self.events_file()?;
-            writeln!(file, "timestamp_us,stream,payload")?;
+            self.events_file()?
+                .write_record(["timestamp_us", "stream", "payload"])
+                .map_err(|e| DataError::Backend(e.to_string()))?;
             self.events_header_written = true;
         }
         Ok(())
@@ -187,26 +190,18 @@ impl DataWriter for CsvDataWriter {
                 }
 
                 let user_cols: Vec<String> = self.user_columns.as_ref().unwrap().clone();
-                let timing = Self::flip_to_csv(&msg.flip);
-                let file = self.frames_file()?;
-                let user_vals: Vec<String> = user_cols
-                    .iter()
-                    .map(|col| {
-                        obj.get(col)
-                            .map(|v| match v {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            })
-                            .unwrap_or_default()
-                    })
-                    .collect();
-                writeln!(
-                    file,
-                    "{},{},{}",
-                    timing,
-                    msg.flip.skipped,
-                    user_vals.join(",")
-                )?;
+                let mut row = Self::flip_to_fields(&msg.flip);
+                row.extend(user_cols.iter().map(|col| {
+                    obj.get(col)
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_default()
+                }));
+                self.frames_file()?
+                    .write_record(row)
+                    .map_err(|e| DataError::Backend(e.to_string()))?;
             }
         }
         Ok(())
@@ -214,28 +209,22 @@ impl DataWriter for CsvDataWriter {
 
     fn write_annotation(&mut self, msg: AnnotationMessage) -> Result<(), DataError> {
         self.ensure_events_header()?;
-        let payload_str = String::from_utf8_lossy(&msg.payload);
-        let file = self.events_file()?;
-        writeln!(
-            file,
-            "{},{},{}",
-            msg.timestamp.as_micros(),
-            msg.stream,
-            payload_str
-        )?;
+        let payload_str = String::from_utf8_lossy(&msg.payload).into_owned();
+        self.events_file()?
+            .write_record([
+                msg.timestamp.as_micros().to_string(),
+                msg.stream,
+                payload_str,
+            ])
+            .map_err(|e| DataError::Backend(e.to_string()))?;
         Ok(())
     }
 
     fn write_event(&mut self, msg: EventMessage) -> Result<(), DataError> {
         self.ensure_events_header()?;
-        let file = self.events_file()?;
-        writeln!(
-            file,
-            "{},{},{}",
-            msg.timestamp.as_micros(),
-            msg.name,
-            msg.value
-        )?;
+        self.events_file()?
+            .write_record([msg.timestamp.as_micros().to_string(), msg.name, msg.value])
+            .map_err(|e| DataError::Backend(e.to_string()))?;
         Ok(())
     }
 
@@ -247,10 +236,10 @@ impl DataWriter for CsvDataWriter {
             self.flush_pending_timing()?;
         }
         if let Some(f) = &mut self.frames_file {
-            f.flush()?;
+            f.flush().map_err(|e| DataError::Backend(e.to_string()))?;
         }
         if let Some(f) = &mut self.events_file {
-            f.flush()?;
+            f.flush().map_err(|e| DataError::Backend(e.to_string()))?;
         }
         Ok(())
     }
@@ -259,7 +248,6 @@ impl DataWriter for CsvDataWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::messages::*;
     use crate::data::writer::DataWriter;
     use crate::timing::{FlipInfo, Timestamp, TimingSource};
 
@@ -284,6 +272,87 @@ mod tests {
             "orientation": orientation
         }))
         .unwrap()
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("vse_{name}_{}_{}", std::process::id(), nonce))
+    }
+
+    #[test]
+    fn test_csv_frame_payload_escapes_commas_quotes_and_newlines() {
+        let dir = unique_temp_dir("csv_frame_escaping");
+        let mut w = CsvDataWriter::new(&dir);
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "note": "comma, quote \" and newline\ninside",
+            "label": "plain"
+        }))
+        .unwrap();
+
+        w.write_frame(FrameMessage {
+            flip: make_flip(0),
+            payload: Some(payload),
+            schema_name: "EscapedFrame",
+        })
+        .unwrap();
+        w.flush().unwrap();
+
+        let mut reader = csv::Reader::from_path(dir.join("frames.csv")).unwrap();
+        let headers = reader.headers().unwrap().clone();
+        let row = reader.records().next().unwrap().unwrap();
+        let note_idx = headers.iter().position(|h| h == "note").unwrap();
+        let label_idx = headers.iter().position(|h| h == "label").unwrap();
+        assert_eq!(
+            row.get(note_idx),
+            Some("comma, quote \" and newline\ninside")
+        );
+        assert_eq!(row.get(label_idx), Some("plain"));
+        assert!(reader.records().next().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_csv_annotations_and_events_escape_commas_quotes_and_newlines() {
+        let dir = unique_temp_dir("csv_events_escaping");
+        let mut w = CsvDataWriter::new(&dir);
+        let annotation_payload = serde_json::to_vec(&serde_json::json!({
+            "note": "annotation, quote \" and newline\ninside"
+        }))
+        .unwrap();
+
+        w.write_annotation(AnnotationMessage {
+            stream: "trial, \"one\"\nline".to_string(),
+            timestamp: Timestamp::from_micros(1_000),
+            payload: annotation_payload,
+        })
+        .unwrap();
+        w.write_event(EventMessage {
+            name: "response, \"left\"\nline".to_string(),
+            timestamp: Timestamp::from_micros(2_000),
+            value: "value, quote \" and newline\ninside".to_string(),
+        })
+        .unwrap();
+        w.flush().unwrap();
+
+        let mut reader = csv::Reader::from_path(dir.join("events.csv")).unwrap();
+        let records: Vec<csv::StringRecord> = reader.records().collect::<Result<_, _>>().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].get(0), Some("1000"));
+        assert_eq!(records[0].get(1), Some("trial, \"one\"\nline"));
+        assert_eq!(
+            records[0].get(2),
+            Some("{\"note\":\"annotation, quote \\\" and newline\\ninside\"}")
+        );
+        assert_eq!(records[1].get(0), Some("2000"));
+        assert_eq!(records[1].get(1), Some("response, \"left\"\nline"));
+        assert_eq!(
+            records[1].get(2),
+            Some("value, quote \" and newline\ninside")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
