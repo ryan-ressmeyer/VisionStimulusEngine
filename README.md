@@ -20,21 +20,18 @@ The project currently includes:
 - basic rendering and drawing abstractions
 - example programs for clear colors, timing validation, calibration squares, Gabors, scheduled flips, image scaling, and fullscreen/direct-display work
 - host and session logging utilities
-- early timing infrastructure with CPU estimates and Vulkan display-timing support
+- timing infrastructure built around scanout-clock presentation, with CPU estimates as a loud fallback
+- experimental Bevy/external-frame integration crates for 3D-rendered stimuli
 
-## Timing roadmap
+## Timing model
 
 Precise visual stimulus timing is the core reason this project exists. For many neuroscience experiments, the important timestamp is not when the CPU submitted a frame or when the GPU finished rendering it. The important timestamp is when display scanout began, because that is the best available proxy for when photons from that frame could reach the eye.
 
-The roadmap is to support a tiered timing system:
+VSE keeps display timing in the scanout-clock domain. The preferred backend is `VK_EXT_present_timing` with `VK_KHR_present_id2` correlation and `VK_KHR_present_wait2` pacing. `VK_GOOGLE_display_timing` was the earlier Linux/Android path and has been removed from VSE. CPU timestamps remain as a fallback for development and for drivers that do not provide usable present-timing behavior.
 
-1. Use CPU timestamps as a development fallback.
-2. Use `VK_GOOGLE_display_timing` where available to query refresh cycles, retrieve past presentation timing, and schedule presentation times.
-3. Move toward `VK_EXT_present_timing`, now that it has shipped, as Rust bindings catch up.
+Driver support is checked behaviorally, not trusted from extension strings alone. On the current Intel ANV/Mesa reference stack, present-id and present-wait work, but past-presentation scanout timestamps are zero and absolute scheduled presentation is not enforced. VSE records those facts in host/session metadata, warns when it falls back, samples the calibrated scanout clock after present-wait when hardware feedback is missing, and uses software pacing when target-time scheduling is not enforced.
 
-`VK_EXT_present_timing` is especially relevant because it exposes presentation timing and scheduling in a standard, cross-platform way. As of mid-2026 it has landed: released in Vulkan 1.4.335 (November 2025) and shipping in stable drivers — Mesa 26.1 (AMD, NVIDIA NVK, Intel) and the NVIDIA 595 series. It is verified working here on Intel (Mesa 26.1.4). The remaining gap for VSE is Rust-side: the pinned `ash` release (0.38.0+1.3.281) predates the Vulkan 1.4 headers. The raw bindings do already exist on `ash`'s git `master`, so adoption means pinning `ash` to git and driving the extension through raw function pointers rather than waiting on a published release. Once wired in, VSE should be able to rely less on CPU-side waiting and more on hardware-supported frame scheduling and timestamp feedback.
-
-The project will report timing fallbacks explicitly. A run that only has CPU estimates should not look equivalent to a run with hardware scanout timestamps.
+The project reports timing fallbacks explicitly. A run that only has CPU estimates should not look equivalent to a run with scanout-domain timing.
 
 ## Design direction
 

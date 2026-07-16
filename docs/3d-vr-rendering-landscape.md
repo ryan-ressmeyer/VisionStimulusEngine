@@ -1,12 +1,13 @@
 # 3D & VR Stimulus Rendering in VisionStimulusEngine — Landscape, Tradeoffs, and Direction
 
 **Date:** 2026-07-09
-**Updated:** 2026-07-11 — a follow-up research pass (Bevy 0.19 / wgpu 29–30 era, plus local
-driver queries on the reference Intel hardware) corrected several claims and revised the
-recommended GPU-integration topology. Corrections are patched inline and tagged **[2026-07-11]**;
-the substantive additions are §5.4 (integration topology), the renderling entry in §7.4, and the
-revised de-risk list in §8.
-**Status:** Planning / landscape survey (no implementation committed)
+**Updated:** 2026-07-12 — a follow-up research pass (Bevy 0.19 / wgpu 29–30 era, plus local
+driver queries on the reference Intel hardware) corrected several claims, revised the recommended
+GPU-integration topology, and recorded the external-frame spike now implemented under
+`crates/vse-bevy` and `crates/vse-external-frame`. Corrections are patched inline and tagged
+**[2026-07-11]** / **[2026-07-12]**; the substantive additions are §5.4 (integration topology),
+the renderling entry in §7.4, the revised de-risk list in §8, and the spike results in §8.
+**Status:** Historical landscape survey plus implemented spike record
 **Scope:** How to add 3D-scene and (eventually) VR-haploscope rendering to VSE **without
 surrendering the hardware-verified presentation-timing guarantee** that is the project's
 reason to exist. Surveys game-engine internals, VR compositor pipelines, the reusable-3D
@@ -14,9 +15,9 @@ subsystem landscape and its Rust ecosystem, and prior art in scientific stimulus
 Ends with a recommended direction (**custom haploscope panels + Bevy-rendered content +
 VSE-owned direct present**) and fully-documented alternatives.
 
-> This document is a *research synthesis and decision map*, not an implementation plan. It
-> deliberately does not commit sequencing or code. It exists so the eventual design docs can
-> reference a shared understanding of the landscape and the reasons behind the chosen path.
+> This document is a research synthesis, decision map, and spike record. It is not the current
+> implementation guide. Use it for the architectural rationale behind the Bevy/external-frame
+> path; use the code and narrower guides for current APIs.
 
 ---
 

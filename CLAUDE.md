@@ -23,17 +23,13 @@ Vision scientists studying primate visual processing who need:
 
 ## Project Status
 
-This is an early-stage project. The repository currently contains:
-- Planning documents in `planning/`
-- Academic references (PDFs) in `references/` related to vision science and stimulus presentation
+This is an early-stage Rust workspace with the core VSE crate plus experimental integration crates under `crates/`. The repository now contains working Vulkan presentation code, timing infrastructure, example experiments, host/session logging, and documentation. Historical planning notes and bundled reference PDFs have been removed from git.
 
 ## Development Commands
 
-*Note: This section will be populated once the Rust project structure is initialized.*
-
 ### Building and Testing
 ```bash
-# Build project (once Cargo.toml exists)
+# Build project
 cargo build
 
 # Run tests
