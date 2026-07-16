@@ -11,7 +11,7 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 use winit::{
     dpi::{LogicalPosition, PhysicalSize},
-    event::{ElementState, Event, MouseScrollDelta, WindowEvent},
+    event::{Event, MouseScrollDelta, WindowEvent},
     event_loop::{ControlFlow, EventLoop, EventLoopWindowTarget},
     keyboard::PhysicalKey,
     window::{Fullscreen, Window, WindowBuilder},
@@ -614,6 +614,48 @@ fn build_present_engine(
     }
 }
 
+fn missed_frame_status(frame_duration: Option<Duration>, expected: Duration) -> (bool, u32) {
+    match frame_duration {
+        Some(dur) => {
+            let ratio = dur.as_micros() as f64 / expected.as_micros() as f64;
+            if ratio > 1.5 {
+                (true, (ratio.round() as u32).saturating_sub(1))
+            } else {
+                (false, 0)
+            }
+        }
+        None => (false, 0),
+    }
+}
+
+fn update_refresh_auto_detection(
+    expected_frame_duration: &mut Option<Duration>,
+    refresh_detect_samples: &mut Vec<Duration>,
+    provider_duration: Option<Duration>,
+    frame_duration: Option<Duration>,
+) -> Option<Duration> {
+    if expected_frame_duration.is_some() {
+        return None;
+    }
+
+    if let Some(dur) = provider_duration {
+        *expected_frame_duration = Some(dur);
+        return Some(dur);
+    }
+
+    if let Some(dur) = frame_duration {
+        refresh_detect_samples.push(dur);
+        if refresh_detect_samples.len() >= 10 {
+            let total: Duration = refresh_detect_samples.iter().copied().sum();
+            let avg = total / refresh_detect_samples.len() as u32;
+            *expected_frame_duration = Some(avg);
+            return Some(avg);
+        }
+    }
+
+    None
+}
+
 impl VSEState {
     /// Recreate the swapchain from the current surface and notify the timing provider so it
     /// refreshes any cached swapchain handle (a retired handle is UB to query).
@@ -747,7 +789,9 @@ impl VSEState {
     fn sample_scanout_now(&self) -> Option<Timestamp> {
         let clock = self.scanout_clock?;
         let sample = self.timing_provider.sample_present_calibration()?;
-        Some(Timestamp::from_micros(clock.rebase(sample.stage_ns).as_micros()))
+        Some(Timestamp::from_micros(
+            clock.rebase(sample.stage_ns).as_micros(),
+        ))
     }
 
     /// Convert a scheduling target (`target`, scanout-domain µs since `t=0`) into an absolute
@@ -769,6 +813,68 @@ impl VSEState {
         self.timing_provider
             .refresh_cycle_duration()
             .or(self.expected_frame_duration)
+    }
+
+    fn update_refresh_detection(
+        &mut self,
+        frame_duration: Option<Duration>,
+        log_provider: bool,
+        log_average: bool,
+    ) {
+        let provider_duration = self.timing_provider.refresh_cycle_duration();
+        let detected = update_refresh_auto_detection(
+            &mut self.expected_frame_duration,
+            &mut self.refresh_detect_samples,
+            provider_duration,
+            frame_duration,
+        );
+
+        if let Some(dur) = detected {
+            if provider_duration.is_some() && log_provider {
+                info!(
+                    "Refresh cycle duration from provider: {} us ({:.1} Hz)",
+                    dur.as_micros(),
+                    1_000_000.0 / dur.as_micros() as f64
+                );
+            } else if provider_duration.is_none() && log_average {
+                info!(
+                    "Auto-detected refresh rate: {:.1} Hz (frame duration: {} us)",
+                    1_000_000.0 / dur.as_micros() as f64,
+                    dur.as_micros()
+                );
+            }
+        }
+    }
+
+    fn handle_winit_input(&mut self, event: &WindowEvent) {
+        match event {
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(key_code) = event.physical_key {
+                    self.input.handle_key(
+                        key_code,
+                        event.logical_key.clone(),
+                        event.state,
+                        self.clock.now(),
+                    );
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.input
+                    .handle_cursor_moved(position.x, position.y, self.clock.now());
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.input
+                    .handle_mouse_button((*button).into(), *state, self.clock.now());
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (*x as f64, *y as f64),
+                    MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
+                };
+                self.input.handle_mouse_wheel(dx, dy, self.clock.now());
+            }
+            _ => {}
+        }
     }
 
     /// One-time guardrail note (per session) that scheduled presents are being software-paced,
@@ -801,7 +907,9 @@ impl VSEState {
         };
         // Aim to submit ~half a refresh before the target vblank: FIFO then shows it at that vblank,
         // robust to ±½-refresh sleep jitter.
-        let present_at_us = target.as_micros().saturating_sub(refresh.as_micros() as u64 / 2);
+        let present_at_us = target
+            .as_micros()
+            .saturating_sub(refresh.as_micros() as u64 / 2);
         let now_us = now.as_micros();
         if present_at_us > now_us {
             std::thread::sleep(Duration::from_micros(present_at_us - now_us));
@@ -849,19 +957,8 @@ impl VSEState {
             .expected_frame_duration
             .unwrap_or(Duration::from_micros(16_667));
 
-        // Auto-detect refresh rate using the same logic as flip()
-        if self.expected_frame_duration.is_none() {
-            if let Some(dur) = self.timing_provider.refresh_cycle_duration() {
-                self.expected_frame_duration = Some(dur);
-            } else if let Some(dur) = cpu_frame_duration {
-                self.refresh_detect_samples.push(dur);
-                if self.refresh_detect_samples.len() >= 10 {
-                    let total: Duration = self.refresh_detect_samples.iter().copied().sum();
-                    let avg = total / self.refresh_detect_samples.len() as u32;
-                    self.expected_frame_duration = Some(avg);
-                }
-            }
-        }
+        // Auto-detect refresh rate using the same logic as flip().
+        self.update_refresh_detection(cpu_frame_duration, false, false);
 
         // Missed detection prefers the real scanout delta (present-stage-local ns), but only
         // between *consecutive* present ids where both records are present — feedback for a
@@ -885,17 +982,7 @@ impl VSEState {
             None => cpu_frame_duration,
         };
 
-        let (missed, missed_count) = match frame_duration {
-            Some(dur) => {
-                let ratio = dur.as_micros() as f64 / expected.as_micros() as f64;
-                if ratio > 1.5 {
-                    (true, (ratio.round() as u32).saturating_sub(1))
-                } else {
-                    (false, 0)
-                }
-            }
-            None => (false, 0),
-        };
+        let (missed, missed_count) = missed_frame_status(frame_duration, expected);
 
         // on_target: with a real scanout time (same domain as the target) the scheduled present
         // met its deadline iff scanout landed at/after target. Without one (windowed), keep the
@@ -1539,86 +1626,11 @@ impl VSEContext {
                                     s.swapchain.mark_needs_recreation();
                                 }
                             }
-                            WindowEvent::KeyboardInput { event, .. } => {
-                                if let PhysicalKey::Code(key_code) = event.physical_key {
-                                    let timestamp = s.clock.now();
-                                    let logical_key = event.logical_key.clone();
-                                    match event.state {
-                                        ElementState::Pressed => {
-                                            let repeat = s.input.keys_down.contains(&key_code);
-                                            s.input.keys_down.insert(key_code);
-                                            if !repeat {
-                                                s.input.keys_just_pressed.insert(key_code);
-                                            }
-                                            s.input.events.push(InputEvent::KeyDown {
-                                                key_code,
-                                                logical_key,
-                                                timestamp,
-                                                repeat,
-                                            });
-                                        }
-                                        ElementState::Released => {
-                                            s.input.keys_down.remove(&key_code);
-                                            s.input.keys_just_released.insert(key_code);
-                                            s.input.events.push(InputEvent::KeyUp {
-                                                key_code,
-                                                logical_key,
-                                                timestamp,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                            WindowEvent::CursorMoved { position, .. } => {
-                                let timestamp = s.clock.now();
-                                s.input.mouse_position = (position.x, position.y);
-                                s.input.events.push(InputEvent::MouseMove {
-                                    x: position.x,
-                                    y: position.y,
-                                    timestamp,
-                                });
-                            }
-                            WindowEvent::MouseInput {
-                                state: btn_state,
-                                button,
-                                ..
-                            } => {
-                                let timestamp = s.clock.now();
-                                let btn: MouseButton = button.into();
-                                let (mx, my) = s.input.mouse_position;
-                                match btn_state {
-                                    ElementState::Pressed => {
-                                        s.input.buttons_down.insert(btn);
-                                        s.input.buttons_just_pressed.insert(btn);
-                                        s.input.events.push(InputEvent::MouseDown {
-                                            button: btn,
-                                            x: mx,
-                                            y: my,
-                                            timestamp,
-                                        });
-                                    }
-                                    ElementState::Released => {
-                                        s.input.buttons_down.remove(&btn);
-                                        s.input.events.push(InputEvent::MouseUp {
-                                            button: btn,
-                                            x: mx,
-                                            y: my,
-                                            timestamp,
-                                        });
-                                    }
-                                }
-                            }
-                            WindowEvent::MouseWheel { delta, .. } => {
-                                let timestamp = s.clock.now();
-                                let (dx, dy) = match delta {
-                                    MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64),
-                                    MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
-                                };
-                                s.input.events.push(InputEvent::MouseWheel {
-                                    delta_x: dx,
-                                    delta_y: dy,
-                                    timestamp,
-                                });
+                            WindowEvent::KeyboardInput { .. }
+                            | WindowEvent::CursorMoved { .. }
+                            | WindowEvent::MouseInput { .. }
+                            | WindowEvent::MouseWheel { .. } => {
+                                s.handle_winit_input(&window_event);
                             }
                             WindowEvent::RedrawRequested => {
                                 if s.minimized {
@@ -1850,86 +1862,11 @@ impl VSEContext {
                                     s.swapchain.mark_needs_recreation();
                                 }
                             }
-                            WindowEvent::KeyboardInput { event, .. } => {
-                                if let PhysicalKey::Code(key_code) = event.physical_key {
-                                    let timestamp = s.clock.now();
-                                    let logical_key = event.logical_key.clone();
-                                    match event.state {
-                                        ElementState::Pressed => {
-                                            let repeat = s.input.keys_down.contains(&key_code);
-                                            s.input.keys_down.insert(key_code);
-                                            if !repeat {
-                                                s.input.keys_just_pressed.insert(key_code);
-                                            }
-                                            s.input.events.push(InputEvent::KeyDown {
-                                                key_code,
-                                                logical_key,
-                                                timestamp,
-                                                repeat,
-                                            });
-                                        }
-                                        ElementState::Released => {
-                                            s.input.keys_down.remove(&key_code);
-                                            s.input.keys_just_released.insert(key_code);
-                                            s.input.events.push(InputEvent::KeyUp {
-                                                key_code,
-                                                logical_key,
-                                                timestamp,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                            WindowEvent::CursorMoved { position, .. } => {
-                                let timestamp = s.clock.now();
-                                s.input.mouse_position = (position.x, position.y);
-                                s.input.events.push(InputEvent::MouseMove {
-                                    x: position.x,
-                                    y: position.y,
-                                    timestamp,
-                                });
-                            }
-                            WindowEvent::MouseInput {
-                                state: btn_state,
-                                button,
-                                ..
-                            } => {
-                                let timestamp = s.clock.now();
-                                let btn: MouseButton = button.into();
-                                let (mx, my) = s.input.mouse_position;
-                                match btn_state {
-                                    ElementState::Pressed => {
-                                        s.input.buttons_down.insert(btn);
-                                        s.input.buttons_just_pressed.insert(btn);
-                                        s.input.events.push(InputEvent::MouseDown {
-                                            button: btn,
-                                            x: mx,
-                                            y: my,
-                                            timestamp,
-                                        });
-                                    }
-                                    ElementState::Released => {
-                                        s.input.buttons_down.remove(&btn);
-                                        s.input.events.push(InputEvent::MouseUp {
-                                            button: btn,
-                                            x: mx,
-                                            y: my,
-                                            timestamp,
-                                        });
-                                    }
-                                }
-                            }
-                            WindowEvent::MouseWheel { delta, .. } => {
-                                let timestamp = s.clock.now();
-                                let (dx, dy) = match delta {
-                                    MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64),
-                                    MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
-                                };
-                                s.input.events.push(InputEvent::MouseWheel {
-                                    delta_x: dx,
-                                    delta_y: dy,
-                                    timestamp,
-                                });
+                            WindowEvent::KeyboardInput { .. }
+                            | WindowEvent::CursorMoved { .. }
+                            | WindowEvent::MouseInput { .. }
+                            | WindowEvent::MouseWheel { .. } => {
+                                s.handle_winit_input(&window_event);
                             }
                             WindowEvent::RedrawRequested => {
                                 if s.minimized {
@@ -2235,49 +2172,15 @@ impl<'a> RenderContext<'a> {
             .last_present_time
             .map(|prev| present_time.duration_since(prev));
 
-        // Auto-detect refresh rate if needed
-        if self.state.expected_frame_duration.is_none() {
-            // First try the provider (e.g., ExtPresentTiming has driver refresh info)
-            if let Some(dur) = self.state.timing_provider.refresh_cycle_duration() {
-                self.state.expected_frame_duration = Some(dur);
-                info!(
-                    "Refresh cycle duration from provider: {} us ({:.1} Hz)",
-                    dur.as_micros(),
-                    1_000_000.0 / dur.as_micros() as f64
-                );
-            } else if let Some(dur) = frame_duration {
-                // Fall back to auto-detect from frame timings
-                self.state.refresh_detect_samples.push(dur);
-                if self.state.refresh_detect_samples.len() >= 10 {
-                    let total: Duration = self.state.refresh_detect_samples.iter().copied().sum();
-                    let avg = total / self.state.refresh_detect_samples.len() as u32;
-                    self.state.expected_frame_duration = Some(avg);
-                    info!(
-                        "Auto-detected refresh rate: {:.1} Hz (frame duration: {} us)",
-                        1_000_000.0 / avg.as_micros() as f64,
-                        avg.as_micros()
-                    );
-                }
-            }
-        }
+        self.state
+            .update_refresh_detection(frame_duration, true, true);
 
         let expected = self
             .state
             .expected_frame_duration
             .unwrap_or(Duration::from_micros(16_667)); // 60 Hz fallback
 
-        // Missed frame detection
-        let (missed, missed_count) = match frame_duration {
-            Some(dur) => {
-                let ratio = dur.as_micros() as f64 / expected.as_micros() as f64;
-                if ratio > 1.5 {
-                    (true, (ratio.round() as u32).saturating_sub(1))
-                } else {
-                    (false, 0)
-                }
-            }
-            None => (false, 0),
-        };
+        let (missed, missed_count) = missed_frame_status(frame_duration, expected);
 
         // present_id is assigned by the EXT present path; 0 on the CPU-estimate path.
         let present_id: u64 = 0;
@@ -2361,18 +2264,22 @@ impl<'a> RenderContext<'a> {
             .external_source
             .as_mut()
             .and_then(|src| src.take_frames());
-        let underlay = ext_frames.as_ref().map(|f| crate::drawing::renderer::ExternalUnderlay {
-            image: f.image.clone(),
-            readback: self.state.external_readback.take(),
-        });
+        let underlay = ext_frames
+            .as_ref()
+            .map(|f| crate::drawing::renderer::ExternalUnderlay {
+                image: f.image.clone(),
+                readback: self.state.external_readback.take(),
+            });
 
         // --- Render into the acquired image ---
         let image = self.state.swapchain.images()[image_index as usize].clone();
         let extent = self.state.swapchain.extent();
-        let command_buffer =
-            self.state
-                .renderer
-                .render_with_underlay(image, clear_color, extent, underlay.as_ref())?;
+        let command_buffer = self.state.renderer.render_with_underlay(
+            image,
+            clear_color,
+            extent,
+            underlay.as_ref(),
+        )?;
 
         // Hardware scheduling: express the target (scanout-domain µs) as an absolute scanout time
         // for `VkPresentTimingInfoEXT.targetTime`. Falls back to unscheduled when the scanout
@@ -2491,40 +2398,15 @@ impl<'a> RenderContext<'a> {
             .last_present_time
             .map(|prev| present_time.duration_since(prev));
 
-        if self.state.expected_frame_duration.is_none() {
-            if let Some(dur) = self.state.timing_provider.refresh_cycle_duration() {
-                self.state.expected_frame_duration = Some(dur);
-                info!(
-                    "Refresh cycle duration from provider: {} us ({:.1} Hz)",
-                    dur.as_micros(),
-                    1_000_000.0 / dur.as_micros() as f64
-                );
-            } else if let Some(dur) = frame_duration {
-                self.state.refresh_detect_samples.push(dur);
-                if self.state.refresh_detect_samples.len() >= 10 {
-                    let total: Duration = self.state.refresh_detect_samples.iter().copied().sum();
-                    let avg = total / self.state.refresh_detect_samples.len() as u32;
-                    self.state.expected_frame_duration = Some(avg);
-                }
-            }
-        }
+        self.state
+            .update_refresh_detection(frame_duration, true, false);
 
         let expected = self
             .state
             .expected_frame_duration
             .unwrap_or(Duration::from_micros(16_667));
 
-        let (missed, missed_count) = match frame_duration {
-            Some(dur) => {
-                let ratio = dur.as_micros() as f64 / expected.as_micros() as f64;
-                if ratio > 1.5 {
-                    (true, (ratio.round() as u32).saturating_sub(1))
-                } else {
-                    (false, 0)
-                }
-            }
-            None => (false, 0),
-        };
+        let (missed, missed_count) = missed_frame_status(frame_duration, expected);
 
         let flip_info = FlipInfo {
             frame_number: self.state.frame_number,
@@ -2733,18 +2615,22 @@ impl<'a> RenderContext<'a> {
             .external_source
             .as_mut()
             .and_then(|src| src.take_frames());
-        let underlay = ext_frames.as_ref().map(|f| crate::drawing::renderer::ExternalUnderlay {
-            image: f.image.clone(),
-            readback: self.state.external_readback.take(),
-        });
+        let underlay = ext_frames
+            .as_ref()
+            .map(|f| crate::drawing::renderer::ExternalUnderlay {
+                image: f.image.clone(),
+                readback: self.state.external_readback.take(),
+            });
 
         // --- Render ---
         let image = self.state.swapchain.images()[image_index as usize].clone();
         let extent = self.state.swapchain.extent();
-        let command_buffer =
-            self.state
-                .renderer
-                .render_with_underlay(image, clear_color, extent, underlay.as_ref())?;
+        let command_buffer = self.state.renderer.render_with_underlay(
+            image,
+            clear_color,
+            extent,
+            underlay.as_ref(),
+        )?;
 
         // Hardware scheduling (no CPU spin): express the target as an absolute scanout time for
         // the driver. Falls back to unscheduled before the scanout epoch/domain is known.
@@ -3641,6 +3527,70 @@ fn monitor_handle_to_info(index: usize, handle: &winit::monitor::MonitorHandle) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missed_frame_status_uses_strict_one_point_five_threshold() {
+        let expected = Duration::from_micros(10_000);
+        assert_eq!(missed_frame_status(None, expected), (false, 0));
+        assert_eq!(
+            missed_frame_status(Some(Duration::from_micros(15_000)), expected),
+            (false, 0)
+        );
+        assert_eq!(
+            missed_frame_status(Some(Duration::from_micros(15_001)), expected),
+            (true, 1)
+        );
+        assert_eq!(
+            missed_frame_status(Some(Duration::from_micros(35_000)), expected),
+            (true, 3)
+        );
+    }
+
+    #[test]
+    fn refresh_auto_detection_prefers_provider_duration() {
+        let mut samples = Vec::new();
+        let mut expected = None;
+
+        let detected = update_refresh_auto_detection(
+            &mut expected,
+            &mut samples,
+            Some(Duration::from_micros(8_333)),
+            Some(Duration::from_micros(16_667)),
+        );
+
+        assert_eq!(detected, Some(Duration::from_micros(8_333)));
+        assert_eq!(expected, Some(Duration::from_micros(8_333)));
+        assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn refresh_auto_detection_averages_ten_frame_samples() {
+        let mut samples = Vec::new();
+        let mut expected = None;
+
+        for _ in 0..9 {
+            assert_eq!(
+                update_refresh_auto_detection(
+                    &mut expected,
+                    &mut samples,
+                    None,
+                    Some(Duration::from_micros(16_000)),
+                ),
+                None
+            );
+            assert!(expected.is_none());
+        }
+
+        let detected = update_refresh_auto_detection(
+            &mut expected,
+            &mut samples,
+            None,
+            Some(Duration::from_micros(18_000)),
+        );
+
+        assert_eq!(detected, Some(Duration::from_micros(16_200)));
+        assert_eq!(expected, Some(Duration::from_micros(16_200)));
+    }
 
     #[test]
     fn test_recording_state_pending_flip_handoff() {

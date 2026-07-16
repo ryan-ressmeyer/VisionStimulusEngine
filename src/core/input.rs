@@ -2,6 +2,7 @@
 
 use crate::timing::Timestamp;
 use std::collections::HashSet;
+use winit::event::ElementState;
 pub use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 
 /// How VSE acquired exclusive access to the display in DirectDisplay mode.
@@ -244,11 +245,182 @@ impl InputState {
     pub(crate) fn clear_events(&mut self) {
         self.events.clear();
     }
+
+    pub(crate) fn handle_key(
+        &mut self,
+        key_code: KeyCode,
+        logical_key: Key,
+        state: ElementState,
+        timestamp: Timestamp,
+    ) {
+        match state {
+            ElementState::Pressed => {
+                let repeat = self.keys_down.contains(&key_code);
+                self.keys_down.insert(key_code);
+                if !repeat {
+                    self.keys_just_pressed.insert(key_code);
+                }
+                self.events.push(InputEvent::KeyDown {
+                    key_code,
+                    logical_key,
+                    timestamp,
+                    repeat,
+                });
+            }
+            ElementState::Released => {
+                self.keys_down.remove(&key_code);
+                self.keys_just_released.insert(key_code);
+                self.events.push(InputEvent::KeyUp {
+                    key_code,
+                    logical_key,
+                    timestamp,
+                });
+            }
+        }
+    }
+
+    pub(crate) fn handle_cursor_moved(&mut self, x: f64, y: f64, timestamp: Timestamp) {
+        self.mouse_position = (x, y);
+        self.events.push(InputEvent::MouseMove { x, y, timestamp });
+    }
+
+    pub(crate) fn handle_mouse_button(
+        &mut self,
+        button: MouseButton,
+        state: ElementState,
+        timestamp: Timestamp,
+    ) {
+        let (x, y) = self.mouse_position;
+        match state {
+            ElementState::Pressed => {
+                self.buttons_down.insert(button);
+                self.buttons_just_pressed.insert(button);
+                self.events.push(InputEvent::MouseDown {
+                    button,
+                    x,
+                    y,
+                    timestamp,
+                });
+            }
+            ElementState::Released => {
+                self.buttons_down.remove(&button);
+                self.events.push(InputEvent::MouseUp {
+                    button,
+                    x,
+                    y,
+                    timestamp,
+                });
+            }
+        }
+    }
+
+    pub(crate) fn handle_mouse_wheel(&mut self, delta_x: f64, delta_y: f64, timestamp: Timestamp) {
+        self.events.push(InputEvent::MouseWheel {
+            delta_x,
+            delta_y,
+            timestamp,
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_state_tracks_keyboard_transitions_and_repeats() {
+        let mut input = InputState::new();
+        let t0 = Timestamp::from_micros(10);
+        let t1 = Timestamp::from_micros(20);
+
+        input.handle_key(
+            KeyCode::KeyA,
+            Key::Character("a".into()),
+            ElementState::Pressed,
+            t0,
+        );
+        assert!(input.keys_down.contains(&KeyCode::KeyA));
+        assert!(input.keys_just_pressed.contains(&KeyCode::KeyA));
+        assert!(matches!(
+            input.events.last(),
+            Some(InputEvent::KeyDown { repeat: false, .. })
+        ));
+
+        input.handle_key(
+            KeyCode::KeyA,
+            Key::Character("a".into()),
+            ElementState::Pressed,
+            t1,
+        );
+        assert_eq!(input.keys_just_pressed.len(), 1);
+        assert!(matches!(
+            input.events.last(),
+            Some(InputEvent::KeyDown { repeat: true, .. })
+        ));
+
+        input.handle_key(
+            KeyCode::KeyA,
+            Key::Character("a".into()),
+            ElementState::Released,
+            t1,
+        );
+        assert!(!input.keys_down.contains(&KeyCode::KeyA));
+        assert!(input.keys_just_released.contains(&KeyCode::KeyA));
+        assert!(matches!(
+            input.events.last(),
+            Some(InputEvent::KeyUp { .. })
+        ));
+    }
+
+    #[test]
+    fn input_state_tracks_mouse_transitions_and_wheel() {
+        let mut input = InputState::new();
+        let t = Timestamp::from_micros(10);
+
+        input.handle_cursor_moved(12.0, 34.0, t);
+        assert_eq!(input.mouse_position, (12.0, 34.0));
+        assert!(matches!(
+            input.events.last(),
+            Some(InputEvent::MouseMove {
+                x: 12.0,
+                y: 34.0,
+                ..
+            })
+        ));
+
+        input.handle_mouse_button(MouseButton::Left, ElementState::Pressed, t);
+        assert!(input.buttons_down.contains(&MouseButton::Left));
+        assert!(input.buttons_just_pressed.contains(&MouseButton::Left));
+        assert!(matches!(
+            input.events.last(),
+            Some(InputEvent::MouseDown {
+                x: 12.0,
+                y: 34.0,
+                ..
+            })
+        ));
+
+        input.handle_mouse_button(MouseButton::Left, ElementState::Released, t);
+        assert!(!input.buttons_down.contains(&MouseButton::Left));
+        assert!(matches!(
+            input.events.last(),
+            Some(InputEvent::MouseUp {
+                x: 12.0,
+                y: 34.0,
+                ..
+            })
+        ));
+
+        input.handle_mouse_wheel(-1.0, 2.5, t);
+        assert!(matches!(
+            input.events.last(),
+            Some(InputEvent::MouseWheel {
+                delta_x: -1.0,
+                delta_y: 2.5,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn window_mode_direct_display_is_distinct() {
