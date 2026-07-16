@@ -10,8 +10,8 @@
 //! / `Swapchain::from_handle`.
 //!
 //! Layouts are transcribed verbatim from Vulkan-Headers `vulkan_core.h`
-//! (`VK_EXT_PRESENT_TIMING_SPEC_VERSION == 3`). See
-//! `docs/plans/2026-07-09-ext-present-timing-design.md` for the surrounding design.
+//! (`VK_EXT_PRESENT_TIMING_SPEC_VERSION == 3`). See `docs/clock-synchronization.md` for the
+//! clock model and driver-conformance notes.
 
 #![allow(non_upper_case_globals)]
 // This module is a complete FFI binding surface: some constants/structs are declared for

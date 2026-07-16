@@ -1,7 +1,7 @@
 # Experiment Data Schema Reference
 
 This document describes the exact output schema for VSE's two data backends.
-All timestamps are in **microseconds since VSE context creation** (not wall clock).
+Timing fields are in microseconds. Their clock domain depends on `timing_source`.
 
 ## frames.csv / frames.parquet — Frame Records
 
@@ -12,9 +12,12 @@ User columns (from `record_frame()`) are empty/null for frames where
 | Column | Type | Units | Notes |
 |---|---|---|---|
 | `frame_number` | u64 | — | Monotonically increasing from 0 |
-| `present_time_us` | u64 | µs | Frame present timestamp (see timing_source and note below) |
+| `present_time_us` | u64 | µs | Frame present timestamp (see `timing_source` and note below) |
 | `submit_time_us` | u64 | µs | GPU command buffer submission timestamp |
-| `timing_source` | string | — | `CpuEstimate` or `GoogleDisplayTiming` |
+| `timing_source` | string | — | `ExtPresentTiming` or `CpuEstimate` |
+| `present_id` | u64 | — | `VK_KHR_present_id2` id for hardware feedback correlation; `0` on the CPU path |
+| `target_time_us` | u64/null | µs | Requested scanout target for scheduled flips; null for immediate presents |
+| `on_target` | bool | — | True when the confirmed scanout was at or after `target_time_us`; true for unscheduled or unconfirmed CPU-path frames |
 | `missed` | bool | — | True if this frame was dropped |
 | `missed_count` | u32 | — | Number of display intervals missed (0 = on time) |
 | `skipped` | bool | — | True if frame was skipped (minimized/swapchain recreation) |
@@ -33,15 +36,13 @@ share this file, distinguished by the `stream` column.
 
 ### Note on `present_time_us` accuracy
 
-In synchronous `run()`, `present_time_us` is captured after the blocking GPU fence wait —
-it reflects when the GPU finished executing the command buffer, not necessarily the exact
-display scanout.
+When `timing_source = ExtPresentTiming`, `present_time_us` is in the session's scanout-clock
+domain. VSE derives it from `IMAGE_FIRST_PIXEL_OUT` feedback when the driver populates that
+record, or from a calibrated scanout-clock sample taken immediately after `wait_for_present`
+when the driver advertises the feature but returns zero-valued feedback.
 
-In `run_buffered()`, `present_time_us` is populated in `FlipEvent::Presented` after the
-fence signals. When `VK_GOOGLE_display_timing` is available (`timing_source =
-GoogleDisplayTiming`), the driver provides an actual hardware scanout timestamp via
-`vkGetPastPresentationTimingGOOGLE`. When the CPU path is used (`CpuEstimate`),
-`present_time_us` is the fence-signal time. Either way, it is never a pre-submit estimate.
+When `timing_source = CpuEstimate`, `present_time_us` is a host-clock timestamp taken after the
+GPU fence signals. It confirms that rendering completed, but it does not prove display scanout.
 
 ## Null Handling
 

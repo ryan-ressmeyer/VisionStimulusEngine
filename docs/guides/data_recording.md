@@ -150,19 +150,17 @@ impl DataWriter for MyWriter {
 
 Every row in `frames.csv` / `frames.parquet` includes a `timing_source` column:
 
-- `CpuEstimate`: timestamp taken after GPU fence signal — accurate to ~0.5ms
-- `GoogleDisplayTiming`: hardware scanout timestamp from the driver — accurate
-  to the display refresh interval
+- `ExtPresentTiming`: scanout-clock timestamp for `IMAGE_FIRST_PIXEL_OUT`, reported by driver feedback when available or sampled from the calibrated scanout clock after `wait_for_present` when the driver returns zero-valued feedback.
+- `CpuEstimate`: host-clock timestamp taken after the GPU fence signals. This confirms render completion, not display scanout.
 
-The `present_time_us` field is microseconds since the VSE clock epoch
-(context creation time), not wall-clock time.
+`present_id`, `target_time_us`, and `on_target` record present-id correlation and scheduled-flip provenance on the EXT path. See [the schema reference](experiment_data_schema.md) for exact columns.
 
 ## Buffered Flip
 
 For pipelined GPU experiments, use `run_buffered()` instead of `run()`. In buffered mode,
-`record_frame()` is called in the `FlipEvent::Presented` arm with **confirmed** hardware
-timing — `present_time` is never an estimate. See the
-[buffered flips guide](buffered_flips.md) for full details.
+`record_frame()` is called in the `FlipEvent::Presented` arm, after VSE has correlated the
+frame with its present result. On the EXT path this gives scanout-clock timing; on the CPU path
+it remains a fence-time estimate. See the [buffered flips guide](buffered_flips.md) for details.
 
 ```rust
 context.run_buffered::<MyData, _>(BufferedConfig::default(), |event, vse| {
@@ -171,7 +169,7 @@ context.run_buffered::<MyData, _>(BufferedConfig::default(), |event, vse| {
             vse.flip_with_payload(None, MyData { /* ... */ })?;
         }
         FlipEvent::Presented { flip_info, payload } => {
-            // flip_info.present_time is confirmed hardware timing
+            // flip_info.present_time uses the domain identified by flip_info.timing_source
             vse.record_frame(payload)?;
         }
         _ => {}

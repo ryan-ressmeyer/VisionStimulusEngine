@@ -55,18 +55,15 @@ We support a hierarchy of timing mechanisms, ranging from "Gold Standard" to "Be
 * **Scheduling:** Allows specifying an `earliestPresentTime`. The GPU will hold the frame until this specific nanosecond, eliminating early flips.
 * **Feedback:** Returns `VkPastPresentationTimingEXT`, containing the exact hardware clock time when the image scanout began.
 
-* **Status:** Preferred, and now shipping. Available in stable Mesa 26.1 (AMD/RADV, NVIDIA/NVK, Intel/ANV) and the NVIDIA 595 series; verified on Intel (Mesa 26.1.4). VSE adoption now needs only `ash` pinned to git (the raw bindings landed on `master`; no published release carries them yet) and the calls wired up.
+* **Status:** Preferred and implemented. Available in stable Mesa 26.1 (AMD/RADV, NVIDIA/NVK, Intel/ANV) and the NVIDIA 595 series; verified on Intel (Mesa 26.1.4). VSE uses hand-rolled FFI for the Vulkan 1.4 present-timing structs because vulkano 0.35 predates those bindings.
 
-### Tier 2: `VK_GOOGLE_display_timing` (The Silver Standard)
+### Historical: `VK_GOOGLE_display_timing`
 
-* **What it is:** The predecessor to `EXT_present_timing`, widely supported on Android and Linux.
-* **Capabilities:**
-* **Feedback:** Provides accurate `pastPresentationTime` from the kernel/display driver.
-* **Limitation:** Less robust scheduling controls than the EXT version.
+`VK_GOOGLE_display_timing` was the Linux/Android predecessor to `EXT_present_timing`. VSE no
+longer uses it. The active fallback is the explicit `CpuEstimate` path, so data files have two
+provenance labels rather than a partially supported middle tier.
 
-* **Status:** Good fallback for Linux systems.
-
-### Tier 3: `VK_KHR_present_wait` (The Bronze Standard)
+### Tier 2: `VK_KHR_present_wait` / `VK_KHR_present_wait2` (Pacing)
 
 * **What it is:** A synchronization tool that allows the CPU to wait for the GPU to finish *handing off* the image.
 * **Capabilities:**
@@ -76,7 +73,7 @@ We support a hierarchy of timing mechanisms, ranging from "Gold Standard" to "Be
 
 * **Status:** Useful for preventing queue buildup, but insufficient for verification.
 
-### Tier 4: `std::time::Instant` (The Software Baseline)
+### Tier 3: `std::time::Instant` (The Software Baseline)
 
 * **What it is:** Checking the CPU clock immediately after submitting the work.
 * **Capabilities:** None (Estimate only).
@@ -91,9 +88,8 @@ We use a `TimingSource` enum in our data logs (`FlipInfo`):
 
 ```rust
 pub enum TimingSource {
-    HardwareScanout, // VK_EXT_present_timing (Trust this)
-    DriverComplete,  // VK_GOOGLE_display_timing (Mostly trust this)
-    CpuEstimate,     // std::time::Instant (Use only for debugging)
+    ExtPresentTiming, // scanout-clock timing from VK_EXT_present_timing
+    CpuEstimate,      // host-clock fence time; no scanout verification
 }
 
 ```
@@ -101,9 +97,8 @@ pub enum TimingSource {
 **Selection Logic:**
 
 1. On startup, `Context` queries device extensions.
-2. If `VK_EXT_present_timing` is available, enable it and set `source = HardwareScanout`.
-3. Else, try `VK_GOOGLE_display_timing`.
-4. Else, fall back to `CpuEstimate` and emit a warning log.
+2. If `VK_EXT_present_timing` and its required companion extensions are available, enable the EXT path and set `source = ExtPresentTiming`.
+3. Else, fall back to `CpuEstimate` and emit a warning log.
 
 ## 5. Development vs. Experiment: Windowed and Direct Display
 

@@ -46,9 +46,9 @@ VSE reports the active backend via `vse.display_backend()`:
 ### `DisplayBackend::Wayland`
 
 Your app is a native Wayland client. The compositor (Mutter, KWin) mediates
-all frame presentation. `VK_GOOGLE_display_timing` gives feedback about actual
-scanout times, but the compositor still controls scheduling. Typical jitter:
-0.5–2 ms.
+all frame presentation. `VK_EXT_present_timing` can still provide hardware-anchored
+feedback for the compositor-presented frame, but the compositor remains in the path.
+Typical jitter: 0.5–2 ms.
 
 ### `DisplayBackend::X11`
 

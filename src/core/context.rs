@@ -2132,7 +2132,7 @@ impl<'a> RenderContext<'a> {
     /// Present the current frame to the screen
     ///
     /// Optionally accepts a target presentation time. When provided:
-    /// - With `GoogleDisplayTiming`: schedules the present via the driver
+    /// - With `ExtPresentTiming`: schedules/paces against the scanout clock
     /// - With `CpuEstimate`: spin-waits until the target time
     ///
     /// Pass `None` for immediate presentation (VSync-locked).
@@ -2237,7 +2237,7 @@ impl<'a> RenderContext<'a> {
 
         // Auto-detect refresh rate if needed
         if self.state.expected_frame_duration.is_none() {
-            // First try the provider (e.g., GoogleDisplayTiming has driver info)
+            // First try the provider (e.g., ExtPresentTiming has driver refresh info)
             if let Some(dur) = self.state.timing_provider.refresh_cycle_duration() {
                 self.state.expected_frame_duration = Some(dur);
                 info!(

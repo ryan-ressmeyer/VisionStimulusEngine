@@ -25,13 +25,12 @@ VSE-owned direct present**) and fully-documented alternatives.
 VSE is a Rust + Vulkan (vulkano 0.35.2) stimulus engine whose entire value proposition is
 **deterministic, hardware-verified frame timing**:
 
-- `VK_EXT_present_timing` on the present path (hardware-scheduled presents via
-  `targetPresentTime`, per-present scanout timestamps, `VK_KHR_present_id2` correlation),
+- `VK_EXT_present_timing` on the present path (hardware-scheduled presents where the driver
+  enforces `targetTime`, per-present scanout timestamps, `VK_KHR_present_id2` correlation),
   wired through hand-rolled minimal FFI because vulkano 0.35 predates the Vulkan 1.4
-  extensions (see `docs/plans/2026-07-09-ext-present-timing-design.md`).
-- One calibrated clock domain: hardware scanout time ↔ VSE `Clock` ↔ `CLOCK_MONOTONIC`, so
-  `submit_time`, `present_time`, scheduled targets, and external ephys timestamps are
-  directly comparable.
+  extensions.
+- Scanout-clock-native display timing. Host-clock conversion is an opt-in bridge for
+  host-originated events; acquisition alignment remains physical via photodiode and ADC.
 - A direct-display backend (`VK_KHR_display`) that takes exclusive control of a physical
   display with no compositor in the path — the deterministic path for real experiments.
 - A "loud fallback" posture: `ExtPresentTiming` when available, else `CpuEstimate` with an
@@ -851,8 +850,7 @@ remaining baseline: `VUID-StandaloneSpirv-None-10684` ×10 (shader layout pedant
   the actual target hardware, and Topology 1 remains the documented fallback.
 - **Per-eye synchronization on custom panels.** Two direct-display swapchains, two present
   timelines — inter-ocular sync becomes a first-class timing problem (both eyes targeting the
-  same absolute onset). VSE's calibrated single clock domain is the right substrate, but the
-  two-swapchain scheduling model needs its own design.
+  same scanout-clock onset). The two-swapchain scheduling model needs its own design.
 - **Panel physics (§3.5 caveat).** Low-persistence illumination timing must be characterized
   per panel; the hardware timestamp is present time, not photon time. Photodiode validation
   remains necessary.
@@ -866,7 +864,7 @@ remaining baseline: `VUID-StandaloneSpirv-None-10684` ×10 (shader layout pedant
 ## 10. References
 
 ### VSE internal
-- `docs/plans/2026-07-09-ext-present-timing-design.md` — the present-timing foundation.
+- `docs/clock-synchronization.md` — scanout-clock model, host-clock bridge, and driver conformance notes.
 - `docs/timing.md` — timing philosophy and tiers.
 - `docs/guides/display_backends.md` — direct-display (`VK_KHR_display`) architecture.
 - `docs/gpu-vendor-selection.md` — **[2026-07-11]** AMD vs. NVIDIA for the experiment rig

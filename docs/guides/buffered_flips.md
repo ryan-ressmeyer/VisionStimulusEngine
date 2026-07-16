@@ -1,8 +1,8 @@
 # Buffered Flips
 
 `run_buffered()` is VSE's pipelined rendering mode. It pipelines CPU and GPU work across
-frames, delivers **confirmed hardware scanout timestamps** to your data recorder, and provides
-a predictable closed-loop latency contract for neural recording experiments.
+frames, correlates each submitted frame with its present result, and provides a predictable
+closed-loop latency contract for neural recording experiments.
 
 ---
 
@@ -30,22 +30,23 @@ This is standard double-buffering. The driver's swapchain image management provi
 backpressure — `acquire_next_image()` blocks if all images are in use, keeping the pipeline
 at the configured depth.
 
-### Confirmed scanout timestamps
+### Present-result correlation
 
-The synchronous `run()` path records `present_time` after the fence signals. The fence signals
-when the GPU finishes *executing* the command buffer, not necessarily when the display hardware
-*scans out* the frame.
+On the `ExtPresentTiming` path, `run_buffered()` assigns a `VK_KHR_present_id2` id to every
+present and later matches `FlipEvent::Presented` to the corresponding driver result. When the
+driver provides `IMAGE_FIRST_PIXEL_OUT`, `FlipInfo::present_time` is the hardware scanout time.
+On drivers that advertise present timing but return zero-valued scanout feedback, VSE falls back
+to a calibrated scanout-clock sample after `wait_for_present` and records that behavior in
+`HostInfo.timing.scanout_feedback_populated`.
 
-In `run_buffered()`, `FlipEvent::Presented` fires after fence completion and, when
-`VK_GOOGLE_display_timing` is available, attempts to retrieve the actual hardware scanout time
-via `vkGetPastPresentationTimingGOOGLE`. The resulting `FlipInfo::present_time` is therefore
-as close to a ground-truth scanout timestamp as the driver will provide.
+On the `CpuEstimate` path, `FlipInfo::present_time` is taken after the GPU fence signals. That
+confirms render completion, not display scanout, and `timing_source` records the difference.
 
 ### Scheduled presentation
 
-`flip_with_payload(Some(target_time), payload)` spin-waits until `target_time` before
-submitting. Paired with `VK_GOOGLE_display_timing` (future: `VkPresentTimesInfoGOOGLE`),
-this enables sub-millisecond control over which vblank a stimulus appears on.
+`flip_with_payload(Some(target_time), payload)` schedules the present for a scanout-clock target
+on the EXT path. If the driver does not enforce `targetTime`, VSE software-paces against the
+scanout clock and records the observed driver behavior in `HostInfo.timing.absolute_scheduling_enforced`.
 
 ---
 
@@ -203,7 +204,7 @@ fn run_experiment(context: VSEContext, session: ExperimentSession) -> Result<(),
             }
 
             FlipEvent::Presented { flip_info, payload } => {
-                // Confirmed hardware timing — record with accurate present_time
+                // Record after the frame has been correlated with its present result.
                 vse.record_frame(payload)?;
 
                 // Closed-loop: reduce contrast on missed frames

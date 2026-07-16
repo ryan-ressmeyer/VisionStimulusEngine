@@ -22,6 +22,7 @@ A single call to `capture_host_info()` returns a `HostInfo` struct containing:
 | **GPU** | Device name, vendor/device IDs, device type, driver version, Vulkan API version, timestamp period, sub-pixel precision, max 2D image dimension | Vulkan physical device properties |
 | **Display** | Monitor name, refresh rate (millihertz), scale factor, physical size, logical size | `winit` window/monitor info |
 | **Swapchain** | Image format, color space, present mode, image count, extent | Negotiated Vulkan swapchain state |
+| **Timing** | Present-timing extension support, present-id2, present-wait2, calibrated timestamp domains, measured CPU↔GPU deviation, observed scanout-feedback and scheduling behavior, queue-priority outcome | Vulkan capability probes and runtime observations |
 | **Pipeline** | Window size, clear color, GPU preference, present mode, expected refresh rate, flip logging settings | VSE builder configuration |
 | **Build** | VSE version, git commit hash, build profile (debug/release), rustc version | Compile-time `build.rs` + `env!()` |
 | **Runtime** | Username, display server (X11/Wayland), relevant environment variables (`DISPLAY`, `WAYLAND_DISPLAY`, `VK_ICD_FILENAMES`, `VK_LAYER_PATH`), process nice value | Environment variables, `/proc/self/stat` |
@@ -86,6 +87,13 @@ println!("Negotiated present mode: {}", info.swapchain.present_mode);
 // Check monitor refresh rate
 if let Some(rate) = info.display.refresh_rate_millihertz {
     println!("Refresh rate: {:.2} Hz", rate as f64 / 1000.0);
+}
+
+// Check whether advertised present-timing features worked in this run
+if let Some(timing) = &info.timing {
+    println!("EXT present timing available: {}", timing.present_timing);
+    println!("Scanout feedback populated: {:?}", timing.scanout_feedback_populated);
+    println!("Absolute scheduling enforced: {:?}", timing.absolute_scheduling_enforced);
 }
 ```
 

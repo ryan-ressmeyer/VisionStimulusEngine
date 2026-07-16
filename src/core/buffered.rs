@@ -126,8 +126,8 @@ pub enum FlipEvent<T> {
 
     /// A frame has been confirmed by the GPU/driver.
     ///
-    /// `flip_info.present_time` is a confirmed hardware scanout timestamp when
-    /// `GoogleDisplayTiming` is active; otherwise it is derived from the fence signal.
+    /// `flip_info.present_time` is a scanout-clock timestamp on the `ExtPresentTiming` path;
+    /// otherwise it is derived from the fence signal.
     ///
     /// `payload` is the value passed to `flip_with_payload()` when this frame was rendered.
     ///

@@ -22,14 +22,13 @@ pub trait TimingProvider {
     fn refresh_cycle_duration(&self) -> Option<Duration>;
 
     /// Record the present time for the current frame.
-    /// Called after the GPU fence signals.
-    /// For CPU: returns clock.now().
-    /// For GOOGLE: queries vkGetPastPresentationTimingGOOGLE.
+    /// Called after the GPU fence signals on the CPU-estimate path.
+    /// The EXT path handles scanout timing in the raw present flow.
     fn record_present_time(&self, clock: &Clock) -> Timestamp;
 
     /// Wait/schedule for a target present time.
-    /// For CPU: spin-waits until target_time.
-    /// For GOOGLE: target is passed to VkPresentTimeGOOGLE during present.
+    /// The CPU-estimate path spin-waits until `target_time`.
+    /// The EXT path schedules or software-paces in the raw present flow.
     fn wait_for_target(&self, target_time: Timestamp, clock: &Clock);
 
     /// Notify the provider that the swapchain was recreated and its handle changed.
