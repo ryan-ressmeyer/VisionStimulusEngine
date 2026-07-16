@@ -4,8 +4,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use vulkano::{
-    buffer::{Buffer, BufferCreateInfo, BufferUsage},
     buffer::Subbuffer,
+    buffer::{Buffer, BufferCreateInfo, BufferUsage},
     command_buffer::{
         allocator::{CommandBufferAllocator, StandardCommandBufferAllocator},
         AutoCommandBufferBuilder, BlitImageInfo, CommandBufferUsage as CmdBufUsage,
@@ -47,7 +47,8 @@ use vulkano::{
 };
 
 use super::primitives::{
-    circle_vertices, line_vertices, rect_vertices, textured_quad_vertices, DrawCommand,
+    circle_vertices, dot_unit_quad_vertices, line_vertices, rect_vertices, textured_quad_vertices,
+    DrawCommand,
 };
 
 /// An external frame consumed as the background of one rendered frame
@@ -181,11 +182,14 @@ pub(crate) struct Renderer {
     grating_pipeline: Arc<GraphicsPipeline>,
     gabor_pipeline: Arc<GraphicsPipeline>,
     dot_pipeline: Arc<GraphicsPipeline>,
+    dot_quad_buffer: Subbuffer<[DotInstance]>,
 
     textures: HashMap<u64, TextureResources>,
     next_texture_id: u64,
 
     draw_commands: Vec<DrawCommand>,
+    flat_vertex_scratch: Vec<Vertex2D>,
+    dot_instance_scratch: Vec<DotInstance>,
 }
 
 impl Renderer {
@@ -208,6 +212,7 @@ impl Renderer {
         let grating_pipeline = Self::create_grating_pipeline(&device, swapchain_format)?;
         let gabor_pipeline = Self::create_gabor_pipeline(&device, swapchain_format)?;
         let dot_pipeline = Self::create_dot_pipeline(&device, swapchain_format)?;
+        let dot_quad_buffer = Self::create_dot_quad_buffer(memory_allocator.clone())?;
 
         Ok(Self {
             device,
@@ -220,9 +225,12 @@ impl Renderer {
             grating_pipeline,
             gabor_pipeline,
             dot_pipeline,
+            dot_quad_buffer,
             textures: HashMap::new(),
             next_texture_id: 0,
             draw_commands: Vec::new(),
+            flat_vertex_scratch: Vec::new(),
+            dot_instance_scratch: Vec::new(),
         })
     }
 
@@ -302,7 +310,10 @@ impl Renderer {
         let (load_op, clear_value) = if underlay.is_some() {
             (AttachmentLoadOp::Load, None)
         } else {
-            (AttachmentLoadOp::Clear, Some(ClearValue::Float(clear_color)))
+            (
+                AttachmentLoadOp::Clear,
+                Some(ClearValue::Float(clear_color)),
+            )
         };
         builder
             .begin_rendering(RenderingInfo {
@@ -327,8 +338,8 @@ impl Renderer {
             .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
 
         // Generate flat-color vertices from queued commands
-        let flat_vertices = self.generate_flat_color_vertices();
-        if !flat_vertices.is_empty() {
+        self.fill_flat_color_vertices();
+        if !self.flat_vertex_scratch.is_empty() {
             let vertex_buffer = Buffer::from_iter(
                 self.memory_allocator.clone(),
                 BufferCreateInfo {
@@ -340,7 +351,7 @@ impl Renderer {
                         | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                     ..Default::default()
                 },
-                flat_vertices.into_iter(),
+                self.flat_vertex_scratch.iter().copied(),
             )
             .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
 
@@ -367,29 +378,25 @@ impl Renderer {
         }
 
         // Textured draws (Texture and Noise both use the textured pipeline)
-        let texture_commands: Vec<_> = self
-            .draw_commands
-            .iter()
-            .filter_map(|cmd| match cmd {
+        for cmd in &self.draw_commands {
+            let (texture_id, left, top, right, bottom) = match cmd {
                 DrawCommand::Texture {
                     texture_id,
                     left,
                     top,
                     right,
                     bottom,
-                } => Some((*texture_id, *left, *top, *right, *bottom)),
-                DrawCommand::Noise {
+                }
+                | DrawCommand::Noise {
                     texture_id,
                     left,
                     top,
                     right,
                     bottom,
-                } => Some((*texture_id, *left, *top, *right, *bottom)),
-                _ => None,
-            })
-            .collect();
+                } => (*texture_id, *left, *top, *right, *bottom),
+                _ => continue,
+            };
 
-        for (texture_id, left, top, right, bottom) in texture_commands {
             let resources = self
                 .textures
                 .get(&texture_id)
@@ -407,7 +414,7 @@ impl Renderer {
                         | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                     ..Default::default()
                 },
-                tex_vertices.into_iter(),
+                tex_vertices,
             )
             .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
 
@@ -440,17 +447,28 @@ impl Renderer {
         }
 
         // Grating and Gabor draws
-        let parametric_commands: Vec<_> = self
-            .draw_commands
-            .iter()
-            .filter_map(|cmd| match cmd {
+        for cmd in &self.draw_commands {
+            let (
+                is_grating,
+                left,
+                top,
+                right,
+                bottom,
+                frequency,
+                orientation,
+                phase,
+                contrast,
+                background,
+                sigma,
+                wave_type,
+            ) = match cmd {
                 DrawCommand::Grating {
                     left,
                     top,
                     right,
                     bottom,
                     params,
-                } => Some((
+                } => (
                     true,
                     *left,
                     *top,
@@ -466,14 +484,14 @@ impl Renderer {
                         WaveType::Sine => 0u32,
                         WaveType::Square => 1u32,
                     },
-                )),
+                ),
                 DrawCommand::Gabor {
                     left,
                     top,
                     right,
                     bottom,
                     params,
-                } => Some((
+                } => (
                     false,
                     *left,
                     *top,
@@ -486,26 +504,9 @@ impl Renderer {
                     params.background,
                     params.sigma,
                     0u32,
-                )),
-                _ => None,
-            })
-            .collect();
-
-        for (
-            is_grating,
-            left,
-            top,
-            right,
-            bottom,
-            frequency,
-            orientation,
-            phase,
-            contrast,
-            background,
-            sigma,
-            wave_type,
-        ) in parametric_commands
-        {
+                ),
+                _ => continue,
+            };
             let quad = textured_quad_vertices(left, top, right, bottom);
             let vertex_buffer = Buffer::from_iter(
                 self.memory_allocator.clone(),
@@ -518,7 +519,7 @@ impl Renderer {
                         | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                     ..Default::default()
                 },
-                quad.into_iter(),
+                quad,
             )
             .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
 
@@ -558,66 +559,28 @@ impl Renderer {
         }
 
         // Dot draws (instanced rendering)
-        let dot_commands: Vec<_> = self
-            .draw_commands
-            .iter()
-            .filter_map(|cmd| match cmd {
+        for cmd in &self.draw_commands {
+            let (positions, radius, color) = match cmd {
                 DrawCommand::Dots {
                     positions,
                     radius,
                     color,
-                } => Some((positions.clone(), *radius, *color)),
-                _ => None,
-            })
-            .collect();
+                } => (positions, *radius, *color),
+                _ => continue,
+            };
 
-        for (positions, radius, color) in dot_commands {
             if positions.is_empty() {
                 continue;
             }
 
-            // Unit quad: 6 vertices for two triangles covering [-1, 1]
-            let quad_data: Vec<DotInstance> = vec![
-                DotInstance {
-                    position: [-1.0, -1.0],
-                },
-                DotInstance {
-                    position: [-1.0, 1.0],
-                },
-                DotInstance {
-                    position: [1.0, 1.0],
-                },
-                DotInstance {
-                    position: [-1.0, -1.0],
-                },
-                DotInstance {
-                    position: [1.0, 1.0],
-                },
-                DotInstance {
-                    position: [1.0, -1.0],
-                },
-            ];
-
-            let quad_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                quad_data.into_iter(),
-            )
-            .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
-
-            let instance_data: Vec<DotInstance> = positions
-                .iter()
-                .map(|&pos| DotInstance { position: pos })
-                .collect();
-            let instance_count = instance_data.len() as u32;
+            self.dot_instance_scratch.clear();
+            self.dot_instance_scratch.extend(
+                positions
+                    .iter()
+                    .copied()
+                    .map(|position| DotInstance { position }),
+            );
+            let instance_count = self.dot_instance_scratch.len() as u32;
 
             let instance_buffer = Buffer::from_iter(
                 self.memory_allocator.clone(),
@@ -630,7 +593,7 @@ impl Renderer {
                         | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                     ..Default::default()
                 },
-                instance_data.into_iter(),
+                self.dot_instance_scratch.iter().copied(),
             )
             .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
 
@@ -649,7 +612,7 @@ impl Renderer {
                     },
                 )
                 .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                .bind_vertex_buffers(0, (quad_buffer, instance_buffer))
+                .bind_vertex_buffers(0, (self.dot_quad_buffer.clone(), instance_buffer))
                 .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
             unsafe {
                 builder
@@ -810,8 +773,8 @@ impl Renderer {
         self.textures.remove(&handle.id);
     }
 
-    fn generate_flat_color_vertices(&self) -> Vec<Vertex2D> {
-        let mut vertices = Vec::new();
+    fn fill_flat_color_vertices(&mut self) {
+        self.flat_vertex_scratch.clear();
 
         for cmd in &self.draw_commands {
             match cmd {
@@ -825,7 +788,7 @@ impl Renderer {
                     if left >= right || top >= bottom {
                         continue;
                     }
-                    vertices
+                    self.flat_vertex_scratch
                         .extend_from_slice(&rect_vertices(*left, *top, *right, *bottom, *color));
                 }
                 DrawCommand::Circle {
@@ -838,7 +801,8 @@ impl Renderer {
                     if *radius <= 0.0 {
                         continue;
                     }
-                    vertices.extend(circle_vertices(*cx, *cy, *radius, *color, *segments));
+                    self.flat_vertex_scratch
+                        .extend(circle_vertices(*cx, *cy, *radius, *color, *segments));
                 }
                 DrawCommand::Line {
                     x1,
@@ -857,7 +821,8 @@ impl Renderer {
                     if dx * dx + dy * dy < 1e-12 {
                         continue;
                     }
-                    vertices.extend_from_slice(&line_vertices(*x1, *y1, *x2, *y2, *width, *color));
+                    self.flat_vertex_scratch
+                        .extend_from_slice(&line_vertices(*x1, *y1, *x2, *y2, *width, *color));
                 }
                 DrawCommand::Texture { .. } => {}
                 DrawCommand::Grating { .. } => {}
@@ -866,8 +831,73 @@ impl Renderer {
                 DrawCommand::Dots { .. } => {}
             }
         }
+    }
 
-        vertices
+    fn create_dot_quad_buffer(
+        memory_allocator: Arc<StandardMemoryAllocator>,
+    ) -> Result<Subbuffer<[DotInstance]>, RendererError> {
+        Buffer::from_iter(
+            memory_allocator,
+            BufferCreateInfo {
+                usage: BufferUsage::VERTEX_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            dot_unit_quad_vertices(),
+        )
+        .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))
+    }
+
+    fn create_graphics_pipeline(
+        device: &Arc<Device>,
+        swapchain_format: Format,
+        stages: [PipelineShaderStageCreateInfo; 2],
+        vertex_input_state: VertexInputState,
+    ) -> Result<Arc<GraphicsPipeline>, RendererError> {
+        let layout = PipelineLayout::new(
+            device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+                .into_pipeline_layout_create_info(device.clone())
+                .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?,
+        )
+        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
+
+        GraphicsPipeline::new(
+            device.clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: stages.into_iter().collect(),
+                vertex_input_state: Some(vertex_input_state),
+                input_assembly_state: Some(InputAssemblyState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                }),
+                viewport_state: Some(ViewportState::default()),
+                rasterization_state: Some(RasterizationState::default()),
+                multisample_state: Some(MultisampleState::default()),
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    1,
+                    ColorBlendAttachmentState {
+                        blend: Some(AttachmentBlend::alpha()),
+                        ..Default::default()
+                    },
+                )),
+                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+                subpass: Some(
+                    PipelineRenderingCreateInfo {
+                        color_attachment_formats: vec![Some(swapchain_format)],
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..GraphicsPipelineCreateInfo::layout(layout)
+            },
+        )
+        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))
     }
 
     fn create_flat_color_pipeline(
@@ -891,46 +921,7 @@ impl Renderer {
             PipelineShaderStageCreateInfo::new(fs_entry),
         ];
 
-        let layout = PipelineLayout::new(
-            device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(device.clone())
-                .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?,
-        )
-        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
-
-        GraphicsPipeline::new(
-            device.clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                stages: stages.into_iter().collect(),
-                vertex_input_state: Some(vertex_input_state),
-                input_assembly_state: Some(InputAssemblyState {
-                    topology: PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                }),
-                viewport_state: Some(ViewportState::default()),
-                rasterization_state: Some(RasterizationState::default()),
-                multisample_state: Some(MultisampleState::default()),
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    1,
-                    ColorBlendAttachmentState {
-                        blend: Some(AttachmentBlend::alpha()),
-                        ..Default::default()
-                    },
-                )),
-                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-                subpass: Some(
-                    PipelineRenderingCreateInfo {
-                        color_attachment_formats: vec![Some(swapchain_format)],
-                        ..Default::default()
-                    }
-                    .into(),
-                ),
-                ..GraphicsPipelineCreateInfo::layout(layout)
-            },
-        )
-        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))
+        Self::create_graphics_pipeline(device, swapchain_format, stages, vertex_input_state)
     }
 
     fn create_textured_pipeline(
@@ -954,46 +945,7 @@ impl Renderer {
             PipelineShaderStageCreateInfo::new(fs_entry),
         ];
 
-        let layout = PipelineLayout::new(
-            device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(device.clone())
-                .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?,
-        )
-        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
-
-        GraphicsPipeline::new(
-            device.clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                stages: stages.into_iter().collect(),
-                vertex_input_state: Some(vertex_input_state),
-                input_assembly_state: Some(InputAssemblyState {
-                    topology: PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                }),
-                viewport_state: Some(ViewportState::default()),
-                rasterization_state: Some(RasterizationState::default()),
-                multisample_state: Some(MultisampleState::default()),
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    1,
-                    ColorBlendAttachmentState {
-                        blend: Some(AttachmentBlend::alpha()),
-                        ..Default::default()
-                    },
-                )),
-                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-                subpass: Some(
-                    PipelineRenderingCreateInfo {
-                        color_attachment_formats: vec![Some(swapchain_format)],
-                        ..Default::default()
-                    }
-                    .into(),
-                ),
-                ..GraphicsPipelineCreateInfo::layout(layout)
-            },
-        )
-        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))
+        Self::create_graphics_pipeline(device, swapchain_format, stages, vertex_input_state)
     }
 
     fn create_grating_pipeline(
@@ -1017,46 +969,7 @@ impl Renderer {
             PipelineShaderStageCreateInfo::new(fs_entry),
         ];
 
-        let layout = PipelineLayout::new(
-            device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(device.clone())
-                .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?,
-        )
-        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
-
-        GraphicsPipeline::new(
-            device.clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                stages: stages.into_iter().collect(),
-                vertex_input_state: Some(vertex_input_state),
-                input_assembly_state: Some(InputAssemblyState {
-                    topology: PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                }),
-                viewport_state: Some(ViewportState::default()),
-                rasterization_state: Some(RasterizationState::default()),
-                multisample_state: Some(MultisampleState::default()),
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    1,
-                    ColorBlendAttachmentState {
-                        blend: Some(AttachmentBlend::alpha()),
-                        ..Default::default()
-                    },
-                )),
-                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-                subpass: Some(
-                    PipelineRenderingCreateInfo {
-                        color_attachment_formats: vec![Some(swapchain_format)],
-                        ..Default::default()
-                    }
-                    .into(),
-                ),
-                ..GraphicsPipelineCreateInfo::layout(layout)
-            },
-        )
-        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))
+        Self::create_graphics_pipeline(device, swapchain_format, stages, vertex_input_state)
     }
 
     fn create_gabor_pipeline(
@@ -1080,46 +993,7 @@ impl Renderer {
             PipelineShaderStageCreateInfo::new(fs_entry),
         ];
 
-        let layout = PipelineLayout::new(
-            device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(device.clone())
-                .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?,
-        )
-        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
-
-        GraphicsPipeline::new(
-            device.clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                stages: stages.into_iter().collect(),
-                vertex_input_state: Some(vertex_input_state),
-                input_assembly_state: Some(InputAssemblyState {
-                    topology: PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                }),
-                viewport_state: Some(ViewportState::default()),
-                rasterization_state: Some(RasterizationState::default()),
-                multisample_state: Some(MultisampleState::default()),
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    1,
-                    ColorBlendAttachmentState {
-                        blend: Some(AttachmentBlend::alpha()),
-                        ..Default::default()
-                    },
-                )),
-                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-                subpass: Some(
-                    PipelineRenderingCreateInfo {
-                        color_attachment_formats: vec![Some(swapchain_format)],
-                        ..Default::default()
-                    }
-                    .into(),
-                ),
-                ..GraphicsPipelineCreateInfo::layout(layout)
-            },
-        )
-        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))
+        Self::create_graphics_pipeline(device, swapchain_format, stages, vertex_input_state)
     }
 
     fn create_dot_pipeline(
@@ -1176,45 +1050,6 @@ impl Renderer {
             PipelineShaderStageCreateInfo::new(fs_entry),
         ];
 
-        let layout = PipelineLayout::new(
-            device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(device.clone())
-                .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?,
-        )
-        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
-
-        GraphicsPipeline::new(
-            device.clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                stages: stages.into_iter().collect(),
-                vertex_input_state: Some(vertex_input_state),
-                input_assembly_state: Some(InputAssemblyState {
-                    topology: PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                }),
-                viewport_state: Some(ViewportState::default()),
-                rasterization_state: Some(RasterizationState::default()),
-                multisample_state: Some(MultisampleState::default()),
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    1,
-                    ColorBlendAttachmentState {
-                        blend: Some(AttachmentBlend::alpha()),
-                        ..Default::default()
-                    },
-                )),
-                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-                subpass: Some(
-                    PipelineRenderingCreateInfo {
-                        color_attachment_formats: vec![Some(swapchain_format)],
-                        ..Default::default()
-                    }
-                    .into(),
-                ),
-                ..GraphicsPipelineCreateInfo::layout(layout)
-            },
-        )
-        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))
+        Self::create_graphics_pipeline(device, swapchain_format, stages, vertex_input_state)
     }
 }

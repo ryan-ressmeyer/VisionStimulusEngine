@@ -1,6 +1,6 @@
 use super::color::Color;
 use super::stimuli::GratingParams;
-use super::vertex::{TexturedVertex, Vertex2D};
+use super::vertex::{DotInstance, TexturedVertex, Vertex2D};
 use crate::drawing::GaborParams;
 
 /// A queued draw command, processed during flip().
@@ -253,6 +253,30 @@ pub(crate) fn textured_quad_vertices(
     ]
 }
 
+/// Generate the static unit quad for instanced dot rendering.
+pub(crate) fn dot_unit_quad_vertices() -> [DotInstance; 6] {
+    [
+        DotInstance {
+            position: [-1.0, -1.0],
+        },
+        DotInstance {
+            position: [-1.0, 1.0],
+        },
+        DotInstance {
+            position: [1.0, 1.0],
+        },
+        DotInstance {
+            position: [-1.0, -1.0],
+        },
+        DotInstance {
+            position: [1.0, 1.0],
+        },
+        DotInstance {
+            position: [1.0, -1.0],
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +346,18 @@ mod tests {
         assert_eq!(verts[1].uv, [0.0, 1.0]); // bottom-left
         assert_eq!(verts[2].uv, [1.0, 1.0]); // bottom-right
         assert_eq!(verts[5].uv, [1.0, 0.0]); // top-right
+    }
+
+    #[test]
+    fn test_dot_unit_quad_vertices() {
+        let verts = dot_unit_quad_vertices();
+        assert_eq!(verts.len(), 6);
+        assert_eq!(verts[0].position, [-1.0, -1.0]);
+        assert_eq!(verts[1].position, [-1.0, 1.0]);
+        assert_eq!(verts[2].position, [1.0, 1.0]);
+        assert_eq!(verts[3].position, [-1.0, -1.0]);
+        assert_eq!(verts[4].position, [1.0, 1.0]);
+        assert_eq!(verts[5].position, [1.0, -1.0]);
     }
 
     #[test]
