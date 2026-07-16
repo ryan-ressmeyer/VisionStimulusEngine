@@ -22,13 +22,9 @@ pub struct OrbitingLight;
 /// Cube transform at frame `n` (pure; also used by tests / analysis).
 pub fn cube_transform(n: u64) -> Transform {
     let theta = (n as f64) * (std::f64::consts::TAU / CUBE_PERIOD_FRAMES);
-    Transform::from_xyz(
-        (1.8 * theta.cos()) as f32,
-        0.6,
-        (1.8 * theta.sin()) as f32,
-    )
-    // Spin the cube on its own axis too, so specular highlights sweep its faces.
-    .with_rotation(Quat::from_rotation_y((theta * 3.0) as f32))
+    Transform::from_xyz((1.8 * theta.cos()) as f32, 0.6, (1.8 * theta.sin()) as f32)
+        // Spin the cube on its own axis too, so specular highlights sweep its faces.
+        .with_rotation(Quat::from_rotation_y((theta * 3.0) as f32))
 }
 
 /// Light transform at frame `n` (pure; revolves opposite the cube, overhead).
@@ -45,23 +41,36 @@ pub fn build_demo_scene(app: &mut App, _camera: Entity) {
     let cube_mesh = world
         .resource_mut::<Assets<Mesh>>()
         .add(Cuboid::new(1.0, 1.0, 1.0));
-    let cube_mat = world.resource_mut::<Assets<StandardMaterial>>().add(StandardMaterial {
-        base_color: Color::srgb(0.85, 0.30, 0.20),
-        perceptual_roughness: 0.25,
-        metallic: 0.1,
-        ..default()
-    });
+    let cube_mat = world
+        .resource_mut::<Assets<StandardMaterial>>()
+        .add(StandardMaterial {
+            base_color: Color::srgb(0.85, 0.30, 0.20),
+            perceptual_roughness: 0.25,
+            metallic: 0.1,
+            ..default()
+        });
     let ground_mesh = world
         .resource_mut::<Assets<Mesh>>()
         .add(Plane3d::default().mesh().size(10.0, 10.0));
-    let ground_mat = world.resource_mut::<Assets<StandardMaterial>>().add(StandardMaterial {
-        base_color: Color::srgb(0.35, 0.38, 0.42),
-        perceptual_roughness: 0.9,
-        ..default()
-    });
+    let ground_mat = world
+        .resource_mut::<Assets<StandardMaterial>>()
+        .add(StandardMaterial {
+            base_color: Color::srgb(0.35, 0.38, 0.42),
+            perceptual_roughness: 0.9,
+            ..default()
+        });
 
-    world.spawn((Mesh3d(cube_mesh), MeshMaterial3d(cube_mat), cube_transform(0), OrbitingCube));
-    world.spawn((Mesh3d(ground_mesh), MeshMaterial3d(ground_mat), Transform::from_xyz(0.0, 0.0, 0.0)));
+    world.spawn((
+        Mesh3d(cube_mesh),
+        MeshMaterial3d(cube_mat),
+        cube_transform(0),
+        OrbitingCube,
+    ));
+    world.spawn((
+        Mesh3d(ground_mesh),
+        MeshMaterial3d(ground_mat),
+        Transform::from_xyz(0.0, 0.0, 0.0),
+    ));
     world.spawn((
         PointLight {
             intensity: 2_000_000.0,

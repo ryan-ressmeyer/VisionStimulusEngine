@@ -96,8 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     s.on_target += 1;
                 }
                 if let Some(last) = s.last_present {
-                    let dt_us = flip_info.present_time.as_micros() as i64
-                        - last.as_micros() as i64;
+                    let dt_us = flip_info.present_time.as_micros() as i64 - last.as_micros() as i64;
                     if s.dt_count == 0 {
                         s.min_dt_us = dt_us;
                         s.max_dt_us = dt_us;
@@ -170,7 +169,10 @@ fn report(s: &Verify, requested: u64, sync_kind: vse_external_frame::SyncKind) {
             s.missed_total, s.presented
         );
     } else {
-        println!("FAIL x  presented count off: {} of {requested}", s.presented);
+        println!(
+            "FAIL x  presented count off: {} of {requested}",
+            s.presented
+        );
     }
     println!();
 }

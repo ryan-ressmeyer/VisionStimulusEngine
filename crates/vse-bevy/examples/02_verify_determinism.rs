@@ -135,7 +135,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("frame image written: {path}");
     }
     if hashes.len() == HASH_FRAMES.len() {
-        println!("OK  captured {} frame hashes — compare across two runs", hashes.len());
+        println!(
+            "OK  captured {} frame hashes — compare across two runs",
+            hashes.len()
+        );
     } else {
         println!(
             "FAIL x  captured {} of {} frame hashes (frame skipped or readback lost)",

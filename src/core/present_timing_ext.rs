@@ -675,8 +675,7 @@ pub unsafe fn create_device_with_present_timing(
     // queue family? Checked up front so a denial is a driver decision, not a blind guess.
     let advertise_global_priority = has_ext(b"VK_KHR_global_priority\0");
     let high_priority_offered = advertise_global_priority && {
-        let count =
-            ash_instance.get_physical_device_queue_family_properties2_len(phys);
+        let count = ash_instance.get_physical_device_queue_family_properties2_len(phys);
         let mut prio_props = ash::vk::QueueFamilyGlobalPriorityPropertiesKHR::default();
         let mut props2: Vec<ash::vk::QueueFamilyProperties2> =
             (0..count).map(|_| Default::default()).collect();
@@ -814,7 +813,8 @@ pub unsafe fn create_device_with_present_timing(
             enabled.queue_priority = QueuePriorityOutcome::Denied(e);
             queue_ci.p_next = std::ptr::null();
             ext_names.retain(|p| {
-                CStr::from_ptr(*p) != CStr::from_bytes_with_nul_unchecked(b"VK_KHR_global_priority\0")
+                CStr::from_ptr(*p)
+                    != CStr::from_bytes_with_nul_unchecked(b"VK_KHR_global_priority\0")
             });
             device_ci.enabled_extension_count = ext_names.len() as u32;
             device_ci.pp_enabled_extension_names = ext_names.as_ptr();

@@ -259,8 +259,7 @@ impl ExternalFrameRing {
                 let mut import_info =
                     ImportSemaphoreFdInfo::handle_type(ExternalSemaphoreHandleType::OpaqueFd);
                 import_info.file = Some(std::fs::File::from(fd));
-                unsafe { sem.import_fd(import_info) }
-                .map_err(|e| {
+                unsafe { sem.import_fd(import_info) }.map_err(|e| {
                     ExternalFrameError::ImportFailed(format!("semaphore {i} import: {e}"))
                 })?;
                 ready_sems.push(Arc::new(sem));

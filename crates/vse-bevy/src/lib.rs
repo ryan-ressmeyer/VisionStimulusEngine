@@ -93,13 +93,16 @@ impl BevyProducer {
         // fallback. Bevy's raw_vulkan_init hook lets us append the extension to
         // wgpu's own list at device creation. Must be inserted before
         // add_plugins: RenderPlugin::build reads this resource.
-        let mut raw_vulkan = bevy::render::renderer::raw_vulkan_init::RawVulkanInitSettings::default();
+        let mut raw_vulkan =
+            bevy::render::renderer::raw_vulkan_init::RawVulkanInitSettings::default();
         // SAFETY: the callback only appends an extension the physical device
         // reports support for; nothing is removed or disabled.
         unsafe {
             raw_vulkan.add_create_device_callback(|args, adapter, _| {
                 let name = ash::khr::external_semaphore_fd::NAME;
-                if adapter.physical_device_capabilities().supports_extension(name)
+                if adapter
+                    .physical_device_capabilities()
+                    .supports_extension(name)
                     && !args.extensions.contains(&name)
                 {
                     args.extensions.push(name);
@@ -147,7 +150,9 @@ impl BevyProducer {
                 .slots
                 .iter()
                 .map(|slot| {
-                    let view = slot.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    let view = slot
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
                     ManualTextureView {
                         texture_view: view.into(),
                         size: UVec2::new(config.extent[0], config.extent[1]),
@@ -229,7 +234,9 @@ impl BevyProducer {
 
     /// Hand the ring descriptor to the consumer (once).
     pub fn export_ring(&mut self) -> Result<ExternalRingDesc, ProducerError> {
-        self.export_desc.take().ok_or(ProducerError::AlreadyExported)
+        self.export_desc
+            .take()
+            .ok_or(ProducerError::AlreadyExported)
     }
 
     /// Receiver for the consumer's slot-release back-edge.

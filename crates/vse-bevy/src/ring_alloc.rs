@@ -140,8 +140,9 @@ pub(crate) fn allocate_ring(
             let memory = raw
                 .allocate_memory(&alloc, None)
                 .map_err(|e| ProducerError::Setup(format!("allocate_memory[{slot_index}]: {e}")))?;
-            raw.bind_image_memory(image, memory, 0)
-                .map_err(|e| ProducerError::Setup(format!("bind_image_memory[{slot_index}]: {e}")))?;
+            raw.bind_image_memory(image, memory, 0).map_err(|e| {
+                ProducerError::Setup(format!("bind_image_memory[{slot_index}]: {e}"))
+            })?;
 
             // --- Export the memory fd (one per image; importer takes ownership) ---
             let fd_loader = ash::khr::external_memory_fd::Device::new(instance, raw);

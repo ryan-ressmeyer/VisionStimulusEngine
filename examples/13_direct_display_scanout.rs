@@ -177,7 +177,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if (8_000..=40_000).contains(&med) {
                 refresh_us = med;
             }
-            eprintln!("Measured refresh interval: {:.3} ms", refresh_us as f64 / 1000.0);
+            eprintln!(
+                "Measured refresh interval: {:.3} ms",
+                refresh_us as f64 / 1000.0
+            );
         }
 
         vse.record_frame(Row {

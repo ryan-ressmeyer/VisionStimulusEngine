@@ -3,8 +3,8 @@
 //! This module handles Vulkan swapchain creation, image acquisition,
 //! and presentation for double/triple buffering.
 
-use std::sync::Arc;
 use ash::vk;
+use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use vulkano::{
@@ -122,8 +122,8 @@ impl Default for SwapchainConfig {
 
 /// Image usage for VSE swapchain images: color attachment (rendered into) + transfer dst
 /// (cleared / blitted). Shared verbatim by the vulkano and raw creation paths.
-const SWAPCHAIN_IMAGE_USAGE: vulkano::image::ImageUsage = vulkano::image::ImageUsage::COLOR_ATTACHMENT
-    .union(vulkano::image::ImageUsage::TRANSFER_DST);
+const SWAPCHAIN_IMAGE_USAGE: vulkano::image::ImageUsage =
+    vulkano::image::ImageUsage::COLOR_ATTACHMENT.union(vulkano::image::ImageUsage::TRANSFER_DST);
 
 /// Surface-dependent swapchain parameters resolved once and shared by the vulkano and raw
 /// (present-wait2 opt-in) creation paths.
@@ -420,7 +420,13 @@ impl SwapchainManager {
         // SAFETY: `handle` and `image_handles` were just created from `device`/`surface` with the
         // matching create info; vulkano takes ownership of both.
         unsafe {
-            Swapchain::from_handle(device.clone(), handle, image_handles, surface.clone(), vko_ci)
+            Swapchain::from_handle(
+                device.clone(),
+                handle,
+                image_handles,
+                surface.clone(),
+                vko_ci,
+            )
         }
         .map_err(|e| SwapchainError::CreationFailed(format!("Swapchain::from_handle failed: {e}")))
     }

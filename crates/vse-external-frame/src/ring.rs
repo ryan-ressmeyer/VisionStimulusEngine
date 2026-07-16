@@ -152,13 +152,10 @@ impl RingStateMachine {
     }
 
     fn expect_state(&self, slot: SlotIndex, expected: SlotState) -> Result<(), RingError> {
-        let actual = *self
-            .slots
-            .get(slot.0)
-            .ok_or(RingError::OutOfRange {
-                slot: slot.0,
-                len: self.slots.len(),
-            })?;
+        let actual = *self.slots.get(slot.0).ok_or(RingError::OutOfRange {
+            slot: slot.0,
+            len: self.slots.len(),
+        })?;
         if actual != expected {
             return Err(RingError::InvalidTransition {
                 slot: slot.0,
