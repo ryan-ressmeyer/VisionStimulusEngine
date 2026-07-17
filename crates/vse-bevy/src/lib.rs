@@ -396,6 +396,7 @@ impl BevyProducer {
                 .iter()
                 .map(|fd| fd.try_clone().expect("dup ring semaphore fd"))
                 .collect(),
+            timeline_semaphore_fd: None,
             sync: ring.sync,
         };
 

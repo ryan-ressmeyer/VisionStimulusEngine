@@ -225,6 +225,8 @@ impl ExternalFrameRing {
                 "ring of {ring_len} image(s); need at least 2"
             )));
         }
+        desc.validate_sync_shape(ring_len)
+            .map_err(ExternalFrameError::InvalidDesc)?;
         match desc.sync {
             SyncKind::BinaryPerSlot => {
                 if !enabled.khr_external_semaphore_fd {
@@ -232,19 +234,8 @@ impl ExternalFrameRing {
                         "device created without VK_KHR_external_semaphore_fd".into(),
                     ));
                 }
-                if desc.ready_semaphore_fds.len() != ring_len {
-                    return Err(ExternalFrameError::InvalidDesc(format!(
-                        "{} semaphore fd(s) for {ring_len} image(s)",
-                        desc.ready_semaphore_fds.len()
-                    )));
-                }
             }
             SyncKind::CpuBlocking => {
-                if !desc.ready_semaphore_fds.is_empty() {
-                    return Err(ExternalFrameError::InvalidDesc(
-                        "CpuBlocking ring must not carry semaphore fds".into(),
-                    ));
-                }
                 warn!(
                     "external frame source using CpuBlocking sync (semaphore export \
                      unavailable on the producer) — producer CPU-stalls per frame"
@@ -252,7 +243,9 @@ impl ExternalFrameRing {
             }
             SyncKind::Timeline => {
                 return Err(ExternalFrameError::Unsupported(
-                    "timeline sync not implemented in the PoC".into(),
+                    "timeline sync descriptor accepted, but timeline semaphore import/export is \
+                     not implemented yet"
+                        .into(),
                 ));
             }
         }

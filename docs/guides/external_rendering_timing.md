@@ -165,6 +165,8 @@ With `LatestReadyHoldLast`, a missed producer deadline repeats the pinned frame 
 
 ## Timeline semaphores
 
-The current implemented path uses one binary semaphore per ring slot. A binary signal must be waited before that slot's semaphore can be signaled again, so VSE drains all ready slots even when it displays only the newest.
+The current GPU path uses one binary semaphore per ring slot. A binary signal must be waited before that slot's semaphore can be signaled again, so VSE drains all ready slots even when it displays only the newest.
 
-A future timeline-semaphore backend can make latest-ready consumption cleaner. The producer would signal monotonically increasing values on one semaphore, and VSE could wait directly for the newest value. Older producer frames would be superseded by that wait. Slot ownership would still matter: VSE must keep any pinned display slot away from the producer until a replacement submit has finished reading it.
+The shared external-frame descriptor now has an explicit timeline shape: `sync = SyncKind::Timeline`, no per-slot binary semaphore FDs, and one `timeline_semaphore_fd`. The descriptor validator rejects mixed binary/timeline configurations before either side touches Vulkan.
+
+The raw GPU timeline backend is still pending. That backend will need the producer to export a real timeline semaphore, signal monotonically increasing values for completed frames, and send those values with the ready-frame notification. VSE can then wait directly for the newest value. Older producer frames are superseded by that wait. Slot ownership will still matter: VSE must keep any pinned display slot away from the producer until a replacement submit has finished reading it.
