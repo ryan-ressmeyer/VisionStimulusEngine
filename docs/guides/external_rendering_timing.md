@@ -125,19 +125,41 @@ The current API exposes the policy and preserves safe slot ownership. If an expe
 
 ## Deadline-aware producers
 
-`LatestReadyHoldLast` is most useful when the external producer is nonblocking from VSE's point of view. The current Bevy producer API can be used synchronously, where `render_frame()` returns only after Bevy submits the frame. In that pattern, VSE still waits for Bevy before it can flip.
+`LatestReadyHoldLast` is most useful when the external producer is nonblocking from VSE's point of view. `vse-bevy` provides both synchronous and asynchronous producer APIs.
 
-A deadline-aware producer should instead render ahead or render on another thread, then let VSE poll ready frames:
+The synchronous API renders before the flip:
 
 ```rust
-while let Some(frame) = producer.try_recv_ready() {
-    vse.queue_external_frame(frame.slot)?;
-}
-
+let slot = producer.render_frame(vse.frame_number())?;
+vse.queue_external_frame(slot)?;
 vse.flip_with_payload(None, payload)?;
 ```
 
-With `LatestReadyHoldLast`, a missed producer deadline then repeats the pinned frame rather than blocking the flip. VSE's scanout timing remains deterministic; the external content stream becomes opportunistic.
+This preserves a simple frame-indexed model, but VSE waits for Bevy.
+
+The asynchronous API runs Bevy on a worker thread. VSE requests frames, drains whatever has completed, and flips without waiting for the producer:
+
+```rust
+use vse_bevy::AsyncBevyProducer;
+
+let mut producer = AsyncBevyProducer::spawn(config, build_scene)?;
+vse.attach_external_frame_source_with_policy(
+    producer.export_ring()?,
+    producer.release_tx(),
+    ExternalFramePolicy::LatestReadyHoldLast,
+)?;
+
+// In FlipEvent::Render:
+producer.request_frame(vse.frame_number())?;
+while let Some(frame) = producer.try_recv_ready()? {
+    vse.queue_external_frame(frame.slot)?;
+}
+vse.flip_with_payload(None, payload)?;
+```
+
+The async worker coalesces pending requests. If VSE asks for frames 10, 11, and 12 while Bevy is still rendering, the worker skips the stale requests and renders the newest pending frame. This keeps the external stream latency-oriented instead of building a backlog of obsolete scene states.
+
+With `LatestReadyHoldLast`, a missed producer deadline repeats the pinned frame rather than blocking the flip. VSE's scanout timing remains deterministic; the external content stream becomes opportunistic.
 
 ---
 

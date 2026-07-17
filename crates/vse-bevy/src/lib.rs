@@ -14,9 +14,17 @@
 //!   shaders compile in the background;
 //! - all animation is a pure function of [`ExternalFrameIndex`] (VSE's frame
 //!   counter); Bevy's `Time` is never read by scene systems.
+//!
+//! Use [`BevyProducer`] when VSE should render a Bevy frame synchronously before
+//! each flip. Use [`AsyncBevyProducer`] with VSE's `LatestReadyHoldLast` external
+//! frame policy when VSE should flip on time and display the newest Bevy frame
+//! that has completed by the deadline.
 
 mod ring_alloc;
 pub mod scene;
+
+use std::sync::mpsc;
+use std::thread;
 
 use bevy::app::PluginsState;
 use bevy::camera::{ManualTextureViewHandle, RenderTarget};
@@ -28,7 +36,8 @@ use bevy::render::RenderPlugin;
 use bevy::window::ExitCondition;
 
 use vse_external_frame::{
-    ExternalRingDesc, RingError, RingFormat, RingStateMachine, SlotIndex, SlotReleaseRx, SyncKind,
+    release_channel, ExternalRingDesc, RingError, RingFormat, RingStateMachine, SlotIndex,
+    SlotReleaseRx, SlotReleaseTx, SyncKind,
 };
 
 use ring_alloc::ExportedRing;
@@ -41,6 +50,208 @@ pub enum ProducerError {
     Ring(#[from] RingError),
     #[error("ring already exported")]
     AlreadyExported,
+    #[error("async producer worker stopped")]
+    WorkerStopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadyFrame {
+    pub frame_number: u64,
+    pub slot: SlotIndex,
+}
+
+enum AsyncProducerCommand {
+    Render(u64),
+    Stop,
+}
+
+struct AsyncProducerClient {
+    request_tx: mpsc::Sender<AsyncProducerCommand>,
+    ready_rx: mpsc::Receiver<Result<ReadyFrame, ProducerError>>,
+}
+
+struct AsyncProducerWorker {
+    request_rx: mpsc::Receiver<AsyncProducerCommand>,
+    ready_tx: mpsc::Sender<Result<ReadyFrame, ProducerError>>,
+}
+
+struct AsyncProducerChannels;
+
+impl AsyncProducerChannels {
+    fn pair() -> (AsyncProducerClient, AsyncProducerWorker) {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        (
+            AsyncProducerClient {
+                request_tx,
+                ready_rx,
+            },
+            AsyncProducerWorker {
+                request_rx,
+                ready_tx,
+            },
+        )
+    }
+}
+
+impl AsyncProducerClient {
+    fn request_frame(&self, frame_number: u64) -> Result<(), ProducerError> {
+        self.request_tx
+            .send(AsyncProducerCommand::Render(frame_number))
+            .map_err(|_| ProducerError::WorkerStopped)
+    }
+
+    fn try_recv_ready(&self) -> Result<Option<ReadyFrame>, ProducerError> {
+        match self.ready_rx.try_recv() {
+            Ok(Ok(frame)) => Ok(Some(frame)),
+            Ok(Err(e)) => Err(e),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err(ProducerError::WorkerStopped),
+        }
+    }
+}
+
+impl AsyncProducerWorker {
+    fn try_recv_request(&self) -> Result<Option<u64>, ProducerError> {
+        match self.request_rx.try_recv() {
+            Ok(AsyncProducerCommand::Render(frame_number)) => Ok(Some(frame_number)),
+            Ok(AsyncProducerCommand::Stop) => Ok(None),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err(ProducerError::WorkerStopped),
+        }
+    }
+
+    fn recv_latest_request(&self) -> Result<Option<u64>, ProducerError> {
+        let mut latest = match self.request_rx.recv() {
+            Ok(AsyncProducerCommand::Render(frame_number)) => frame_number,
+            Ok(AsyncProducerCommand::Stop) => return Ok(None),
+            Err(_) => return Err(ProducerError::WorkerStopped),
+        };
+        while let Some(frame_number) = self.try_recv_request()? {
+            latest = frame_number;
+        }
+        Ok(Some(latest))
+    }
+
+    #[cfg(test)]
+    fn send_ready(&self, frame: ReadyFrame) -> Result<(), ProducerError> {
+        self.ready_tx
+            .send(Ok(frame))
+            .map_err(|_| ProducerError::WorkerStopped)
+    }
+}
+
+struct AsyncProducerInit {
+    export_desc: ExternalRingDesc,
+    sync: SyncKind,
+    extent: [u32; 2],
+}
+
+/// A Bevy external-frame producer running on its own worker thread.
+///
+/// `request_frame()` queues work and returns immediately. Completed frames are
+/// retrieved with `try_recv_ready()` and then passed to VSE via
+/// `RenderContext::queue_external_frame`.
+pub struct AsyncBevyProducer {
+    client: AsyncProducerClient,
+    release_tx: SlotReleaseTx,
+    export_desc: Option<ExternalRingDesc>,
+    sync: SyncKind,
+    extent: [u32; 2],
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl AsyncBevyProducer {
+    pub fn spawn(
+        config: ProducerConfig,
+        build_scene: impl FnOnce(&mut App, Entity) + Send + 'static,
+    ) -> Result<Self, ProducerError> {
+        let (release_tx, release_rx) = release_channel();
+        let (client, worker_channels) = AsyncProducerChannels::pair();
+        let (init_tx, init_rx) = mpsc::sync_channel(1);
+
+        let worker = thread::spawn(move || {
+            let mut producer = match BevyProducer::new(config, build_scene) {
+                Ok(producer) => producer,
+                Err(e) => {
+                    let _ = init_tx.send(Err(e));
+                    return;
+                }
+            };
+            producer.set_release_rx(release_rx);
+
+            let export_desc = match producer.export_ring() {
+                Ok(desc) => desc,
+                Err(e) => {
+                    let _ = init_tx.send(Err(e));
+                    return;
+                }
+            };
+            let init = AsyncProducerInit {
+                export_desc,
+                sync: producer.sync(),
+                extent: producer.extent(),
+            };
+            if init_tx.send(Ok(init)).is_err() {
+                return;
+            }
+
+            while let Ok(Some(frame_number)) = worker_channels.recv_latest_request() {
+                let result = producer
+                    .render_frame(frame_number)
+                    .map(|slot| ReadyFrame { frame_number, slot });
+                if worker_channels.ready_tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let init = init_rx.recv().map_err(|_| ProducerError::WorkerStopped)??;
+
+        Ok(Self {
+            client,
+            release_tx,
+            export_desc: Some(init.export_desc),
+            sync: init.sync,
+            extent: init.extent,
+            worker: Some(worker),
+        })
+    }
+
+    pub fn export_ring(&mut self) -> Result<ExternalRingDesc, ProducerError> {
+        self.export_desc
+            .take()
+            .ok_or(ProducerError::AlreadyExported)
+    }
+
+    pub fn release_tx(&self) -> SlotReleaseTx {
+        self.release_tx.clone()
+    }
+
+    pub fn sync(&self) -> SyncKind {
+        self.sync
+    }
+
+    pub fn extent(&self) -> [u32; 2] {
+        self.extent
+    }
+
+    pub fn request_frame(&self, frame_number: u64) -> Result<(), ProducerError> {
+        self.client.request_frame(frame_number)
+    }
+
+    pub fn try_recv_ready(&self) -> Result<Option<ReadyFrame>, ProducerError> {
+        self.client.try_recv_ready()
+    }
+}
+
+impl Drop for AsyncBevyProducer {
+    fn drop(&mut self) {
+        let _ = self.client.request_tx.send(AsyncProducerCommand::Stop);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 /// The only clock scene systems may read: VSE's frame counter, written by
@@ -307,5 +518,46 @@ impl BevyProducer {
         let handed = self.machine.take_ready().expect("slot marked ready above");
         debug_assert_eq!(handed, slot, "producer hand-off must be FIFO");
         Ok(slot)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn async_channels_deliver_requests_and_ready_frames_without_blocking() {
+        let (client, worker) = AsyncProducerChannels::pair();
+
+        client.request_frame(7).unwrap();
+        assert_eq!(worker.try_recv_request().unwrap(), Some(7));
+        assert_eq!(worker.try_recv_request().unwrap(), None);
+
+        worker
+            .send_ready(ReadyFrame {
+                frame_number: 7,
+                slot: SlotIndex(2),
+            })
+            .unwrap();
+        assert_eq!(
+            client.try_recv_ready().unwrap(),
+            Some(ReadyFrame {
+                frame_number: 7,
+                slot: SlotIndex(2),
+            })
+        );
+        assert_eq!(client.try_recv_ready().unwrap(), None);
+    }
+
+    #[test]
+    fn async_worker_coalesces_pending_requests_to_newest_frame() {
+        let (client, worker) = AsyncProducerChannels::pair();
+
+        client.request_frame(1).unwrap();
+        client.request_frame(2).unwrap();
+        client.request_frame(3).unwrap();
+
+        assert_eq!(worker.recv_latest_request().unwrap(), Some(3));
+        assert_eq!(worker.try_recv_request().unwrap(), None);
     }
 }
