@@ -298,12 +298,24 @@ impl<'a> RenderContext<'a> {
         &mut self,
         slot: vse_external_frame::SlotIndex,
     ) -> Result<(), VSEError> {
+        self.queue_external_frame_with_timeline_value(slot, None)
+    }
+
+    /// Queue an external frame and, for timeline-synchronized sources, the
+    /// timeline semaphore value signaled by the producer for that frame. This
+    /// method also accepts `None` for binary-per-slot and CPU-blocking sources,
+    /// so callers can pass `ReadyFrame::timeline_value` without branching.
+    pub fn queue_external_frame_with_timeline_value(
+        &mut self,
+        slot: vse_external_frame::SlotIndex,
+        timeline_value: Option<u64>,
+    ) -> Result<(), VSEError> {
         let src = self.state.external_source.as_mut().ok_or_else(|| {
             crate::core::external_frame::ExternalFrameError::Unsupported(
                 "no external frame source attached".into(),
             )
         })?;
-        src.note_ready(slot)?;
+        src.note_ready_with_value(slot, timeline_value)?;
         Ok(())
     }
 

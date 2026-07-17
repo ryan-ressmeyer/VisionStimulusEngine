@@ -58,6 +58,7 @@ pub enum ProducerError {
 pub struct ReadyFrame {
     pub frame_number: u64,
     pub slot: SlotIndex,
+    pub timeline_value: Option<u64>,
 }
 
 enum AsyncProducerCommand {
@@ -197,9 +198,7 @@ impl AsyncBevyProducer {
             }
 
             while let Ok(Some(frame_number)) = worker_channels.recv_latest_request() {
-                let result = producer
-                    .render_frame(frame_number)
-                    .map(|slot| ReadyFrame { frame_number, slot });
+                let result = producer.render_ready_frame(frame_number);
                 if worker_channels.ready_tx.send(result).is_err() {
                     break;
                 }
@@ -287,6 +286,7 @@ pub struct BevyProducer {
     /// Ring descriptor, present until `export_ring` moves it out.
     export_desc: Option<ExternalRingDesc>,
     extent: [u32; 2],
+    timeline_counter: u64,
 }
 
 impl BevyProducer {
@@ -396,7 +396,10 @@ impl BevyProducer {
                 .iter()
                 .map(|fd| fd.try_clone().expect("dup ring semaphore fd"))
                 .collect(),
-            timeline_semaphore_fd: None,
+            timeline_semaphore_fd: ring
+                .timeline_semaphore_fd
+                .as_ref()
+                .map(|fd| fd.try_clone().expect("dup timeline semaphore fd")),
             sync: ring.sync,
         };
 
@@ -431,6 +434,7 @@ impl BevyProducer {
             camera,
             export_desc: Some(export_desc),
             extent: config.extent,
+            timeline_counter: 0,
         })
     }
 
@@ -462,6 +466,13 @@ impl BevyProducer {
     /// function of it. The returned slot must be handed to
     /// `RenderContext::queue_external_frame` before the corresponding flip.
     pub fn render_frame(&mut self, frame_number: u64) -> Result<SlotIndex, ProducerError> {
+        self.render_ready_frame(frame_number)
+            .map(|frame| frame.slot)
+    }
+
+    /// Render one frame and return the full ready-frame notification,
+    /// including a timeline value when the ring uses timeline sync.
+    pub fn render_ready_frame(&mut self, frame_number: u64) -> Result<ReadyFrame, ProducerError> {
         // Drain the release back-edge.
         if let Some(rx) = &self.release_rx {
             for slot in rx.drain() {
@@ -489,8 +500,13 @@ impl BevyProducer {
         // prior commands on the queue in submission order, so an empty submit
         // carrying the signal is correct even if Bevy submitted multiple times.
         let queue = self.app.world().resource::<RenderQueue>();
-        match self.ring.slots[slot.0].semaphore {
-            Some(semaphore) => {
+        let mut timeline_value = None;
+        match (
+            self.ring.sync,
+            self.ring.slots[slot.0].semaphore,
+            self.ring.timeline_semaphore,
+        ) {
+            (SyncKind::BinaryPerSlot, Some(semaphore), _) => {
                 // SAFETY: semaphore was created on this queue's device; the hal
                 // guard is dropped before the submit that consumes the signal.
                 unsafe {
@@ -501,7 +517,21 @@ impl BevyProducer {
                 }
                 queue.submit([]);
             }
-            None => {
+            (SyncKind::Timeline, _, Some(semaphore)) => {
+                self.timeline_counter += 1;
+                let value = self.timeline_counter;
+                // SAFETY: semaphore was created on this queue's device; the hal
+                // guard is dropped before the submit that consumes the signal.
+                unsafe {
+                    let hal_queue = queue
+                        .as_hal::<wgpu::hal::api::Vulkan>()
+                        .expect("wgpu is running on Vulkan");
+                    hal_queue.add_signal_semaphore(semaphore, Some(value));
+                }
+                queue.submit([]);
+                timeline_value = Some(value);
+            }
+            _ => {
                 // CpuBlocking fallback: stall until this frame's GPU work is
                 // done, so the frame is complete before VSE ever samples it.
                 self.app
@@ -518,7 +548,11 @@ impl BevyProducer {
         // over the release channel (Ready → Consuming on this side's mirror).
         let handed = self.machine.take_ready().expect("slot marked ready above");
         debug_assert_eq!(handed, slot, "producer hand-off must be FIFO");
-        Ok(slot)
+        Ok(ReadyFrame {
+            frame_number,
+            slot,
+            timeline_value,
+        })
     }
 }
 
@@ -538,6 +572,7 @@ mod tests {
             .send_ready(ReadyFrame {
                 frame_number: 7,
                 slot: SlotIndex(2),
+                timeline_value: Some(11),
             })
             .unwrap();
         assert_eq!(
@@ -545,6 +580,7 @@ mod tests {
             Some(ReadyFrame {
                 frame_number: 7,
                 slot: SlotIndex(2),
+                timeline_value: Some(11),
             })
         );
         assert_eq!(client.try_recv_ready().unwrap(), None);

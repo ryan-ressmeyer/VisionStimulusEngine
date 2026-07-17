@@ -689,6 +689,7 @@ pub unsafe fn create_device_with_present_timing(
 
     // --- Discover supported sub-features via vkGetPhysicalDeviceFeatures2 ---
     let mut dyn_render = ash::vk::PhysicalDeviceDynamicRenderingFeatures::default();
+    let mut timeline = ash::vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
     let mut f_timing = PhysicalDevicePresentTimingFeaturesEXT {
         s_type: STYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT,
         p_next: std::ptr::null_mut(),
@@ -707,12 +708,13 @@ pub unsafe fn create_device_with_present_timing(
         present_wait2: 0,
     };
 
-    // Chain: dyn_render -> f_timing -> f_id2 -> [f_wait2]
+    // Chain: dyn_render -> timeline -> f_timing -> f_id2 -> [f_wait2]
     if support.present_wait2 {
         f_id2.p_next = &mut f_wait2 as *mut _ as *mut c_void;
     }
     f_timing.p_next = &mut f_id2 as *mut _ as *mut c_void;
-    dyn_render.p_next = &mut f_timing as *mut _ as *mut c_void;
+    timeline.p_next = &mut f_timing as *mut _ as *mut c_void;
+    dyn_render.p_next = &mut timeline as *mut _ as *mut c_void;
 
     let mut features2 = ash::vk::PhysicalDeviceFeatures2::default();
     features2.p_next = &mut dyn_render as *mut _ as *mut c_void;
@@ -794,6 +796,12 @@ pub unsafe fn create_device_with_present_timing(
         queue_ci.p_next = &queue_prio as *const _ as *const c_void;
     }
 
+    timeline.timeline_semaphore = if timeline.timeline_semaphore != 0 {
+        ash::vk::TRUE
+    } else {
+        ash::vk::FALSE
+    };
+
     let mut device_ci = ash::vk::DeviceCreateInfo::default();
     device_ci.queue_create_info_count = 1;
     device_ci.p_queue_create_infos = &queue_ci;
@@ -847,6 +855,7 @@ pub unsafe fn create_device_with_present_timing(
         },
         enabled_features: DeviceFeatures {
             dynamic_rendering: true,
+            timeline_semaphore: timeline.timeline_semaphore != 0,
             ..DeviceFeatures::empty()
         },
         ..Default::default()

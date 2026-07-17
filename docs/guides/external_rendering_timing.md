@@ -152,10 +152,12 @@ vse.attach_external_frame_source_with_policy(
 // In FlipEvent::Render:
 producer.request_frame(vse.frame_number())?;
 while let Some(frame) = producer.try_recv_ready()? {
-    vse.queue_external_frame(frame.slot)?;
+    vse.queue_external_frame_with_timeline_value(frame.slot, frame.timeline_value)?;
 }
 vse.flip_with_payload(None, payload)?;
 ```
+
+For binary-per-slot and CPU-blocking producers, `frame.timeline_value` is `None`. For timeline-synchronized producers, it is the value signaled by the producer for that completed frame.
 
 The async worker coalesces pending requests. If VSE asks for frames 10, 11, and 12 while Bevy is still rendering, the worker skips the stale requests and renders the newest pending frame. This keeps the external stream latency-oriented instead of building a backlog of obsolete scene states.
 
@@ -167,6 +169,6 @@ With `LatestReadyHoldLast`, a missed producer deadline repeats the pinned frame 
 
 The current GPU path uses one binary semaphore per ring slot. A binary signal must be waited before that slot's semaphore can be signaled again, so VSE drains all ready slots even when it displays only the newest.
 
-The shared external-frame descriptor now has an explicit timeline shape: `sync = SyncKind::Timeline`, no per-slot binary semaphore FDs, and one `timeline_semaphore_fd`. The descriptor validator rejects mixed binary/timeline configurations before either side touches Vulkan.
+The shared external-frame descriptor has an explicit timeline shape: `sync = SyncKind::Timeline`, no per-slot binary semaphore FDs, and one `timeline_semaphore_fd`. The descriptor validator rejects mixed binary/timeline configurations before either side touches Vulkan.
 
-The raw GPU timeline backend is still pending. That backend will need the producer to export a real timeline semaphore, signal monotonically increasing values for completed frames, and send those values with the ready-frame notification. VSE can then wait directly for the newest value. Older producer frames are superseded by that wait. Slot ownership will still matter: VSE must keep any pinned display slot away from the producer until a replacement submit has finished reading it.
+The `vse-bevy` timeline backend is opt-in with `VSE_BEVY_FORCE_TIMELINE=1`. When the live create/export probe succeeds, Bevy signals one exported timeline semaphore with a monotonically increasing value for each completed frame, and `ReadyFrame::timeline_value` carries that value to VSE. VSE imports the timeline semaphore and waits the newest queued value in the submit that samples the external image. Older producer frames are superseded by that wait and released after the submit fence. Slot ownership still matters: VSE keeps any pinned display slot away from the producer until a replacement submit has finished reading it.

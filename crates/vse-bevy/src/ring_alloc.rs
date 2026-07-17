@@ -49,6 +49,8 @@ pub(crate) struct ExportedRing {
     pub slots: Vec<ExportedSlot>,
     pub image_descs: Vec<ExternalImageDesc>,
     pub semaphore_fds: Vec<OwnedFd>,
+    pub timeline_semaphore: Option<vk::Semaphore>,
+    pub timeline_semaphore_fd: Option<OwnedFd>,
     pub sync: SyncKind,
 }
 
@@ -73,6 +75,18 @@ pub(crate) fn allocate_ring(
             .as_hal::<wgpu::hal::api::Vulkan>()
             .ok_or_else(|| ProducerError::Setup("wgpu is not running on Vulkan".into()))?;
         probe_semaphore_export(&hal)
+    };
+    let (timeline_semaphore, timeline_semaphore_fd) = if sync == SyncKind::Timeline {
+        unsafe {
+            let hal = device
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .expect("checked above");
+            let raw = hal.raw_device();
+            let instance = hal.shared_instance().raw_instance();
+            create_exported_timeline_semaphore(raw, instance)?
+        }
+    } else {
+        (None, None)
     };
 
     for slot_index in 0..ring_len {
@@ -253,8 +267,36 @@ pub(crate) fn allocate_ring(
         slots,
         image_descs,
         semaphore_fds,
+        timeline_semaphore,
+        timeline_semaphore_fd,
         sync,
     })
+}
+
+unsafe fn create_exported_timeline_semaphore(
+    raw: &ash::Device,
+    instance: &ash::Instance,
+) -> Result<(Option<vk::Semaphore>, Option<OwnedFd>), ProducerError> {
+    let mut export_sem = vk::ExportSemaphoreCreateInfo::default()
+        .handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+    let mut type_info = vk::SemaphoreTypeCreateInfo::default()
+        .semaphore_type(vk::SemaphoreType::TIMELINE)
+        .initial_value(0);
+    let sem_ci = vk::SemaphoreCreateInfo::default()
+        .push_next(&mut export_sem)
+        .push_next(&mut type_info);
+    let sem = raw
+        .create_semaphore(&sem_ci, None)
+        .map_err(|e| ProducerError::Setup(format!("create timeline semaphore: {e}")))?;
+    let sem_loader = ash::khr::external_semaphore_fd::Device::new(instance, raw);
+    let fd = sem_loader
+        .get_semaphore_fd(
+            &vk::SemaphoreGetFdInfoKHR::default()
+                .semaphore(sem)
+                .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD),
+        )
+        .map_err(|e| ProducerError::Setup(format!("get timeline semaphore fd: {e}")))?;
+    Ok((Some(sem), Some(OwnedFd::from_raw_fd(fd))))
 }
 
 /// Probe whether binary-semaphore OPAQUE_FD export will work on this device.
@@ -275,6 +317,34 @@ unsafe fn probe_semaphore_export(hal: &wgpu::hal::vulkan::Device) -> SyncKind {
     let phys = hal.raw_physical_device();
 
     // 1. Driver-level exportability (instance-level query, fully conformant).
+    let mut timeline_type = vk::SemaphoreTypeCreateInfo::default()
+        .semaphore_type(vk::SemaphoreType::TIMELINE)
+        .initial_value(0);
+    let timeline_info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD)
+        .push_next(&mut timeline_type);
+    let mut timeline_props = vk::ExternalSemaphoreProperties::default();
+    instance.get_physical_device_external_semaphore_properties(
+        phys,
+        &timeline_info,
+        &mut timeline_props,
+    );
+    if std::env::var_os("VSE_BEVY_FORCE_TIMELINE").is_some()
+        && timeline_props
+            .external_semaphore_features
+            .contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE)
+    {
+        match create_exported_timeline_semaphore(hal.raw_device(), instance) {
+            Ok((Some(sem), Some(_fd))) => {
+                hal.raw_device().destroy_semaphore(sem, None);
+                tracing::info!("timeline semaphore export probe succeeded — Timeline sync");
+                return SyncKind::Timeline;
+            }
+            Ok(_) => {}
+            Err(e) => warn!("timeline semaphore export probe failed: {e}"),
+        }
+    }
+
     let info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
         .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
     let mut props = vk::ExternalSemaphoreProperties::default();

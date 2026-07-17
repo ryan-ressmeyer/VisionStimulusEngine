@@ -46,7 +46,10 @@ use vulkano::memory::{
     MemoryAllocateInfo, MemoryImportInfo, ResourceMemory,
 };
 use vulkano::sync::fence::Fence;
-use vulkano::sync::semaphore::{ExternalSemaphoreHandleType, ImportSemaphoreFdInfo, Semaphore};
+use vulkano::sync::semaphore::{
+    ExternalSemaphoreHandleType, ImportSemaphoreFdInfo, Semaphore, SemaphoreCreateInfo,
+    SemaphoreType,
+};
 use vulkano::sync::GpuFuture;
 
 use vse_external_frame::{
@@ -171,6 +174,8 @@ struct ExternalFramePlan {
 pub struct ExternalFrameRing {
     images: Vec<Arc<Image>>,
     ready_sems: Vec<Arc<Semaphore>>,
+    timeline_sem: Option<Arc<Semaphore>>,
+    ready_values: Vec<Option<u64>>,
     machine: RingStateMachine,
     release_tx: SlotReleaseTx,
     /// Consumed slots awaiting their sampling submit's fence (release back-edge).
@@ -207,7 +212,7 @@ impl ExternalFrameRing {
     pub fn import_with_policy(
         device: &Arc<Device>,
         queue: &Arc<Queue>,
-        desc: ExternalRingDesc,
+        mut desc: ExternalRingDesc,
         release_tx: SlotReleaseTx,
         policy: ExternalFramePolicy,
     ) -> Result<Self, ExternalFrameError> {
@@ -242,11 +247,16 @@ impl ExternalFrameRing {
                 );
             }
             SyncKind::Timeline => {
-                return Err(ExternalFrameError::Unsupported(
-                    "timeline sync descriptor accepted, but timeline semaphore import/export is \
-                     not implemented yet"
-                        .into(),
-                ));
+                if !device.enabled_features().timeline_semaphore {
+                    return Err(ExternalFrameError::Unsupported(
+                        "device created without timeline_semaphore feature".into(),
+                    ));
+                }
+                if !enabled.khr_external_semaphore_fd {
+                    return Err(ExternalFrameError::Unsupported(
+                        "device created without VK_KHR_external_semaphore_fd".into(),
+                    ));
+                }
             }
         }
 
@@ -327,7 +337,7 @@ impl ExternalFrameRing {
             images.push(Arc::new(image));
         }
 
-        // --- Import the per-slot ready semaphores ---
+        // --- Import ready semaphore(s) ---
         let mut ready_sems = Vec::new();
         if desc.sync == SyncKind::BinaryPerSlot {
             for (i, fd) in desc.ready_semaphore_fds.into_iter().enumerate() {
@@ -345,6 +355,29 @@ impl ExternalFrameRing {
                 ready_sems.push(Arc::new(sem));
             }
         }
+        let timeline_sem = if desc.sync == SyncKind::Timeline {
+            let fd = desc
+                .timeline_semaphore_fd
+                .take()
+                .expect("validate_sync_shape checked timeline fd");
+            let sem = Semaphore::new(
+                device.clone(),
+                SemaphoreCreateInfo {
+                    semaphore_type: SemaphoreType::Timeline,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| ExternalFrameError::ImportFailed(format!("timeline semaphore: {e}")))?;
+            let mut import_info =
+                ImportSemaphoreFdInfo::handle_type(ExternalSemaphoreHandleType::OpaqueFd);
+            import_info.file = Some(std::fs::File::from(fd));
+            unsafe { sem.import_fd(import_info) }.map_err(|e| {
+                ExternalFrameError::ImportFailed(format!("timeline semaphore import: {e}"))
+            })?;
+            Some(Arc::new(sem))
+        } else {
+            None
+        };
 
         // --- One-time layout init: clear every image (see doc comment) ---
         let cb_alloc = Arc::new(StandardCommandBufferAllocator::new(
@@ -374,8 +407,10 @@ impl ExternalFrameRing {
 
         Ok(Self {
             machine: RingStateMachine::new(ring_len, desc.sync)?,
+            ready_values: vec![None; ring_len],
             images,
             ready_sems,
+            timeline_sem,
             release_tx,
             in_flight: VecDeque::new(),
             sync: desc.sync,
@@ -405,7 +440,24 @@ impl ExternalFrameRing {
     /// The producer finished rendering `slot` (consumer-side mirror of the
     /// producer's `mark_ready`): `Producing → Ready` here, entered via
     /// `RenderContext::queue_external_frame`.
-    pub(crate) fn note_ready(&mut self, slot: SlotIndex) -> Result<(), ExternalFrameError> {
+    pub(crate) fn note_ready_with_value(
+        &mut self,
+        slot: SlotIndex,
+        timeline_value: Option<u64>,
+    ) -> Result<(), ExternalFrameError> {
+        match self.sync {
+            SyncKind::Timeline if timeline_value.is_none() => {
+                return Err(ExternalFrameError::InvalidDesc(
+                    "Timeline external frame queued without a timeline value".into(),
+                ));
+            }
+            SyncKind::BinaryPerSlot | SyncKind::CpuBlocking if timeline_value.is_some() => {
+                return Err(ExternalFrameError::InvalidDesc(
+                    "timeline value supplied for non-timeline external frame source".into(),
+                ));
+            }
+            _ => {}
+        }
         // Mirror the producer's acquire on this side first.
         let acquired = self.machine.acquire_for_produce()?;
         if acquired != slot {
@@ -415,25 +467,34 @@ impl ExternalFrameRing {
                 slot.0, acquired.0
             )));
         }
+        self.ready_values[slot.0] = timeline_value;
         self.machine.mark_ready(slot)?;
         Ok(())
     }
 
     /// Take the external image to use for this flip (see [`ConsumableFrames`]).
     pub(crate) fn take_frames(&mut self) -> Option<ConsumableFrames> {
-        let mut ready_slots = Vec::new();
-        while let Some(slot) = self.machine.take_ready() {
-            ready_slots.push(slot);
-        }
+        let ready_slots = self.machine.take_all_ready();
         let plan = self.latch.plan(self.policy, ready_slots);
         let display_slot = plan.display_slot?;
-        let waits = if self.sync == SyncKind::BinaryPerSlot {
-            plan.wait_slots
+        let waits = match self.sync {
+            SyncKind::BinaryPerSlot => plan
+                .wait_slots
                 .iter()
                 .map(|slot| (self.ready_sems[slot.0].clone(), None))
-                .collect()
-        } else {
-            Vec::new()
+                .collect(),
+            SyncKind::Timeline => {
+                let value = self.ready_values[display_slot.0]
+                    .expect("timeline ready frame must carry a value");
+                vec![(
+                    self.timeline_sem
+                        .as_ref()
+                        .expect("timeline sync imports a semaphore")
+                        .clone(),
+                    Some(value),
+                )]
+            }
+            SyncKind::CpuBlocking => Vec::new(),
         };
         Some(ConsumableFrames {
             image: self.images[display_slot.0].clone(),
@@ -468,6 +529,7 @@ impl ExternalFrameRing {
                 Ok(true) => {
                     let slot = *slot;
                     self.in_flight.pop_front();
+                    self.ready_values[slot.0] = None;
                     if let Err(e) = self.machine.release(slot) {
                         warn!("external frame slot release bookkeeping failed: {e}");
                     }

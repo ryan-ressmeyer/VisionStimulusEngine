@@ -137,6 +137,20 @@ impl RingStateMachine {
         }
     }
 
+    /// Hand every ready slot to the consumer in production order
+    /// (`Ready → Consuming`). Unlike [`take_ready`](Self::take_ready), timeline
+    /// stale slots are not freed immediately; the caller can wait the newest
+    /// timeline value and then release every superseded slot through the normal
+    /// back-edge.
+    pub fn take_all_ready(&mut self) -> Vec<SlotIndex> {
+        let mut slots = Vec::with_capacity(self.ready_order.len());
+        while let Some(slot) = self.ready_order.pop_front() {
+            self.slots[slot] = SlotState::Consuming;
+            slots.push(SlotIndex(slot));
+        }
+        slots
+    }
+
     /// The consumer's submit that sampled the slot has fully executed
     /// (`Consuming → Free`); the slot's semaphore may be re-signaled.
     pub fn release(&mut self, slot: SlotIndex) -> Result<(), RingError> {
@@ -294,6 +308,22 @@ mod tests {
         let c = m.acquire_for_produce().unwrap();
         let d = m.acquire_for_produce().unwrap();
         assert!([c.0, d.0].contains(&a.0), "stale ready slot was not freed");
+    }
+
+    #[test]
+    fn take_all_ready_keeps_timeline_stale_slots_consuming_until_release() {
+        let mut m = ring(3, SyncKind::Timeline);
+        let a = m.acquire_for_produce().unwrap();
+        m.mark_ready(a).unwrap();
+        let b = m.acquire_for_produce().unwrap();
+        m.mark_ready(b).unwrap();
+
+        assert_eq!(m.take_all_ready(), vec![a, b]);
+        assert_eq!(m.acquire_for_produce().unwrap().0, 2);
+        assert_eq!(m.acquire_for_produce().unwrap_err(), RingError::NoFreeSlot);
+
+        m.release(a).unwrap();
+        assert_eq!(m.acquire_for_produce().unwrap(), a);
     }
 
     #[test]
