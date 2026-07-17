@@ -25,6 +25,7 @@ pub mod scene;
 
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use bevy::app::PluginsState;
 use bevy::camera::{ManualTextureViewHandle, RenderTarget};
@@ -112,6 +113,10 @@ impl AsyncProducerClient {
     }
 }
 
+fn is_retryable_async_backpressure(error: &ProducerError) -> bool {
+    matches!(error, ProducerError::Ring(RingError::NoFreeSlot))
+}
+
 impl AsyncProducerWorker {
     fn try_recv_request(&self) -> Result<Option<u64>, ProducerError> {
         match self.request_rx.try_recv() {
@@ -197,10 +202,38 @@ impl AsyncBevyProducer {
                 return;
             }
 
-            while let Ok(Some(frame_number)) = worker_channels.recv_latest_request() {
-                let result = producer.render_ready_frame(frame_number);
-                if worker_channels.ready_tx.send(result).is_err() {
-                    break;
+            'worker: while let Ok(Some(mut frame_number)) = worker_channels.recv_latest_request() {
+                loop {
+                    match producer.render_ready_frame(frame_number) {
+                        Ok(frame) => {
+                            if worker_channels.ready_tx.send(Ok(frame)).is_err() {
+                                break 'worker;
+                            }
+                            break;
+                        }
+                        Err(e) if is_retryable_async_backpressure(&e) => {
+                            // The async producer can temporarily outrun VSE's
+                            // release back-edge. That is backpressure, not a
+                            // fatal producer error: wait briefly, coalesce any
+                            // newer requests, and retry after releases have had
+                            // a chance to arrive.
+                            thread::sleep(Duration::from_millis(1));
+                            loop {
+                                match worker_channels.request_rx.try_recv() {
+                                    Ok(AsyncProducerCommand::Render(newer)) => {
+                                        frame_number = newer;
+                                    }
+                                    Ok(AsyncProducerCommand::Stop) => break 'worker,
+                                    Err(mpsc::TryRecvError::Empty) => break,
+                                    Err(mpsc::TryRecvError::Disconnected) => break 'worker,
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = worker_channels.ready_tx.send(Err(e));
+                            break 'worker;
+                        }
+                    }
                 }
             }
         });
@@ -596,5 +629,18 @@ mod tests {
 
         assert_eq!(worker.recv_latest_request().unwrap(), Some(3));
         assert_eq!(worker.try_recv_request().unwrap(), None);
+    }
+
+    #[test]
+    fn async_worker_treats_no_free_slot_as_retryable_backpressure() {
+        assert!(is_retryable_async_backpressure(&ProducerError::Ring(
+            RingError::NoFreeSlot
+        )));
+        assert!(!is_retryable_async_backpressure(&ProducerError::Ring(
+            RingError::TooSmall { len: 1 }
+        )));
+        assert!(!is_retryable_async_backpressure(
+            &ProducerError::WorkerStopped
+        ));
     }
 }

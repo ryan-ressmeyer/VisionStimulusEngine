@@ -458,15 +458,11 @@ impl ExternalFrameRing {
             }
             _ => {}
         }
-        // Mirror the producer's acquire on this side first.
-        let acquired = self.machine.acquire_for_produce()?;
-        if acquired != slot {
-            return Err(ExternalFrameError::InvalidDesc(format!(
-                "producer slot {} does not match consumer-side acquisition {} — \
-                 producer and consumer state machines have diverged",
-                slot.0, acquired.0
-            )));
-        }
+        // Mirror the producer's actual slot choice on this side. Async
+        // producers can receive release back-edge messages at different times
+        // than the consumer mirror, so lowest-free FIFO acquisition is not a
+        // safe cross-thread assumption.
+        self.machine.acquire_specific_for_produce(slot)?;
         self.ready_values[slot.0] = timeline_value;
         self.machine.mark_ready(slot)?;
         Ok(())

@@ -163,6 +163,40 @@ The async worker coalesces pending requests. If VSE asks for frames 10, 11, and 
 
 With `LatestReadyHoldLast`, a missed producer deadline repeats the pinned frame rather than blocking the flip. VSE's scanout timing remains deterministic; the external content stream becomes opportunistic.
 
+### Runnable async verification example
+
+`vse-bevy` includes a runnable example that exercises the full async latest-ready path:
+
+```sh
+CARGO_INCREMENTAL=0 cargo run -p vse-bevy --profile demo \
+  --example 03_async_latest_ready_demo -- 300
+```
+
+To force the optional timeline-semaphore probe/path:
+
+```sh
+VSE_BEVY_FORCE_TIMELINE=1 CARGO_INCREMENTAL=0 cargo run -p vse-bevy --profile demo \
+  --example 03_async_latest_ready_demo -- 300
+```
+
+The example does the following in each `FlipEvent::Render` callback:
+
+1. requests the next Bevy frame with `AsyncBevyProducer::request_frame(vse.frame_number())`;
+2. drains all completed frames with `try_recv_ready()`;
+3. queues each ready slot with `queue_external_frame_with_timeline_value(frame.slot, frame.timeline_value)`;
+4. calls `flip_with_payload(None, log)` without waiting for Bevy.
+
+Each confirmed frame prints the external-stream decision:
+
+- `new external frame displayed`: at least one Bevy frame was ready; VSE displayed the newest one;
+- `repeated/pinned frame`: no new Bevy frame was ready; VSE repeated the last displayed slot;
+- `stale_superseded > 0`: more than one ready Bevy frame was drained; older ready frames were safely consumed/released, but only the newest was displayed;
+- `producer`, `slot`, and `timeline` identify the displayed Bevy frame when available.
+
+A repeat is not a VSE timing failure. It means VSE preserved the flip deadline and held the previous external image instead of blocking on Bevy. Check `on_target` and `missed_count` separately for display-timing behavior.
+
+The example uses a 4-slot ring. That is the recommended starting point for `run_buffered(depth = 1)` plus `LatestReadyHoldLast`: one slot can be pinned for display, one can be in producer use, and the remaining slots cover the VSE submit/release pipeline. If the log shows long runs of repeated frames under a light scene, increase the ring length before treating it as a rendering-performance problem.
+
 ---
 
 ## Timeline semaphores

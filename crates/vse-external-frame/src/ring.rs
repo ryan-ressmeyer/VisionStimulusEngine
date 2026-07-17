@@ -102,6 +102,18 @@ impl RingStateMachine {
         Ok(SlotIndex(slot))
     }
 
+    /// Claim a specific producer-chosen `Free` slot (`Free → Producing`).
+    ///
+    /// Consumer mirrors use this when an asynchronous producer reports which
+    /// slot it actually rendered into. Release messages can reach the producer
+    /// and consumer mirrors at different times, so lowest-free acquisition is
+    /// not a safe cross-thread assumption.
+    pub fn acquire_specific_for_produce(&mut self, slot: SlotIndex) -> Result<(), RingError> {
+        self.expect_state(slot, SlotState::Free)?;
+        self.slots[slot.0] = SlotState::Producing;
+        Ok(())
+    }
+
     /// The producer finished the slot's frame and signaled its semaphore
     /// (`Producing → Ready`).
     pub fn mark_ready(&mut self, slot: SlotIndex) -> Result<(), RingError> {
@@ -241,6 +253,32 @@ mod tests {
         ids.sort();
         assert_eq!(ids, [0, 1, 2], "three acquires must yield distinct slots");
         assert_eq!(m.acquire_for_produce().unwrap_err(), RingError::NoFreeSlot);
+    }
+
+    #[test]
+    fn acquire_specific_claims_producer_chosen_free_slot() {
+        let mut m = ring(4, SyncKind::BinaryPerSlot);
+        let a = m.acquire_for_produce().unwrap();
+        let b = m.acquire_for_produce().unwrap();
+        m.mark_ready(a).unwrap();
+        m.mark_ready(b).unwrap();
+        assert_eq!(m.take_all_ready(), vec![a, b]);
+        m.release(b).unwrap();
+        m.release(a).unwrap();
+
+        // Both slots are free again, but a consumer mirror may receive a
+        // producer handoff for the later slot first. It must claim that exact
+        // slot rather than assuming lowest-free FIFO acquisition.
+        m.acquire_specific_for_produce(b).unwrap();
+        assert_eq!(
+            m.mark_ready(a).unwrap_err(),
+            RingError::InvalidTransition {
+                slot: a.0,
+                actual: SlotState::Free,
+                expected: SlotState::Producing,
+            }
+        );
+        m.mark_ready(b).unwrap();
     }
 
     #[test]
