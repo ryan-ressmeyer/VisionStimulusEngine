@@ -31,7 +31,7 @@ pub use buffered::{BufferedConfig, FlipEvent};
 pub use config::{VSEConfig, VSEContextBuilder, VSEError};
 pub use context::VSEContext;
 pub use device::{DeviceError, DeviceSelector, GPUPreference};
-pub use external_frame::{ExternalFrameError, ExternalFrameRing};
+pub use external_frame::{ExternalFrameError, ExternalFramePolicy, ExternalFrameRing};
 pub use frame::{Frame, FrameError};
 pub use input::{
     AcquisitionMethod, DisplayBackend, InputEvent, Key, KeyCode, MonitorInfo, MonitorSelection,

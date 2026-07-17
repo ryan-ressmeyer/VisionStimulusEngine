@@ -237,6 +237,23 @@ impl<'a> RenderContext<'a> {
         desc: vse_external_frame::ExternalRingDesc,
         release_tx: vse_external_frame::SlotReleaseTx,
     ) -> Result<(), VSEError> {
+        self.attach_external_frame_source_with_policy(
+            desc,
+            release_tx,
+            crate::core::external_frame::ExternalFramePolicy::default(),
+        )
+    }
+
+    /// Attach an external-renderer frame source with an explicit consumption
+    /// policy. Use [`ExternalFramePolicy::LatestReadyHoldLast`] when VSE should
+    /// repeat the last displayed external image instead of dropping to a clear
+    /// underlay on frames where no new producer frame has been queued.
+    pub fn attach_external_frame_source_with_policy(
+        &mut self,
+        desc: vse_external_frame::ExternalRingDesc,
+        release_tx: vse_external_frame::SlotReleaseTx,
+        policy: crate::core::external_frame::ExternalFramePolicy,
+    ) -> Result<(), VSEError> {
         use crate::core::external_frame::{ExternalFrameError, ExternalFrameRing};
         if self.state.present_engine.is_none() {
             return Err(ExternalFrameError::Unsupported(
@@ -252,13 +269,19 @@ impl<'a> RenderContext<'a> {
             )
             .into());
         }
-        let ring =
-            ExternalFrameRing::import(&self.state.device, &self.state.queue, desc, release_tx)?;
+        let ring = ExternalFrameRing::import_with_policy(
+            &self.state.device,
+            &self.state.queue,
+            desc,
+            release_tx,
+            policy,
+        )?;
         tracing::info!(
-            "external frame source attached: {} slots, {:?}, {:?}, {}x{}",
+            "external frame source attached: {} slots, {:?}, {:?}, {:?}, {}x{}",
             ring.ring_len(),
             ring.format(),
             ring.sync(),
+            policy,
             ring.extent()[0],
             ring.extent()[1],
         );

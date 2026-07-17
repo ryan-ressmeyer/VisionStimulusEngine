@@ -94,8 +94,77 @@ pub(crate) struct ConsumableFrames {
     /// All semaphores the consuming submit must wait on (empty under
     /// [`SyncKind::CpuBlocking`]), with timeline values if any.
     pub waits: Vec<(Arc<Semaphore>, Option<u64>)>,
-    /// Every slot consumed by this flip, released together on its fence.
+    /// Consumed slots that should be released together on this flip's fence.
+    /// In latched mode this excludes the newly displayed slot, which remains
+    /// owned by VSE until a replacement frame is submitted.
     pub slots: Vec<SlotIndex>,
+    /// Slot that becomes the held image after this flip submit succeeds.
+    pub latch_after_submit: Option<SlotIndex>,
+}
+
+/// How VSE chooses external-renderer frames at flip time.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalFramePolicy {
+    /// Consume ready external frames for this flip and release every consumed
+    /// slot after the flip's submit fence signals.
+    #[default]
+    FrameLocked,
+    /// Display the newest ready external frame when one exists. If no new
+    /// frame is ready, keep displaying the last consumed slot and do not
+    /// release it to the producer.
+    LatestReadyHoldLast,
+}
+
+#[derive(Debug, Default)]
+struct ExternalFrameLatch {
+    slot: Option<SlotIndex>,
+}
+
+impl ExternalFrameLatch {
+    fn note_latched(&mut self, slot: SlotIndex) {
+        self.slot = Some(slot);
+    }
+
+    fn plan(&self, policy: ExternalFramePolicy, ready_slots: Vec<SlotIndex>) -> ExternalFramePlan {
+        match policy {
+            ExternalFramePolicy::FrameLocked => ExternalFramePlan {
+                display_slot: ready_slots.last().copied(),
+                wait_slots: ready_slots.clone(),
+                release_after_submit: ready_slots,
+                new_latch: None,
+            },
+            ExternalFramePolicy::LatestReadyHoldLast => match ready_slots.last().copied() {
+                Some(newest) => {
+                    let wait_slots = ready_slots.clone();
+                    let mut release_after_submit = ready_slots;
+                    let _ = release_after_submit.pop();
+                    if let Some(previous) = self.slot {
+                        release_after_submit.push(previous);
+                    }
+                    ExternalFramePlan {
+                        display_slot: Some(newest),
+                        wait_slots,
+                        release_after_submit,
+                        new_latch: Some(newest),
+                    }
+                }
+                None => ExternalFramePlan {
+                    display_slot: self.slot,
+                    wait_slots: Vec::new(),
+                    release_after_submit: Vec::new(),
+                    new_latch: self.slot,
+                },
+            },
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ExternalFramePlan {
+    display_slot: Option<SlotIndex>,
+    wait_slots: Vec<SlotIndex>,
+    release_after_submit: Vec<SlotIndex>,
+    new_latch: Option<SlotIndex>,
 }
 
 /// The imported external image ring: VSE-side consumer state.
@@ -109,6 +178,8 @@ pub struct ExternalFrameRing {
     sync: SyncKind,
     format: RingFormat,
     extent: [u32; 2],
+    policy: ExternalFramePolicy,
+    latch: ExternalFrameLatch,
 }
 
 impl ExternalFrameRing {
@@ -123,6 +194,22 @@ impl ExternalFrameRing {
         queue: &Arc<Queue>,
         desc: ExternalRingDesc,
         release_tx: SlotReleaseTx,
+    ) -> Result<Self, ExternalFrameError> {
+        Self::import_with_policy(
+            device,
+            queue,
+            desc,
+            release_tx,
+            ExternalFramePolicy::default(),
+        )
+    }
+
+    pub fn import_with_policy(
+        device: &Arc<Device>,
+        queue: &Arc<Queue>,
+        desc: ExternalRingDesc,
+        release_tx: SlotReleaseTx,
+        policy: ExternalFramePolicy,
     ) -> Result<Self, ExternalFrameError> {
         let enabled = device.enabled_extensions();
         if !enabled.khr_external_memory_fd {
@@ -301,6 +388,8 @@ impl ExternalFrameRing {
             sync: desc.sync,
             format,
             extent,
+            policy,
+            latch: ExternalFrameLatch::default(),
         })
     }
 
@@ -337,22 +426,35 @@ impl ExternalFrameRing {
         Ok(())
     }
 
-    /// Take everything ready for this flip (see [`ConsumableFrames`]).
+    /// Take the external image to use for this flip (see [`ConsumableFrames`]).
     pub(crate) fn take_frames(&mut self) -> Option<ConsumableFrames> {
-        let mut slots = Vec::new();
-        let mut waits = Vec::new();
+        let mut ready_slots = Vec::new();
         while let Some(slot) = self.machine.take_ready() {
-            if self.sync == SyncKind::BinaryPerSlot {
-                waits.push((self.ready_sems[slot.0].clone(), None));
-            }
-            slots.push(slot);
+            ready_slots.push(slot);
         }
-        let newest = *slots.last()?;
+        let plan = self.latch.plan(self.policy, ready_slots);
+        let display_slot = plan.display_slot?;
+        let waits = if self.sync == SyncKind::BinaryPerSlot {
+            plan.wait_slots
+                .iter()
+                .map(|slot| (self.ready_sems[slot.0].clone(), None))
+                .collect()
+        } else {
+            Vec::new()
+        };
         Some(ConsumableFrames {
-            image: self.images[newest.0].clone(),
+            image: self.images[display_slot.0].clone(),
             waits,
-            slots,
+            slots: plan.release_after_submit,
+            latch_after_submit: plan.new_latch,
         })
+    }
+
+    /// Commit latch state after the flip submit that uses `frames` succeeds.
+    pub(crate) fn on_submitted(&mut self, frames: &ConsumableFrames) {
+        if let Some(slot) = frames.latch_after_submit {
+            self.latch.note_latched(slot);
+        }
     }
 
     /// The flip seam consumed `slots` in a submit guarded by `fence`; when
@@ -385,5 +487,43 @@ impl ExternalFrameRing {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vse_external_frame::SlotIndex;
+
+    #[test]
+    fn latest_ready_hold_last_repeats_latched_slot_when_no_new_frame_is_ready() {
+        let mut latch = ExternalFrameLatch::default();
+        latch.note_latched(SlotIndex(1));
+
+        let decision = latch.plan(ExternalFramePolicy::LatestReadyHoldLast, Vec::new());
+
+        assert_eq!(decision.display_slot, Some(SlotIndex(1)));
+        assert!(decision.wait_slots.is_empty());
+        assert!(decision.release_after_submit.is_empty());
+        assert_eq!(decision.new_latch, Some(SlotIndex(1)));
+    }
+
+    #[test]
+    fn latest_ready_hold_last_replaces_latch_without_releasing_new_slot() {
+        let mut latch = ExternalFrameLatch::default();
+        latch.note_latched(SlotIndex(1));
+
+        let decision = latch.plan(
+            ExternalFramePolicy::LatestReadyHoldLast,
+            vec![SlotIndex(2), SlotIndex(3)],
+        );
+
+        assert_eq!(decision.display_slot, Some(SlotIndex(3)));
+        assert_eq!(decision.wait_slots, vec![SlotIndex(2), SlotIndex(3)]);
+        assert_eq!(
+            decision.release_after_submit,
+            vec![SlotIndex(2), SlotIndex(1)]
+        );
+        assert_eq!(decision.new_latch, Some(SlotIndex(3)));
     }
 }

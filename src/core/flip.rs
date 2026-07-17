@@ -270,9 +270,11 @@ impl<'a> RenderContext<'a> {
         if outcome.suboptimal {
             self.state.swapchain.mark_needs_recreation();
         }
-        // Release back-edge: the slots return to the producer once this submit's
-        // fence signals (pumped at the top of the next flip).
+        // Release back-edge: releasable slots return to the producer once this
+        // submit's fence signals. In latched mode, the displayed slot remains
+        // owned by VSE until a replacement submit succeeds.
         if let (Some(f), Some(src)) = (ext_frames, self.state.external_source.as_mut()) {
+            src.on_submitted(&f);
             src.on_consumed(&f.slots, outcome.fence.clone());
         }
 
@@ -610,9 +612,11 @@ impl<'a> RenderContext<'a> {
         if outcome.suboptimal {
             self.state.swapchain.mark_needs_recreation();
         }
-        // Release back-edge: the slots return to the producer once this submit's
-        // fence signals (pumped at the top of the next flip).
+        // Release back-edge: releasable slots return to the producer once this
+        // submit's fence signals. In latched mode, the displayed slot remains
+        // owned by VSE until a replacement submit succeeds.
         if let (Some(f), Some(src)) = (&ext_frames, self.state.external_source.as_mut()) {
+            src.on_submitted(f);
             src.on_consumed(&f.slots, outcome.fence.clone());
         }
 

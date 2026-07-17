@@ -17,7 +17,8 @@ VSE-owned direct present**) and fully-documented alternatives.
 
 > This document is a research synthesis, decision map, and spike record. It is not the current
 > implementation guide. Use it for the architectural rationale behind the Bevy/external-frame
-> path; use the code and narrower guides for current APIs.
+> path; use [`docs/guides/external_rendering_timing.md`](guides/external_rendering_timing.md)
+> for current external-frame timing policies.
 
 ---
 
