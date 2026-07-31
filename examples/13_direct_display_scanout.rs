@@ -1,5 +1,9 @@
 //! Example: Direct-display scanout timing verification (VK_EXT_present_timing, Subsystem B3)
 //!
+//! This is also VSE's entry point for direct-display mode generally: it acquires
+//! the display with no compositor in the path and drives it end to end. (It
+//! supersedes the earlier minimal "acquire + moving bar" direct-display demo.)
+//!
 //! The authoritative B3 test. On the direct-display path VSE owns the display (no compositor), so
 //! the synchronous `flip()` blocks on `vkWaitForPresent2KHR` until the frame begins scanout and
 //! reads its real scanout time. This example verifies, end to end:

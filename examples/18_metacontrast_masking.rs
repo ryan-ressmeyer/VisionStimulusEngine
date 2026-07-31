@@ -23,7 +23,7 @@
 //! # Running
 //!
 //! ```bash
-//! cargo run --release --example 14_metacontrast_masking
+//! cargo run --release --example 18_metacontrast_masking
 //! ```
 
 use std::fmt::Write as _;

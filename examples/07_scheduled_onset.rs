@@ -7,7 +7,7 @@
 //! # Running
 //!
 //! ```bash
-//! cargo run --release --example 04_scheduled_flip
+//! cargo run --release --example 07_scheduled_onset
 //! ```
 
 use vision_stimulus_engine::prelude::*;

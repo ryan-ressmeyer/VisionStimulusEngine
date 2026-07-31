@@ -13,7 +13,7 @@ use super::input::{
 use super::state::VSEState;
 use super::swapchain::SwapchainManager;
 use crate::data::messages::FrameMessage;
-use crate::drawing::primitives::{default_circle_segments, DrawCommand};
+use crate::drawing::primitives::{default_arc_segments, default_circle_segments, DrawCommand};
 use crate::drawing::{Color, GaborParams, GratingParams, NoiseParams, TextureHandle};
 use crate::timing::{Clock, ScanoutTimestamp, Timestamp, TimingSource};
 
@@ -443,6 +443,71 @@ impl<'a> RenderContext<'a> {
             width,
             color,
         });
+    }
+
+    /// Draw a stroked circular arc (an annular band segment).
+    ///
+    /// The band is centered on `radius` and is `thickness` pixels wide,
+    /// sweeping from `start_angle` to `end_angle` (radians). Pass
+    /// `0.0..=2*PI` for a full ring. Segment count is chosen automatically
+    /// from the radius and angular span.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_arc(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        start_angle: f32,
+        end_angle: f32,
+        thickness: f32,
+        color: Color,
+    ) {
+        let segments = default_arc_segments(radius, start_angle, end_angle);
+        self.state.renderer.push(DrawCommand::Arc {
+            cx,
+            cy,
+            radius,
+            start_angle,
+            end_angle,
+            thickness,
+            color,
+            segments,
+        });
+    }
+
+    /// Draw a line of text using the built-in 5×7 bitmap font.
+    ///
+    /// `(x, y)` is the top-left of the first glyph, in pixel coordinates.
+    /// `scale` is the size of one font pixel in screen pixels (so each glyph is
+    /// `5*scale` wide and `7*scale` tall). Text is drawn as filled rectangles
+    /// through the flat-color pipeline — no texture upload, no font asset.
+    /// Lowercase is rendered with the uppercase glyphs. Use
+    /// [`text_width`](Self::text_width) to center or right-align.
+    pub fn draw_text(&mut self, text: &str, x: f32, y: f32, scale: f32, color: Color) {
+        use crate::drawing::font;
+        let advance = (font::FONT_W + font::FONT_TRACKING) as f32 * scale;
+        let mut cx = x;
+        for ch in text.chars() {
+            if ch != ' ' {
+                let g = font::glyph(ch);
+                for (row, cols) in g.iter().enumerate() {
+                    for (col, &on) in cols.iter().enumerate() {
+                        if on {
+                            let px = cx + col as f32 * scale;
+                            let py = y + row as f32 * scale;
+                            self.draw_rect(px, py, px + scale, py + scale, color);
+                        }
+                    }
+                }
+            }
+            cx += advance;
+        }
+    }
+
+    /// Width in screen pixels that [`draw_text`](Self::draw_text) will occupy
+    /// for `text` at the given `scale`.
+    pub fn text_width(&self, text: &str, scale: f32) -> f32 {
+        crate::drawing::font::text_width_px(text) as f32 * scale
     }
 
     /// Draw a texture at the specified rectangle.

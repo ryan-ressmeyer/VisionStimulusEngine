@@ -5,7 +5,7 @@
 """Analyze a VSE metacontrast-masking session.
 
 Produces two panels from the per-trial CSV written by
-`examples/14_metacontrast_masking.rs`:
+`examples/18_metacontrast_masking.rs`:
 
   1. The masking function — proportion correct vs SOA. A Type-B result shows
      a U-shaped dip at intermediate SOA (~40-64 ms).
@@ -36,7 +36,7 @@ def find_csv(argv: list[str]) -> Path:
     if not candidates:
         sys.exit(
             "No CSV given and no metacontrast_*.csv found. "
-            "Run the demo first: cargo run --release --example 14_metacontrast_masking"
+            "Run the demo first: cargo run --release --example 18_metacontrast_masking"
         )
     return Path(candidates[-1])
 

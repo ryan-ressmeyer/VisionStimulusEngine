@@ -9,7 +9,7 @@
 //! # Running
 //!
 //! ```bash
-//! cargo run --example 00_clear_color
+//! cargo run --example 00_hello_flip
 //! ```
 
 use vision_stimulus_engine::prelude::*;
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Track frame count for logging
     let mut frame_count: u64 = 0;
-    let start_time = std::time::Instant::now();
+    let mut prev_time = std::time::Instant::now();
 
     // Run event loop (closure takes ownership of captured variables)
     context.run(move |vse| {
@@ -58,14 +58,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Log every 60 frames (approximately once per second at 60 Hz)
         if frame_count % 60 == 0 {
-            let elapsed = start_time.elapsed().as_secs_f64();
-            let fps = frame_count as f64 / elapsed;
+            let elapsed = prev_time.elapsed().as_secs_f64();
+            let fps = 60.0 / elapsed;
             println!(
                 "Frame {}: {:.1} FPS | GPU: {}",
                 frame_count,
                 fps,
                 vse.gpu_name()
             );
+            prev_time = std::time::Instant::now();
         }
 
         Ok(())

@@ -103,7 +103,7 @@ Log in, then run VSE. No compositor, no permissions required.
 
 ```bash
 # From TTY:
-cargo run --release --example 08_direct_display
+cargo run --release --example 13_direct_display_scanout
 ```
 
 Switch back to your desktop with **Ctrl+Alt+F1** (or F7 on some systems).

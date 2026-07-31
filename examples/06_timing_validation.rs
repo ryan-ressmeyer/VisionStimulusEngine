@@ -7,8 +7,8 @@
 //! # Running
 //!
 //! ```bash
-//! cargo run --example 01_timing_validation
-//! cargo run --release --example 01_timing_validation  # for production timing
+//! cargo run --example 06_timing_validation
+//! cargo run --release --example 06_timing_validation  # for production timing
 //! ```
 
 use vision_stimulus_engine::prelude::*;

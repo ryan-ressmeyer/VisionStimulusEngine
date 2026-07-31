@@ -4,6 +4,7 @@
 //! and generating vision science stimuli.
 
 mod color;
+pub(crate) mod font;
 mod gabor;
 pub(crate) mod noise;
 pub(crate) mod primitives;

@@ -100,7 +100,7 @@ if let Some(timing) = &info.timing {
 ### Running the Example
 
 ```bash
-cargo run --example 06_host_info
+cargo run --example 12_host_and_display_info
 ```
 
 This opens a window, captures host info on the first frame, prints the summary, writes `host_info.json`, and exits after a few frames.

@@ -6,7 +6,7 @@
 //!   2. `host → scanout → host` round-trips back to the original host timestamp.
 //!   3. `scanout_now()` advances at real (wall-clock) rate, to within the fitted drift.
 //!
-//! Run with: `CARGO_INCREMENTAL=0 cargo run --example 10_host_clock_bridge [seconds]`
+//! Run with: `CARGO_INCREMENTAL=0 cargo run --example 11_host_clock_bridge [seconds]`
 
 use std::time::Instant;
 use vision_stimulus_engine::prelude::*;

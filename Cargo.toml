@@ -81,41 +81,8 @@ libc = "0.2"
 # Testing utilities
 criterion = "0.5"
 
-[[example]]
-name = "00_clear_color"
-path = "examples/00_clear_color.rs"
-
-[[example]]
-name = "01_timing_validation"
-path = "examples/01_timing_validation.rs"
-
-[[example]]
-name = "02_calibration_square"
-path = "examples/02_calibration_square.rs"
-
-[[example]]
-name = "03_gabor_demo"
-path = "examples/03_gabor_demo.rs"
-
-[[example]]
-name = "04_scheduled_flip"
-path = "examples/04_scheduled_flip.rs"
-
-[[example]]
-name = "05_advanced_stimuli"
-path = "examples/05_advanced_stimuli.rs"
-
-[[example]]
-name = "06_host_info"
-path = "examples/06_host_info.rs"
-
-[[example]]
-name = "07_fullscreen_input"
-path = "examples/07_fullscreen_input.rs"
-
-[[example]]
-name = "08_direct_display"
-path = "examples/08_direct_display.rs"
+# Examples are auto-discovered from files in examples/ (basename = target name).
+# The demo curriculum is numbered 00..=19; see examples/README.md.
 
 [[bench]]
 name = "frame_timing"

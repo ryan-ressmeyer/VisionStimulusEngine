@@ -47,8 +47,8 @@ use vulkano::{
 };
 
 use super::primitives::{
-    circle_vertices, dot_unit_quad_vertices, line_vertices, rect_vertices, textured_quad_vertices,
-    DrawCommand,
+    arc_vertices, circle_vertices, dot_unit_quad_vertices, line_vertices, rect_vertices,
+    textured_quad_vertices, DrawCommand,
 };
 
 /// An external frame consumed as the background of one rendered frame
@@ -823,6 +823,31 @@ impl Renderer {
                     }
                     self.flat_vertex_scratch
                         .extend_from_slice(&line_vertices(*x1, *y1, *x2, *y2, *width, *color));
+                }
+                DrawCommand::Arc {
+                    cx,
+                    cy,
+                    radius,
+                    start_angle,
+                    end_angle,
+                    thickness,
+                    color,
+                    segments,
+                } => {
+                    if *radius <= 0.0 || *thickness <= 0.0 || (end_angle - start_angle).abs() < 1e-6
+                    {
+                        continue;
+                    }
+                    self.flat_vertex_scratch.extend(arc_vertices(
+                        *cx,
+                        *cy,
+                        *radius,
+                        *start_angle,
+                        *end_angle,
+                        *thickness,
+                        *color,
+                        *segments,
+                    ));
                 }
                 DrawCommand::Texture { .. } => {}
                 DrawCommand::Grating { .. } => {}

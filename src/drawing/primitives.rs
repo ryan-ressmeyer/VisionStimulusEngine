@@ -75,6 +75,18 @@ pub(crate) enum DrawCommand {
         radius: f32,
         color: Color,
     },
+
+    /// Stroked circular arc (an annular band segment).
+    Arc {
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        start_angle: f32,
+        end_angle: f32,
+        thickness: f32,
+        color: Color,
+        segments: u32,
+    },
 }
 
 /// Generate 6 vertices (2 triangles) for a filled rectangle.
@@ -154,6 +166,84 @@ pub(crate) fn circle_vertices(
 /// Compute default segment count for a circle based on radius.
 pub(crate) fn default_circle_segments(radius: f32) -> u32 {
     (16u32).max((radius * 2.0) as u32).min(256)
+}
+
+/// Generate vertices for a stroked circular arc (an annular band).
+///
+/// The band is centered on `radius` and extends `thickness / 2` inward and
+/// outward, sweeping from `start_angle` to `end_angle` (radians, measured with
+/// +x = 0 and increasing clockwise in screen space, matching the circle path).
+/// Each of `segments` steps emits a quad (2 triangles = 6 vertices), so the
+/// total vertex count is `segments * 6`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn arc_vertices(
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    start_angle: f32,
+    end_angle: f32,
+    thickness: f32,
+    color: Color,
+    segments: u32,
+) -> Vec<Vertex2D> {
+    let c = color.to_array();
+    let segments = segments.max(1);
+    let inner = (radius - thickness / 2.0).max(0.0);
+    let outer = radius + thickness / 2.0;
+    let mut vertices = Vec::with_capacity((segments * 6) as usize);
+
+    for i in 0..segments {
+        let t_a = i as f32 / segments as f32;
+        let t_b = (i + 1) as f32 / segments as f32;
+        let ang_a = start_angle + (end_angle - start_angle) * t_a;
+        let ang_b = start_angle + (end_angle - start_angle) * t_b;
+
+        let (ca, sa) = (ang_a.cos(), ang_a.sin());
+        let (cb, sb) = (ang_b.cos(), ang_b.sin());
+
+        // Four corners of the band quad for this step.
+        let inner_a = [cx + inner * ca, cy + inner * sa];
+        let outer_a = [cx + outer * ca, cy + outer * sa];
+        let inner_b = [cx + inner * cb, cy + inner * sb];
+        let outer_b = [cx + outer * cb, cy + outer * sb];
+
+        // Triangle 1: inner_a, outer_a, outer_b
+        vertices.push(Vertex2D {
+            position: inner_a,
+            color: c,
+        });
+        vertices.push(Vertex2D {
+            position: outer_a,
+            color: c,
+        });
+        vertices.push(Vertex2D {
+            position: outer_b,
+            color: c,
+        });
+        // Triangle 2: inner_a, outer_b, inner_b
+        vertices.push(Vertex2D {
+            position: inner_a,
+            color: c,
+        });
+        vertices.push(Vertex2D {
+            position: outer_b,
+            color: c,
+        });
+        vertices.push(Vertex2D {
+            position: inner_b,
+            color: c,
+        });
+    }
+
+    vertices
+}
+
+/// Compute a default segment count for an arc from its radius and angular span.
+pub(crate) fn default_arc_segments(radius: f32, start_angle: f32, end_angle: f32) -> u32 {
+    let span = (end_angle - start_angle).abs();
+    let fraction = span / (2.0 * std::f32::consts::PI);
+    let full = default_circle_segments(radius);
+    ((full as f32 * fraction).ceil() as u32).clamp(1, 256)
 }
 
 /// Generate 6 vertices (2 triangles) for a thick line.
@@ -365,5 +455,79 @@ mod tests {
         assert_eq!(default_circle_segments(5.0), 16); // min 16
         assert_eq!(default_circle_segments(50.0), 100);
         assert_eq!(default_circle_segments(200.0), 256); // max 256
+    }
+
+    #[test]
+    fn test_arc_vertex_count() {
+        let verts = arc_vertices(
+            0.0,
+            0.0,
+            100.0,
+            0.0,
+            std::f32::consts::PI,
+            10.0,
+            Color::WHITE,
+            32,
+        );
+        assert_eq!(verts.len(), 32 * 6);
+    }
+
+    #[test]
+    fn test_arc_band_radii() {
+        // A full 90° arc at radius 100, thickness 20 -> inner 90, outer 110.
+        let cx = 0.0;
+        let cy = 0.0;
+        let verts = arc_vertices(
+            cx,
+            cy,
+            100.0,
+            0.0,
+            std::f32::consts::FRAC_PI_2,
+            20.0,
+            Color::WHITE,
+            1,
+        );
+        // With 1 segment, vertices 0 (inner_a) and 1 (outer_a) are both at angle 0
+        // (+x axis): inner at (90, 0), outer at (110, 0).
+        let inner_a = verts[0].position;
+        let outer_a = verts[1].position;
+        assert!(
+            (inner_a[0] - 90.0).abs() < 1e-3,
+            "inner radius, got {inner_a:?}"
+        );
+        assert!(
+            (outer_a[0] - 110.0).abs() < 1e-3,
+            "outer radius, got {outer_a:?}"
+        );
+        assert!(inner_a[1].abs() < 1e-3 && outer_a[1].abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_arc_inner_radius_clamped() {
+        // Thickness larger than 2*radius must not produce a negative inner radius.
+        let verts = arc_vertices(
+            0.0,
+            0.0,
+            5.0,
+            0.0,
+            std::f32::consts::PI,
+            100.0,
+            Color::WHITE,
+            4,
+        );
+        for v in &verts {
+            let r = (v.position[0] * v.position[0] + v.position[1] * v.position[1]).sqrt();
+            assert!(r <= 5.0 + 50.0 + 1e-3, "point outside outer radius: {r}");
+        }
+    }
+
+    #[test]
+    fn test_default_arc_segments() {
+        // Full circle span -> same as circle segments.
+        let full = default_arc_segments(50.0, 0.0, 2.0 * std::f32::consts::PI);
+        assert_eq!(full, default_circle_segments(50.0));
+        // Half span -> about half the segments.
+        let half = default_arc_segments(50.0, 0.0, std::f32::consts::PI);
+        assert!(half >= 1 && half <= full);
     }
 }

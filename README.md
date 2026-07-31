@@ -50,9 +50,9 @@ The project is forward-looking. Some code exists to support current experiments 
 Once Rust and Vulkan drivers are available on the host machine, examples can be run with Cargo:
 
 ```bash
-cargo run --example 00_clear_color
-cargo run --example 01_timing_validation
-cargo run --example 03_gabor_demo
+cargo run --example 00_hello_flip
+cargo run --example 01_primitives_gallery
+cargo run --example 03_gabor_field
 ```
 
 Some examples depend on display configuration, fullscreen behavior, or Linux-specific direct-display/input access. Expect those paths to require more machine-specific setup than the basic windowed examples.

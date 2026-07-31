@@ -127,7 +127,7 @@ math, is the accuracy floor.
   experiment's host snapshot. Reports whether present timing / present-id2 / present-wait2 /
   calibrated timestamps are supported, which CPU clock domains are calibrateable, and a
   measured `Device↔CLOCK_MONOTONIC` `maxDeviation` — a per-machine indicator of clock-sync
-  quality. Run `examples/06_host_info` to dump it.
+  quality. Run `examples/12_host_and_display_info` to dump it.
 - **Scanout is the native domain.** `FlipInfo.present_time` is a **scanout-clock** timestamp
   (present-stage-local, referenced to the session's scanout `t=0`). It is *not* converted to CPU
   time by default; the presentation loop stays entirely in the scanout domain.
@@ -143,7 +143,7 @@ math, is the accuracy floor.
 
 ### Measured drift (Intel MTL / ANV / Mesa 26.1.4, windowed, 2026-07)
 
-`examples/09_present_clock_drift` samples the bridge every frame and fits it. On this hardware:
+`examples/10_present_timing_internals` in `drift` mode samples the bridge every frame and fits it. On this hardware:
 
 - `PRESENT_STAGE_LOCAL` is a **genuinely separate clock** — a fixed ~29,714 s epoch offset from
   `CLOCK_MONOTONIC`, i.e. *not* a re-based `CLOCK_MONOTONIC`. Calibration is genuinely required to
@@ -198,7 +198,7 @@ no code change needed.
   presenting deliberate multi-vblank gaps, which disrupts frames, so it is **not** auto-run.
   `examples/13_direct_display_scanout` measures it (schedules gaps from a fixed `t0 + k·T` anchor and
   checks the measured scanout gap) and reports `absolute_scheduling_enforced`. Run it once per
-  hardware/driver config; `examples/06_host_info` prints the advertised-vs-observed table.
+  hardware/driver config; `examples/12_host_and_display_info` prints the advertised-vs-observed table.
 
 The guiding rule: **VSE's behavior stays correct via fallbacks, and provenance
 (`FlipInfo.timing_source`, `HostInfo.timing.*`, the one-time warnings) reports the mechanism that was
