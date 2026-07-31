@@ -64,6 +64,29 @@ use super::stimuli::WaveType;
 use super::texture::TextureHandle;
 use super::vertex::{DotInstance, TexturedVertex, Vertex2D};
 
+fn additive_gabor_blend() -> AttachmentBlend {
+    gabor_accumulation_blend(vulkano::pipeline::graphics::color_blend::BlendOp::Add)
+}
+
+fn subtractive_gabor_blend() -> AttachmentBlend {
+    gabor_accumulation_blend(vulkano::pipeline::graphics::color_blend::BlendOp::ReverseSubtract)
+}
+
+fn gabor_accumulation_blend(
+    color_blend_op: vulkano::pipeline::graphics::color_blend::BlendOp,
+) -> AttachmentBlend {
+    use vulkano::pipeline::graphics::color_blend::{BlendFactor, BlendOp};
+
+    AttachmentBlend {
+        src_color_blend_factor: BlendFactor::One,
+        dst_color_blend_factor: BlendFactor::One,
+        color_blend_op,
+        src_alpha_blend_factor: BlendFactor::Zero,
+        dst_alpha_blend_factor: BlendFactor::One,
+        alpha_blend_op: BlendOp::Add,
+    }
+}
+
 mod flat_color_vs {
     vulkano_shaders::shader! {
         ty: "vertex",
@@ -181,6 +204,8 @@ pub(crate) struct Renderer {
     textured_pipeline: Arc<GraphicsPipeline>,
     grating_pipeline: Arc<GraphicsPipeline>,
     gabor_pipeline: Arc<GraphicsPipeline>,
+    additive_gabor_pipeline: Arc<GraphicsPipeline>,
+    subtractive_gabor_pipeline: Arc<GraphicsPipeline>,
     dot_pipeline: Arc<GraphicsPipeline>,
     dot_quad_buffer: Subbuffer<[DotInstance]>,
 
@@ -210,7 +235,12 @@ impl Renderer {
         let flat_color_pipeline = Self::create_flat_color_pipeline(&device, swapchain_format)?;
         let textured_pipeline = Self::create_textured_pipeline(&device, swapchain_format)?;
         let grating_pipeline = Self::create_grating_pipeline(&device, swapchain_format)?;
-        let gabor_pipeline = Self::create_gabor_pipeline(&device, swapchain_format)?;
+        let gabor_pipeline =
+            Self::create_gabor_pipeline(&device, swapchain_format, AttachmentBlend::alpha())?;
+        let additive_gabor_pipeline =
+            Self::create_gabor_pipeline(&device, swapchain_format, additive_gabor_blend())?;
+        let subtractive_gabor_pipeline =
+            Self::create_gabor_pipeline(&device, swapchain_format, subtractive_gabor_blend())?;
         let dot_pipeline = Self::create_dot_pipeline(&device, swapchain_format)?;
         let dot_quad_buffer = Self::create_dot_quad_buffer(memory_allocator.clone())?;
 
@@ -224,6 +254,8 @@ impl Renderer {
             textured_pipeline,
             grating_pipeline,
             gabor_pipeline,
+            additive_gabor_pipeline,
+            subtractive_gabor_pipeline,
             dot_pipeline,
             dot_quad_buffer,
             textures: HashMap::new(),
@@ -460,7 +492,9 @@ impl Renderer {
                 contrast,
                 background,
                 sigma,
+                aspect_ratio,
                 wave_type,
+                additive,
             ) = match cmd {
                 DrawCommand::Grating {
                     left,
@@ -480,10 +514,12 @@ impl Renderer {
                     params.contrast,
                     params.background,
                     0.0f32,
+                    1.0f32,
                     match params.wave {
                         WaveType::Sine => 0u32,
                         WaveType::Square => 1u32,
                     },
+                    false,
                 ),
                 DrawCommand::Gabor {
                     left,
@@ -491,6 +527,7 @@ impl Renderer {
                     right,
                     bottom,
                     params,
+                    additive,
                 } => (
                     false,
                     *left,
@@ -503,7 +540,9 @@ impl Renderer {
                     params.contrast,
                     params.background,
                     params.sigma,
+                    params.aspect_ratio,
                     0u32,
+                    *additive,
                 ),
                 _ => continue,
             };
@@ -523,38 +562,48 @@ impl Renderer {
             )
             .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
 
-            let pipeline = if is_grating {
-                &self.grating_pipeline
+            let first_pass = if is_grating {
+                (&self.grating_pipeline, 0u32)
+            } else if additive {
+                (&self.additive_gabor_pipeline, 1u32)
             } else {
-                &self.gabor_pipeline
+                (&self.gabor_pipeline, 0u32)
             };
+            // Normalized swapchain formats cannot reliably carry a negative
+            // fragment source into ONE+ONE blending. Split signed modulation
+            // into positive-add and negative-magnitude subtract passes.
+            let second_pass = additive.then_some((&self.subtractive_gabor_pipeline, 2u32));
 
-            builder
-                .bind_pipeline_graphics(pipeline.clone())
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                .push_constants(
-                    pipeline.layout().clone(),
-                    0,
-                    parametric_vs::PushConstants {
-                        viewport_size: [viewport_extent[0] as f32, viewport_extent[1] as f32]
-                            .into(),
-                        rect: [left, top, right, bottom],
-                        frequency,
-                        orientation,
-                        phase,
-                        contrast,
-                        background,
-                        sigma,
-                        wave_type,
-                    },
-                )
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                .bind_vertex_buffers(0, vertex_buffer)
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
-            unsafe {
+            for (pipeline, composite_mode) in std::iter::once(first_pass).chain(second_pass) {
                 builder
-                    .draw(6, 1, 0, 0)
+                    .bind_pipeline_graphics(pipeline.clone())
+                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                    .push_constants(
+                        pipeline.layout().clone(),
+                        0,
+                        parametric_vs::PushConstants {
+                            viewport_size: [viewport_extent[0] as f32, viewport_extent[1] as f32]
+                                .into(),
+                            rect: [left, top, right, bottom],
+                            frequency,
+                            orientation,
+                            phase,
+                            contrast,
+                            background,
+                            sigma,
+                            aspect_ratio,
+                            wave_type,
+                            composite_mode,
+                        },
+                    )
+                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                    .bind_vertex_buffers(0, vertex_buffer.clone())
                     .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+                unsafe {
+                    builder
+                        .draw(6, 1, 0, 0)
+                        .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+                }
             }
         }
 
@@ -882,6 +931,7 @@ impl Renderer {
         swapchain_format: Format,
         stages: [PipelineShaderStageCreateInfo; 2],
         vertex_input_state: VertexInputState,
+        blend: AttachmentBlend,
     ) -> Result<Arc<GraphicsPipeline>, RendererError> {
         let layout = PipelineLayout::new(
             device.clone(),
@@ -907,7 +957,7 @@ impl Renderer {
                 color_blend_state: Some(ColorBlendState::with_attachment_states(
                     1,
                     ColorBlendAttachmentState {
-                        blend: Some(AttachmentBlend::alpha()),
+                        blend: Some(blend),
                         ..Default::default()
                     },
                 )),
@@ -946,7 +996,13 @@ impl Renderer {
             PipelineShaderStageCreateInfo::new(fs_entry),
         ];
 
-        Self::create_graphics_pipeline(device, swapchain_format, stages, vertex_input_state)
+        Self::create_graphics_pipeline(
+            device,
+            swapchain_format,
+            stages,
+            vertex_input_state,
+            AttachmentBlend::alpha(),
+        )
     }
 
     fn create_textured_pipeline(
@@ -970,7 +1026,13 @@ impl Renderer {
             PipelineShaderStageCreateInfo::new(fs_entry),
         ];
 
-        Self::create_graphics_pipeline(device, swapchain_format, stages, vertex_input_state)
+        Self::create_graphics_pipeline(
+            device,
+            swapchain_format,
+            stages,
+            vertex_input_state,
+            AttachmentBlend::alpha(),
+        )
     }
 
     fn create_grating_pipeline(
@@ -994,12 +1056,19 @@ impl Renderer {
             PipelineShaderStageCreateInfo::new(fs_entry),
         ];
 
-        Self::create_graphics_pipeline(device, swapchain_format, stages, vertex_input_state)
+        Self::create_graphics_pipeline(
+            device,
+            swapchain_format,
+            stages,
+            vertex_input_state,
+            AttachmentBlend::alpha(),
+        )
     }
 
     fn create_gabor_pipeline(
         device: &Arc<Device>,
         swapchain_format: Format,
+        blend: AttachmentBlend,
     ) -> Result<Arc<GraphicsPipeline>, RendererError> {
         let vs = parametric_vs::load(device.clone())
             .map_err(|e| RendererError::ShaderLoadFailed(e.to_string()))?;
@@ -1018,7 +1087,7 @@ impl Renderer {
             PipelineShaderStageCreateInfo::new(fs_entry),
         ];
 
-        Self::create_graphics_pipeline(device, swapchain_format, stages, vertex_input_state)
+        Self::create_graphics_pipeline(device, swapchain_format, stages, vertex_input_state, blend)
     }
 
     fn create_dot_pipeline(
@@ -1075,6 +1144,42 @@ impl Renderer {
             PipelineShaderStageCreateInfo::new(fs_entry),
         ];
 
-        Self::create_graphics_pipeline(device, swapchain_format, stages, vertex_input_state)
+        Self::create_graphics_pipeline(
+            device,
+            swapchain_format,
+            stages,
+            vertex_input_state,
+            AttachmentBlend::alpha(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vulkano::pipeline::graphics::color_blend::{BlendFactor, BlendOp};
+
+    #[test]
+    fn subtractive_gabor_blend_subtracts_magnitude_and_preserves_destination_alpha() {
+        let blend = subtractive_gabor_blend();
+
+        assert_eq!(blend.src_color_blend_factor, BlendFactor::One);
+        assert_eq!(blend.dst_color_blend_factor, BlendFactor::One);
+        assert_eq!(blend.color_blend_op, BlendOp::ReverseSubtract);
+        assert_eq!(blend.src_alpha_blend_factor, BlendFactor::Zero);
+        assert_eq!(blend.dst_alpha_blend_factor, BlendFactor::One);
+        assert_eq!(blend.alpha_blend_op, BlendOp::Add);
+    }
+
+    #[test]
+    fn additive_gabor_blend_adds_color_and_preserves_destination_alpha() {
+        let blend = additive_gabor_blend();
+
+        assert_eq!(blend.src_color_blend_factor, BlendFactor::One);
+        assert_eq!(blend.dst_color_blend_factor, BlendFactor::One);
+        assert_eq!(blend.color_blend_op, BlendOp::Add);
+        assert_eq!(blend.src_alpha_blend_factor, BlendFactor::Zero);
+        assert_eq!(blend.dst_alpha_blend_factor, BlendFactor::One);
+        assert_eq!(blend.alpha_blend_op, BlendOp::Add);
     }
 }

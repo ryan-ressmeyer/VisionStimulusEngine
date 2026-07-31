@@ -23,7 +23,7 @@ a fixed duration or frame count and print a summary.
 | 00 | `hello_flip` | Window, clear color, the flip loop | — |
 | 01 | `primitives_gallery` | Rect, circle, line, arc, dots | ArcDemo, LinesDemo, DotDemo |
 | 02 | `gratings_drift` | Drifting sine/square gratings, orientation, TF | GratingDemo, DriftDemo1–6, DriftWaitDemo |
-| 03 | `gabor_field` | One animated Gabor + a garborium field | ProceduralGaborDemo, GarboriumDemo |
+| 03 | `gabor_field` | Moving procedural Gaborium with additive superposition | ProceduralGarboriumDemo |
 | 04 | `noise_suite` | White/pink/binary, contrast-modulated, masked noise | FastNoise, FastMaskedNoise, ContrastModulatedNoise |
 | 05 | `images_alpha` | Image scaling, alpha compositing, per-pixel mixing | AlphaImageDemo, SimpleImageMixingDemo |
 

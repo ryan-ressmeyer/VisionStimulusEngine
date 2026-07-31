@@ -12,7 +12,9 @@ layout(push_constant) uniform PushConstants {
     float contrast;
     float background;
     float sigma;        // used by gabor, ignored by grating
+    float aspect_ratio; // Gaussian width-to-height ratio
     uint wave_type;     // 0=sine, 1=square
+    uint composite_mode; // 0=opaque, 1=positive add, 2=negative subtract
 } pc;
 
 layout(location = 0) out vec2 v_uv;

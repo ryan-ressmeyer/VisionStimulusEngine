@@ -9,7 +9,9 @@ layout(push_constant) uniform PushConstants {
     float contrast;
     float background;
     float sigma;
+    float aspect_ratio;
     uint wave_type;
+    uint composite_mode;
 } pc;
 
 layout(location = 0) in vec2 v_uv;

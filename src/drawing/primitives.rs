@@ -58,6 +58,7 @@ pub(crate) enum DrawCommand {
         right: f32,
         bottom: f32,
         params: GaborParams,
+        additive: bool,
     },
 
     /// CPU-generated noise uploaded as texture.

@@ -9,7 +9,7 @@
 /// ```text
 /// gabor(x, y) = background + contrast * gaussian(x, y) * sin(carrier(x, y))
 ///
-/// gaussian(x, y) = exp(-(x'^2 + y'^2) / (2 * sigma^2))
+/// gaussian(x, y) = exp(-(x'^2 + aspect_ratio^2 * y'^2) / (2 * sigma^2))
 /// carrier(x, y) = 2*pi * frequency * x' + phase
 ///
 /// where x' = x*cos(orientation) + y*sin(orientation)
@@ -34,6 +34,10 @@ pub struct GaborParams {
     /// Standard deviation of the Gaussian envelope in pixels.
     pub sigma: f32,
 
+    /// Width-to-height aspect ratio of the Gaussian envelope.
+    /// A value of `1.0` is circular; values above `1.0` narrow the y' axis.
+    pub aspect_ratio: f32,
+
     /// Contrast of the grating [0.0, 1.0].
     pub contrast: f32,
 
@@ -49,6 +53,7 @@ impl Default for GaborParams {
             orientation: 0.0,
             phase: 0.0,
             sigma: 256.0 / 6.0,
+            aspect_ratio: 1.0,
             contrast: 1.0,
             background: 0.5,
         }
@@ -56,6 +61,16 @@ impl Default for GaborParams {
 }
 
 impl GaborParams {
+    fn gaussian_envelope(&self, x_rot: f32, y_rot: f32) -> f32 {
+        let gamma_y = self.aspect_ratio * y_rot;
+        (-(x_rot * x_rot + gamma_y * gamma_y) / (2.0 * self.sigma * self.sigma)).exp()
+    }
+
+    fn modulation_at(&self, x_rot: f32, y_rot: f32) -> f32 {
+        let carrier = (2.0 * std::f32::consts::PI * self.frequency * x_rot + self.phase).sin();
+        self.contrast * 0.5 * self.gaussian_envelope(x_rot, y_rot) * carrier
+    }
+
     /// Generate the Gabor patch as RGBA pixel data.
     ///
     /// Returns a `Vec<u8>` of length `size * size * 4` (RGBA8).
@@ -74,17 +89,9 @@ impl GaborParams {
                 let x_rot = dx * cos_ori + dy * sin_ori;
                 let y_rot = -dx * sin_ori + dy * cos_ori;
 
-                // Gaussian envelope
-                let gaussian =
-                    (-(x_rot * x_rot + y_rot * y_rot) / (2.0 * self.sigma * self.sigma)).exp();
-
-                // Sinusoidal carrier
-                let carrier =
-                    (2.0 * std::f32::consts::PI * self.frequency * x_rot + self.phase).sin();
-
-                // Combine
+                // Add the zero-centered Gabor modulation to the patch background.
                 let luminance =
-                    (self.background + self.contrast * 0.5 * gaussian * carrier).clamp(0.0, 1.0);
+                    (self.background + self.modulation_at(x_rot, y_rot)).clamp(0.0, 1.0);
 
                 let byte = (luminance * 255.0) as u8;
                 pixels.extend_from_slice(&[byte, byte, byte, 255]);
@@ -167,6 +174,45 @@ mod tests {
         assert_eq!(params.phase, 0.0);
         assert_eq!(params.contrast, 1.0);
         assert_eq!(params.background, 0.5);
+    }
+
+    #[test]
+    fn signed_modulation_is_zero_centered_and_omits_patch_background() {
+        let params = GaborParams {
+            phase: std::f32::consts::FRAC_PI_2,
+            contrast: 0.8,
+            background: 0.9,
+            ..Default::default()
+        };
+
+        assert!((params.modulation_at(0.0, 0.0) - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn psychtoolbox_support_fades_below_one_percent_at_the_edge() {
+        let params = GaborParams {
+            size: 65,
+            sigma: 10.0,
+            ..Default::default()
+        };
+
+        assert!(params.gaussian_envelope(32.0, 0.0) < 0.01);
+    }
+
+    #[test]
+    fn aspect_ratio_scales_the_gaussian_y_axis_like_psychtoolbox() {
+        let circular = GaborParams {
+            sigma: 10.0,
+            aspect_ratio: 1.0,
+            ..Default::default()
+        };
+        let narrow_y = GaborParams {
+            aspect_ratio: 2.0,
+            ..circular.clone()
+        };
+
+        assert!((circular.gaussian_envelope(0.0, 10.0) - (-0.5f32).exp()).abs() < 1e-6);
+        assert!((narrow_y.gaussian_envelope(0.0, 10.0) - (-2.0f32).exp()).abs() < 1e-6);
     }
 
     #[test]

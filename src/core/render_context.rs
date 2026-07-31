@@ -607,6 +607,33 @@ impl<'a> RenderContext<'a> {
             right,
             bottom,
             params: params.clone(),
+            additive: false,
+        });
+    }
+
+    /// Add a zero-centered Gabor modulation to the current framebuffer.
+    ///
+    /// This uses source-one/destination-one color blending, equivalent to
+    /// Psychtoolbox's `Screen('BlendFunction', win, GL_ONE, GL_ONE)`. It is
+    /// intended for fields of overlapping Gabors: positive and negative lobes
+    /// sum linearly instead of each rectangular patch replacing the previous
+    /// one. `params.background` is omitted because the framebuffer supplies the
+    /// common background.
+    pub fn draw_gabor_additive(
+        &mut self,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        params: &GaborParams,
+    ) {
+        self.state.renderer.push(DrawCommand::Gabor {
+            left,
+            top,
+            right,
+            bottom,
+            params: params.clone(),
+            additive: true,
         });
     }
 

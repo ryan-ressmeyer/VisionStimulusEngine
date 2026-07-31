@@ -59,6 +59,7 @@ fn gabor_params(i: usize) -> GaborParams {
         orientation: i as f32 * std::f32::consts::PI / N_GABORS as f32,
         phase: 0.0,
         sigma: 30.0,
+        aspect_ratio: 1.0,
         contrast: 1.0,
         background: 0.5,
     }
