@@ -16,7 +16,7 @@ Verify an existing asset set without network access:
 uv run assets/3d/prepare.py --check
 ```
 
-Source provenance, conversion settings, and hashes are recorded in [`manifest.toml`](manifest.toml). The conversion preserves source triangles except for the freeglut Teapot, whose bicubic Bézier patches are tessellated deterministically at 12 subdivisions per axis.
+Source provenance, conversion settings, and hashes are recorded in [`manifest.toml`](manifest.toml). The conversion preserves source triangles, with two exceptions: the freeglut Teapot's bicubic Bézier patches are tessellated deterministically at 12 subdivisions per axis, and the Bunny and Teapot have their open bottoms (the bunny's unscanned underside; the teapot's open base, spout, and handle ends) capped with centroid triangle fans so the demo models render as closed solids.
 
 The Bunny carries Stanford's research/non-commercial terms. Review those terms before downloading or redistributing it.
 
