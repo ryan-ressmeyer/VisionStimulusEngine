@@ -63,8 +63,17 @@ a fixed duration or frame count and print a summary.
 
 ## 3D
 
-3D / VR-ready rendering lives in the `vse-bevy` crate — a headless Bevy renderer
-feeding frames to VSE's external-frame ring:
+| # | Demo | What it shows |
+|---|------|---------------|
+| 20 | `mesh_normals_3d` | Native indexed glTF meshes, depth testing, face-normal colors, arcball input, and 2D overlays |
+
+Prepare the separately licensed models in [`../assets/3d/README.md`](../assets/3d/README.md), then run:
+
+```bash
+cargo run --release --example 20_mesh_normals_3d
+```
+
+Complex 3D and VR-ready scenes remain available through the `vse-bevy` crate, which feeds a headless Bevy renderer into VSE's external-frame ring:
 
 ```bash
 cargo run -p vse-bevy --release --example 01_bevy_ring_demo

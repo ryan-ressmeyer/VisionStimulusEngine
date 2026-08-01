@@ -68,10 +68,12 @@ impl<'a> RenderContext<'a> {
         let extent = self.state.swapchain.extent();
 
         // Record and execute drawing commands via renderer
-        let command_buffer = self
-            .state
-            .renderer
-            .render(image, self.config.clear_color, extent)?;
+        let command_buffer = self.state.renderer.render(
+            image,
+            image_index as usize,
+            self.config.clear_color,
+            extent,
+        )?;
 
         let future = acquire_future
             .then_execute(self.state.queue.clone(), command_buffer)
@@ -224,6 +226,7 @@ impl<'a> RenderContext<'a> {
         let extent = self.state.swapchain.extent();
         let command_buffer = self.state.renderer.render_with_underlay(
             image,
+            image_index as usize,
             clear_color,
             extent,
             underlay.as_ref(),
@@ -443,10 +446,12 @@ impl<'a> RenderContext<'a> {
         let image = self.state.swapchain.images()[image_index as usize].clone();
         let extent = self.state.swapchain.extent();
 
-        let command_buffer = self
-            .state
-            .renderer
-            .render(image, self.config.clear_color, extent)?;
+        let command_buffer = self.state.renderer.render(
+            image,
+            image_index as usize,
+            self.config.clear_color,
+            extent,
+        )?;
 
         let future = acquire_future
             .then_execute(self.state.queue.clone(), command_buffer)
@@ -577,6 +582,7 @@ impl<'a> RenderContext<'a> {
         let extent = self.state.swapchain.extent();
         let command_buffer = self.state.renderer.render_with_underlay(
             image,
+            image_index as usize,
             clear_color,
             extent,
             underlay.as_ref(),

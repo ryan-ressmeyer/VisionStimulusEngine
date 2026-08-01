@@ -10,13 +10,13 @@ use winit::{
     window::Window,
 };
 
-use super::config::VSEConfig;
+use super::config::{VSEConfig, VSEError};
 use super::device::DeviceSelector;
 use super::frame::FrameBuilder;
 use super::input::{AcquisitionMethod, InputState, WindowMode};
 use super::present_engine::{PresentEngine, ScheduledTarget};
 use super::present_timing_ext::ScanoutFeedback;
-use super::swapchain::{SwapchainError, SwapchainManager};
+use super::swapchain::SwapchainManager;
 use crate::data::messages::FrameMessage;
 use crate::data::ExperimentSession;
 use crate::drawing::renderer::Renderer;
@@ -299,8 +299,10 @@ fn update_refresh_auto_detection(
 impl VSEState {
     /// Recreate the swapchain from the current surface and notify the timing provider so it
     /// refreshes any cached swapchain handle (a retired handle is UB to query).
-    pub(super) fn recreate_swapchain(&mut self, win_size: [u32; 2]) -> Result<(), SwapchainError> {
+    pub(super) fn recreate_swapchain(&mut self, win_size: [u32; 2]) -> Result<(), VSEError> {
         self.swapchain.recreate_from_surface(win_size)?;
+        self.renderer
+            .recreate_depth_attachments(self.swapchain.images().len(), self.swapchain.extent())?;
         self.timing_provider
             .on_swapchain_recreated(self.swapchain.swapchain());
         Ok(())
@@ -655,7 +657,6 @@ impl VSEState {
 mod tests {
     use super::*;
     use crate::core::context::VSEContext;
-    use crate::core::VSEError;
 
     #[test]
     fn missed_frame_status_uses_strict_one_point_five_threshold() {

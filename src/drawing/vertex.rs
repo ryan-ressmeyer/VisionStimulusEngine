@@ -1,6 +1,14 @@
 use vulkano::buffer::BufferContents;
 use vulkano::pipeline::graphics::vertex_input::Vertex;
 
+/// Position-only vertex for native indexed 3D meshes.
+#[derive(Clone, Copy, Debug, Default, BufferContents, Vertex)]
+#[repr(C)]
+pub struct Vertex3D {
+    #[format(R32G32B32_SFLOAT)]
+    pub position: [f32; 3],
+}
+
 /// Vertex for flat-colored geometry (rectangles, circles, lines).
 ///
 /// Position is in pixel coordinates (0,0 = top-left).
@@ -43,6 +51,12 @@ pub struct DotInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_vertex3d_layout() {
+        assert_eq!(std::mem::size_of::<Vertex3D>(), 12);
+        assert_eq!(Vertex3D::default().position, [0.0; 3]);
+    }
 
     #[test]
     fn test_vertex2d_default() {

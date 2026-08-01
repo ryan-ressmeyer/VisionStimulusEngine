@@ -12,6 +12,7 @@ use super::{
 };
 use crate::data::ExperimentSession;
 use crate::drawing::renderer::RendererError;
+use crate::drawing::ModelError;
 
 use super::context::VSEContext;
 
@@ -33,6 +34,10 @@ pub enum VSEError {
     /// Renderer error
     #[error("Renderer error: {0}")]
     Renderer(#[from] RendererError),
+
+    /// Native 3D model or camera error
+    #[error("Model error: {0}")]
+    Model(#[from] ModelError),
 
     /// Window creation error
     #[error("Window error: {0}")]

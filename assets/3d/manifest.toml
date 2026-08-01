@@ -1,0 +1,60 @@
+# Source and output hashes correspond to assets/3d/prepare.py.
+# Generated GLBs are local, ignored build inputs and retain their source terms.
+
+[[model]]
+name = "Bunny"
+file = "models/bunny.glb"
+source_url = "https://graphics.stanford.edu/pub/3Dscanrep/bunny.tar.gz"
+source_sha256 = "a5720bd96d158df403d153381b8411a727a1d73cff2f33dc9b212d6f75455b84"
+converted_sha256 = "7ef98128f08102c1064efe7dd3a9fd9987528946224175a75f475691acacd9b7"
+license = "Stanford 3D Scanning Repository research/non-commercial terms"
+attribution = "Stanford Computer Graphics Laboratory"
+conversion_command = "uv run assets/3d/prepare.py"
+conversion = "Extract bunny/reconstruction/bun_zipper.ply and pack its indexed triangles into GLB without decimation."
+scale_correction = "None; Stanford reconstruction coordinates are interpreted as meters"
+orientation_correction = "None; source is +Y up"
+
+[[model]]
+name = "Teapot"
+file = "models/teapot.glb"
+source_url = "https://raw.githubusercontent.com/freeglut/freeglut/master/src/fg_teapot_data.h"
+source_sha256 = "e6b5587e62acb59564c3801b18ed377c05e78083fbcc70b7bab2caeb4c573ed9"
+converted_sha256 = "3993bd93ca46de0ee5b2e0f34c37db733f5cff2749b0295a22e49102cf696cb1"
+license = "freeglut MIT/X-style license"
+attribution = "freeglut contributors; original Utah teapot by Martin Newell"
+conversion_command = "uv run assets/3d/prepare.py"
+conversion = "Evaluate the 28 full bicubic Bezier patches at 12 subdivisions per axis and triangulate each grid cell."
+scale_correction = "0.1 meters per freeglut unit"
+orientation_correction = "Convert source +Z up to glTF +Y up"
+
+[[model]]
+name = "Suzanne"
+file = "models/suzanne.glb"
+source_urls = [
+  "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Suzanne/glTF/Suzanne.gltf",
+  "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Suzanne/glTF/Suzanne.bin",
+]
+source_sha256 = [
+  "7e8ae013010aff530162ef2795cec74c2646019e224af17bcfb691664f0f0aec",
+  "b85c2727aa41318e00673d8892f5879d46fb6e476e280f28ee1febd07602b6b8",
+]
+converted_sha256 = "ec125a49105bae77092829bb2417329325e9427c021d5d18e11fe20ba5955aab"
+license = "CC0-1.0"
+attribution = "Norbert Nopper / UX3D; Khronos glTF Sample Assets"
+conversion_command = "uv run assets/3d/prepare.py"
+conversion = "Pack the published glTF and binary buffer into a GLB; remove material and texture references unused by native normal rendering."
+scale_correction = "None"
+orientation_correction = "None; source is glTF +Y up"
+
+[[model]]
+name = "Benchy"
+file = "models/benchy.glb"
+source_url = "https://raw.githubusercontent.com/CreativeTools/3DBenchy/master/Single-part/3DBenchy.stl"
+source_sha256 = "6ab57f1c3f8e86bc3cbd302c6fa6270acf06277c6335454e922419c25d42e97e"
+converted_sha256 = "bc50e8f709b26627afa4ecd95341c169d0f8fd21d6f077db988d31ce2f398743"
+license = "CC0-1.0"
+attribution = "Creative Tools / 3DBenchy"
+conversion_command = "uv run assets/3d/prepare.py"
+conversion = "Read the official binary STL and pack its triangles into GLB without decimation."
+scale_correction = "Convert source millimeters to meters"
+orientation_correction = "Convert source +Z up to glTF +Y up"

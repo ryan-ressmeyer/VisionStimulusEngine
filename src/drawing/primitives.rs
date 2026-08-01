@@ -2,6 +2,16 @@ use super::color::Color;
 use super::stimuli::GratingParams;
 use super::vertex::{DotInstance, TexturedVertex, Vertex2D};
 use crate::drawing::GaborParams;
+use glam::Mat4;
+
+/// A queued native 3D draw. Model resources are resident before this command is created.
+pub(crate) enum DrawCommand3D {
+    ModelNormals {
+        model_id: u64,
+        model_transform: Mat4,
+        view_projection: Mat4,
+    },
+}
 
 /// A queued draw command, processed during flip().
 pub(crate) enum DrawCommand {

@@ -18,6 +18,11 @@ vse-external-frame = { path = "crates/vse-external-frame" }
 # Vulkan abstraction - Core rendering
 vulkano = "0.35"
 
+# Native 3D mesh loading and transforms
+glam = "0.27"
+gltf = "1.4"
+sha2 = "0.10"
+
 # Windowing and event handling
 winit = "0.29"
 

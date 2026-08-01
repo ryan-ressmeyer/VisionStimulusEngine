@@ -166,7 +166,13 @@ impl VSEContext {
             present_opt_in,
         )?;
         let frame_builder = FrameBuilder::new(device.clone(), queue.clone());
-        let renderer = Renderer::new(device.clone(), queue.clone(), swapchain.format())?;
+        let renderer = Renderer::new(
+            device.clone(),
+            queue.clone(),
+            swapchain.format(),
+            swapchain.images().len(),
+            swapchain.extent(),
+        )?;
 
         // Initialize timing
         let clock = Clock::new();
@@ -287,7 +293,13 @@ impl VSEContext {
             present_opt_in,
         )?;
         let frame_builder = FrameBuilder::new(device.clone(), queue.clone());
-        let renderer = Renderer::new(device.clone(), queue.clone(), swapchain.format())?;
+        let renderer = Renderer::new(
+            device.clone(),
+            queue.clone(),
+            swapchain.format(),
+            swapchain.images().len(),
+            swapchain.extent(),
+        )?;
 
         let clock = Clock::new();
 

@@ -13,8 +13,13 @@ use super::input::{
 use super::state::VSEState;
 use super::swapchain::SwapchainManager;
 use crate::data::messages::FrameMessage;
-use crate::drawing::primitives::{default_arc_segments, default_circle_segments, DrawCommand};
-use crate::drawing::{Color, GaborParams, GratingParams, NoiseParams, TextureHandle};
+use crate::drawing::primitives::{
+    default_arc_segments, default_circle_segments, DrawCommand, DrawCommand3D,
+};
+use crate::drawing::{
+    Bounds3D, Color, GaborParams, GratingParams, ModelHandle, ModelInfo, NoiseParams,
+    PerspectiveCamera, TextureHandle,
+};
 use crate::timing::{Clock, ScanoutTimestamp, Timestamp, TimingSource};
 
 /// Render context passed to the render callback
@@ -339,6 +344,11 @@ impl<'a> RenderContext<'a> {
         self.state.frame_number
     }
 
+    /// Display refresh interval reported by the timing backend or detected from flips.
+    pub fn refresh_interval(&self) -> Option<std::time::Duration> {
+        self.state.refresh_interval()
+    }
+
     /// Sample the display's `PRESENT_STAGE_LOCAL` scanout clock against `CLOCK_MONOTONIC`.
     ///
     /// Returns `None` on the CPU-estimate path or before the present-stage time domain has been
@@ -562,6 +572,47 @@ impl<'a> RenderContext<'a> {
     /// Unload a texture and free its GPU resources.
     pub fn unload_texture(&mut self, handle: TextureHandle) {
         self.state.renderer.unload_texture(handle);
+    }
+
+    // === Native 3D models ===
+
+    /// Decode a glTF/GLB model and upload immutable indexed mesh buffers.
+    /// Call during startup or between timed trials, never on the presentation path.
+    pub fn load_model(&mut self, path: impl AsRef<Path>) -> Result<ModelHandle, VSEError> {
+        Ok(self.state.renderer.load_model(path)?)
+    }
+
+    pub fn model_info(&self, model: ModelHandle) -> Result<&ModelInfo, VSEError> {
+        Ok(self.state.renderer.model_info(model)?)
+    }
+
+    pub fn model_bounds(&self, model: ModelHandle) -> Result<Bounds3D, VSEError> {
+        Ok(self.model_info(model)?.bounds)
+    }
+
+    /// Queue a resident model for flat world-space geometric-normal rendering.
+    pub fn draw_model_normals(
+        &mut self,
+        model: ModelHandle,
+        model_transform: glam::Mat4,
+        camera: &PerspectiveCamera,
+    ) -> Result<(), VSEError> {
+        if !model_transform.is_finite() {
+            return Err(crate::drawing::ModelError::NonFinite.into());
+        }
+        self.state.renderer.model_info(model)?;
+        let (width, height) = self.window_size();
+        let view_projection = camera.view_projection(width as f32 / height.max(1) as f32)?;
+        self.state.renderer.push_3d(DrawCommand3D::ModelNormals {
+            model_id: model.id,
+            model_transform,
+            view_projection,
+        });
+        Ok(())
+    }
+
+    pub fn unload_model(&mut self, model: ModelHandle) {
+        self.state.renderer.unload_model(model);
     }
 
     // === Advanced stimuli ===
