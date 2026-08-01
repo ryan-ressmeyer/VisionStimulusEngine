@@ -66,6 +66,8 @@ use super::stimuli::WaveType;
 use super::texture::TextureHandle;
 use super::vertex::{DotInstance, TexturedVertex, Vertex2D, Vertex3D};
 
+const MESH_FRONT_FACE: FrontFace = FrontFace::CounterClockwise;
+
 fn additive_gabor_blend() -> AttachmentBlend {
     gabor_accumulation_blend(vulkano::pipeline::graphics::color_blend::BlendOp::Add)
 }
@@ -1402,7 +1404,7 @@ impl Renderer {
                 viewport_state: Some(ViewportState::default()),
                 rasterization_state: Some(RasterizationState {
                     cull_mode: CullMode::Back,
-                    front_face: FrontFace::Clockwise,
+                    front_face: MESH_FRONT_FACE,
                     ..Default::default()
                 }),
                 multisample_state: Some(MultisampleState::default()),
@@ -1500,6 +1502,11 @@ impl Renderer {
 mod tests {
     use super::*;
     use vulkano::pipeline::graphics::color_blend::{BlendFactor, BlendOp};
+
+    #[test]
+    fn gltf_counter_clockwise_faces_are_front_facing() {
+        assert_eq!(MESH_FRONT_FACE, FrontFace::CounterClockwise);
+    }
 
     #[test]
     fn subtractive_gabor_blend_subtracts_magnitude_and_preserves_destination_alpha() {
