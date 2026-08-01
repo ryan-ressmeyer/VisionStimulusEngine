@@ -4,8 +4,7 @@
 //! `ProceduralGarboriumDemo`. Two hundred GPU-computed Gabors move along
 //! independently evolving directions, rotate, shift phase, and pulse their
 //! Gaussian aspect ratio. Overlaps use additive signed-modulation blending,
-//! equivalent to Psychtoolbox's `GL_ONE, GL_ONE`, rather than drawing opaque
-//! gray rectangles over one another.
+//! equivalent to Psychtoolbox's `GL_ONE, GL_ONE`.
 //!
 //! The random seed is fixed, so the initial field and animation are identical
 //! on every run. Press Escape to exit.
