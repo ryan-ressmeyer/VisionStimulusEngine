@@ -327,9 +327,80 @@ impl VSEContext {
     ///
     /// Propagates any `VSEError` returned by the callback, or returns
     /// `VSEError::EventLoop` if the underlying windowing system fails.
-    pub fn run_buffered<T, F>(
+    pub fn run_buffered<T, F>(self, config: BufferedConfig, callback: F) -> Result<(), VSEError>
+    where
+        T: std::any::Any + serde::Serialize + Send + 'static,
+        F: FnMut(FlipEvent<T>, &mut RenderContext<'_>) -> Result<(), VSEError> + 'static,
+    {
+        self.run_buffered_boxed(config, None, callback)
+    }
+
+    /// Like [`run_buffered`](Self::run_buffered), but runs `setup` once before
+    /// the first frame and threads its result into every event.
+    ///
+    /// The buffered counterpart of
+    /// [`run_with_setup`](Self::run_with_setup), and it exists for the same
+    /// reason: compiling a [`StimulusPipeline`](crate::prelude::StimulusPipeline)
+    /// or loading assets inside the first `Render` event would inflate that
+    /// frame past its deadline. `setup` runs after the GPU state and swapchain
+    /// exist — including the buffered depth adjustment — and before frame 0.
+    ///
+    /// ```no_run
+    /// use vision_stimulus_engine::prelude::*;
+    /// # fn demo(context: VSEContext) -> Result<(), VSEError> {
+    /// context.run_buffered_with_setup::<u32, _, _, _>(
+    ///     BufferedConfig::default(),
+    ///     |vse| vse.load_image("stimulus.png"),
+    ///     |event, vse, texture| {
+    ///         if let FlipEvent::Render = event {
+    ///             vse.draw_texture(*texture, 0.0, 0.0, 256.0, 256.0);
+    ///             vse.flip_with_payload(None, 0u32)?;
+    ///         }
+    ///         Ok(())
+    ///     },
+    /// )
+    /// # }
+    /// ```
+    pub fn run_buffered_with_setup<T, S, U, F>(
+        self,
+        config: BufferedConfig,
+        setup: S,
+        mut callback: F,
+    ) -> Result<(), VSEError>
+    where
+        T: std::any::Any + serde::Serialize + Send + 'static,
+        S: FnOnce(&mut RenderContext) -> Result<U, VSEError> + 'static,
+        U: 'static,
+        F: FnMut(FlipEvent<T>, &mut RenderContext<'_>, &mut U) -> Result<(), VSEError> + 'static,
+    {
+        // Produced in one closure and consumed in another, so it lands in a
+        // shared slot rather than in the loop's type signature — the same shape
+        // `run_with_setup` uses.
+        let slot: Rc<RefCell<Option<U>>> = Rc::new(RefCell::new(None));
+        let setup_slot = slot.clone();
+
+        self.run_buffered_boxed(
+            config,
+            Some(Box::new(move |ctx| {
+                *setup_slot.borrow_mut() = Some(setup(ctx)?);
+                Ok(())
+            })),
+            move |event, ctx| {
+                let mut slot = slot.borrow_mut();
+                let state = slot
+                    .as_mut()
+                    .expect("setup runs before the first frame, so the slot is filled");
+                callback(event, ctx, state)
+            },
+        )
+    }
+
+    /// Shared implementation of [`run_buffered`](Self::run_buffered) and
+    /// [`run_buffered_with_setup`](Self::run_buffered_with_setup).
+    fn run_buffered_boxed<T, F>(
         mut self,
         config: BufferedConfig,
+        mut setup: Option<SetupFn>,
         mut callback: F,
     ) -> Result<(), VSEError>
     where
@@ -403,6 +474,20 @@ impl VSEContext {
                                                 "failed to grow present engine sync ring".into(),
                                             ),
                                         ));
+                                        elwt.exit();
+                                        return;
+                                    }
+                                }
+                                // One-time setup AFTER the swapchain depth is
+                                // final and BEFORE frame 0, so pipeline
+                                // compilation stays off the presentation path.
+                                if let Some(setup) = setup.take() {
+                                    let mut setup_ctx = RenderContext {
+                                        state: &mut s,
+                                        config: &mut vse_config,
+                                    };
+                                    if let Err(e) = setup(&mut setup_ctx) {
+                                        *error_clone.borrow_mut() = Some(e);
                                         elwt.exit();
                                         return;
                                     }
