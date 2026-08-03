@@ -363,6 +363,11 @@ impl HeadlessContext {
         S: FnMut(&CapturedFrame) -> Result<(), VSEError>,
         F: FnMut(&mut RenderContext, &mut T) -> Result<(), VSEError>,
     {
+        // A headless context is re-runnable — regenerating two blocks of an
+        // experiment is two runs — so a previous run's exit request must not
+        // end this one before its first frame.
+        self.state.should_close = false;
+
         let mut setup_state = {
             let mut ctx = RenderContext {
                 state: &mut self.state,
