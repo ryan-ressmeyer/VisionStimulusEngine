@@ -12,7 +12,11 @@ use super::state::{InputSource, RecordingState};
 impl VSEContext {
     /// Run the direct display render loop (no winit).
     #[cfg(target_os = "linux")]
-    pub(super) fn run_direct<F>(mut self, mut render_fn: F) -> Result<(), VSEError>
+    pub(super) fn run_direct<F>(
+        mut self,
+        setup: Option<super::event_loop::SetupFn>,
+        mut render_fn: F,
+    ) -> Result<(), VSEError>
     where
         F: FnMut(&mut RenderContext) -> Result<(), VSEError> + 'static,
     {
@@ -26,6 +30,16 @@ impl VSEContext {
             last_claimed_frame: None,
         });
         let mut config = self.config;
+
+        // One-time setup runs before frame 0, so pipeline compilation and asset
+        // loading stay off the presentation path.
+        if let Some(setup) = setup {
+            let mut setup_ctx = RenderContext {
+                state: &mut state,
+                config: &mut config,
+            };
+            setup(&mut setup_ctx)?;
+        }
 
         // Install a SIGINT (Ctrl+C) handler so the loop can exit cleanly,
         // running all Drop implementations and releasing the display surface

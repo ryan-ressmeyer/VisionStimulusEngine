@@ -14,6 +14,13 @@ use super::input::WindowMode;
 use super::state::{RecordingState, VSEState};
 use super::swapchain::SwapchainError;
 
+/// One-time setup, run after the GPU state exists and before the first frame.
+///
+/// Type-erased so the loop implementation is shared between
+/// [`VSEContext::run`] and [`VSEContext::run_with_setup`]; the latter keeps the
+/// caller's concrete return type at the public boundary.
+pub(crate) type SetupFn = Box<dyn FnOnce(&mut RenderContext) -> Result<(), VSEError>>;
+
 impl VSEContext {
     /// Run the main event loop
     ///
@@ -28,14 +35,84 @@ impl VSEContext {
     /// # Errors
     ///
     /// Returns `VSEError` if an error occurs during rendering.
-    pub fn run<F>(mut self, mut render_fn: F) -> Result<(), VSEError>
+    pub fn run<F>(self, render_fn: F) -> Result<(), VSEError>
+    where
+        F: FnMut(&mut RenderContext) -> Result<(), VSEError> + 'static,
+    {
+        self.run_with_setup_boxed(None, render_fn)
+    }
+
+    /// Like [`run`](Self::run), but runs `setup` once before the first frame
+    /// and threads its result into every frame.
+    ///
+    /// `setup` executes immediately after the GPU state exists and **before
+    /// frame 0**, so expensive one-time work — compiling a
+    /// [`StimulusPipeline`](crate::prelude::StimulusPipeline), loading textures
+    /// or models — happens off the presentation path instead of inflating the
+    /// first frame and registering as a missed deadline.
+    ///
+    /// Whatever `setup` returns (pipeline handles, texture handles, trial
+    /// state) is handed to the render closure as `&mut T`.
+    ///
+    /// ```no_run
+    /// use vision_stimulus_engine::prelude::*;
+    /// # fn demo(context: VSEContext) -> Result<(), VSEError> {
+    /// context.run_with_setup(
+    ///     |vse| vse.load_image("stimulus.png"),
+    ///     |vse, texture| {
+    ///         vse.draw_texture(*texture, 0.0, 0.0, 256.0, 256.0);
+    ///         vse.flip(None)?;
+    ///         Ok(())
+    ///     },
+    /// )
+    /// # }
+    /// ```
+    ///
+    /// Registration is only possible here rather than before the loop because
+    /// selecting a presentation-capable Vulkan device requires a surface, which
+    /// does not exist until the window does.
+    pub fn run_with_setup<S, T, F>(self, setup: S, mut render_fn: F) -> Result<(), VSEError>
+    where
+        S: FnOnce(&mut RenderContext) -> Result<T, VSEError> + 'static,
+        T: 'static,
+        F: FnMut(&mut RenderContext, &mut T) -> Result<(), VSEError> + 'static,
+    {
+        // The setup result is produced in one closure and consumed in another,
+        // so it lands in a shared slot rather than being threaded through the
+        // loop's type signature.
+        let slot: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
+        let setup_slot = slot.clone();
+
+        self.run_with_setup_boxed(
+            Some(Box::new(move |ctx| {
+                *setup_slot.borrow_mut() = Some(setup(ctx)?);
+                Ok(())
+            })),
+            move |ctx| {
+                let mut slot = slot.borrow_mut();
+                let state = slot
+                    .as_mut()
+                    .expect("setup runs before the first frame, so the slot is filled");
+                render_fn(ctx, state)
+            },
+        )
+    }
+
+    /// Shared implementation of [`run`](Self::run) and
+    /// [`run_with_setup`](Self::run_with_setup). `setup`, when present, runs
+    /// once after the GPU state is initialized and before the first frame.
+    fn run_with_setup_boxed<F>(
+        mut self,
+        mut setup: Option<SetupFn>,
+        mut render_fn: F,
+    ) -> Result<(), VSEError>
     where
         F: FnMut(&mut RenderContext) -> Result<(), VSEError> + 'static,
     {
         // Branch for direct display mode (Linux only — no winit event loop)
         #[cfg(target_os = "linux")]
         if self.config.window_mode == WindowMode::DirectDisplay {
-            return self.run_direct(render_fn);
+            return self.run_direct(setup.take(), render_fn);
         }
         #[cfg(not(target_os = "linux"))]
         if self.config.window_mode == WindowMode::DirectDisplay {
@@ -72,6 +149,20 @@ impl VSEContext {
                                     pending_flip: None,
                                     last_claimed_frame: None,
                                 });
+                                // Run one-time setup BEFORE frame 0, so
+                                // pipeline compilation and asset loading stay
+                                // off the presentation path.
+                                if let Some(setup) = setup.take() {
+                                    let mut setup_ctx = RenderContext {
+                                        state: &mut s,
+                                        config: &mut config,
+                                    };
+                                    if let Err(e) = setup(&mut setup_ctx) {
+                                        *error_clone.borrow_mut() = Some(e);
+                                        elwt.exit();
+                                        return;
+                                    }
+                                }
                                 state = Some(s);
                             }
                             Err(e) => {
