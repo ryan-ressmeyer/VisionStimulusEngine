@@ -62,7 +62,7 @@ pub struct NoiseParams {
 }
 
 /// Type of noise pattern.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NoiseType {
     /// Uniform random luminance per pixel.
     White,

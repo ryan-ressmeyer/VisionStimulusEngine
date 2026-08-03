@@ -69,11 +69,19 @@ pub(crate) struct ExternalUnderlay {
     pub readback: Option<Subbuffer<[u8]>>,
 }
 use super::model::{decode_model, DecodedInstance, ModelError, ModelHandle, ModelInfo};
+use super::noise::{NoiseKey, NoiseTextureCache};
 use super::stimuli::WaveType;
 use super::texture::TextureHandle;
 use super::vertex::{DotInstance, TexturedVertex, Vertex2D, Vertex3D};
 
 const MESH_FRONT_FACE: FrontFace = FrontFace::CounterClockwise;
+
+/// How many distinct noise textures stay resident.
+///
+/// Sized for animated noise: several panels updating independently keep a few
+/// frames of history live without the cache growing without bound. Static noise
+/// needs one entry per distinct stimulus and hits forever.
+const NOISE_CACHE_CAPACITY: usize = 32;
 
 /// What a queued 2D draw coalesces with, if anything.
 ///
@@ -720,6 +728,15 @@ pub(crate) struct Renderer {
     depth_views: Vec<Arc<ImageView>>,
 
     textures: HashMap<u64, TextureResources>,
+    /// Noise textures keyed by the parameters that generated them, so a
+    /// repeated `draw_noise` reuses its upload instead of regenerating pixels
+    /// and blocking on a fence every frame. Bounded, because animated noise
+    /// brings a new seed (and so a new key) on every update.
+    noise_cache: NoiseTextureCache,
+    /// Textures evicted from `noise_cache` this frame, released only after the
+    /// command buffer is built. Freeing them earlier could drop a texture that
+    /// an already-queued `DrawCommand::Noise` still needs to record.
+    pending_noise_unloads: Vec<u64>,
     models: HashMap<u64, ModelResources>,
     next_model_id: u64,
     next_texture_id: u64,
@@ -815,6 +832,8 @@ impl Renderer {
             needs_depth,
             depth_views,
             textures: HashMap::new(),
+            noise_cache: NoiseTextureCache::new(NOISE_CACHE_CAPACITY),
+            pending_noise_unloads: Vec::new(),
             models: HashMap::new(),
             next_model_id: 0,
             next_texture_id: 0,
@@ -1700,6 +1719,12 @@ impl Renderer {
         self.command_scratch = commands;
         self.kind_scratch = kinds;
 
+        // Safe to release evicted noise textures now: the command buffer holds
+        // its own references to everything it recorded.
+        for texture_id in std::mem::take(&mut self.pending_noise_unloads) {
+            self.textures.remove(&texture_id);
+        }
+
         // `self.draw_commands` was drained into the scratch above.
         self.draw_commands_3d.clear();
 
@@ -1847,6 +1872,29 @@ impl Renderer {
         );
 
         Ok(TextureHandle { id, width, height })
+    }
+
+    /// The cached noise texture for `params`, if one is already uploaded.
+    ///
+    /// Checked before generating pixels, so a cache hit skips the CPU noise
+    /// generation as well as the GPU upload.
+    pub fn cached_noise_texture(&self, params: &crate::drawing::NoiseParams) -> Option<u64> {
+        self.noise_cache.get(&NoiseKey::of(params))
+    }
+
+    /// Upload a freshly generated noise texture and cache it under `params`.
+    ///
+    /// Any texture evicted to stay within the cache bound is queued for release
+    /// at the end of the current frame.
+    pub fn insert_noise_texture(
+        &mut self,
+        params: &crate::drawing::NoiseParams,
+        pixels: &[u8],
+    ) -> Result<u64, RendererError> {
+        let handle = self.load_texture_rgba(params.width, params.height, pixels)?;
+        let evicted = self.noise_cache.insert(NoiseKey::of(params), handle.id);
+        self.pending_noise_unloads.extend(evicted);
+        Ok(handle.id)
     }
 
     /// Remove a texture and free its GPU resources.

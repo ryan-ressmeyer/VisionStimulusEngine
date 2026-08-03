@@ -1,3 +1,5 @@
+use std::collections::{HashMap, VecDeque};
+
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -5,6 +7,88 @@ use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
 use super::stimuli::{NoiseParams, NoiseType};
+
+/// Identity of a generated noise texture.
+///
+/// Two draws share a texture only when they would produce byte-identical
+/// pixels, so floats are compared by their bit patterns rather than by value.
+/// That is the right test here: `generate_noise` is deterministic in its
+/// parameters, and bit-exact identity is what reproducibility requires.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct NoiseKey {
+    noise_type: NoiseType,
+    seed: u64,
+    width: u32,
+    height: u32,
+    contrast_bits: u32,
+    background_bits: u32,
+}
+
+impl NoiseKey {
+    pub(crate) fn of(params: &NoiseParams) -> Self {
+        Self {
+            noise_type: params.noise_type,
+            seed: params.seed,
+            width: params.width,
+            height: params.height,
+            contrast_bits: params.contrast.to_bits(),
+            background_bits: params.background.to_bits(),
+        }
+    }
+}
+
+/// Bounded cache of uploaded noise textures, keyed by the parameters that
+/// generated them.
+///
+/// Without it, every `draw_noise` call regenerated the pixels on the CPU,
+/// allocated a GPU image, submitted a command buffer, and blocked on a fence —
+/// per call, per frame, on the presentation path — while the previous texture
+/// was never freed.
+///
+/// Caching alone would still leak for animated noise, where each update brings
+/// a new seed and therefore a new key, so the cache is capacity-bounded and
+/// evicts oldest-first. `insert` returns the texture ids it dropped; the caller
+/// releases them once the frame that may reference them has been recorded.
+pub(crate) struct NoiseTextureCache {
+    entries: HashMap<NoiseKey, u64>,
+    /// Insertion order, for oldest-first eviction.
+    order: VecDeque<NoiseKey>,
+    capacity: usize,
+}
+
+impl NoiseTextureCache {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// The texture already uploaded for these parameters, if any.
+    pub(crate) fn get(&self, key: &NoiseKey) -> Option<u64> {
+        self.entries.get(key).copied()
+    }
+
+    /// Record a newly uploaded texture, returning any texture ids evicted to
+    /// stay within capacity. The caller must unload those.
+    pub(crate) fn insert(&mut self, key: NoiseKey, texture_id: u64) -> Vec<u64> {
+        if self.entries.insert(key, texture_id).is_none() {
+            self.order.push_back(key);
+        }
+
+        let mut evicted = Vec::new();
+        while self.entries.len() > self.capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(id) = self.entries.remove(&oldest) {
+                evicted.push(id);
+            }
+        }
+        evicted
+    }
+}
 
 /// Generate a noise texture as RGBA8 pixel data.
 ///
@@ -255,6 +339,112 @@ mod tests {
         for chunk in pixels.chunks(4) {
             assert_eq!(chunk[3], 255);
         }
+    }
+
+    // --- Texture caching ---
+    //
+    // `draw_noise` used to build a fresh GPU texture on EVERY call: a CPU noise
+    // generation, an image allocation, a command-buffer submit, and a BLOCKING
+    // fence wait, all on the presentation path — and nothing ever freed them.
+    // The cache removes the repeat work; the capacity bound stops animated
+    // noise (a new seed per update) from leaking without limit.
+
+    fn params(seed: u64, contrast: f32) -> NoiseParams {
+        NoiseParams {
+            noise_type: NoiseType::White,
+            seed,
+            width: 64,
+            height: 64,
+            contrast,
+            background: 0.5,
+        }
+    }
+
+    #[test]
+    fn identical_parameters_reuse_the_uploaded_texture() {
+        let mut cache = NoiseTextureCache::new(8);
+        assert_eq!(cache.get(&NoiseKey::of(&params(1, 0.8))), None);
+
+        cache.insert(NoiseKey::of(&params(1, 0.8)), 42);
+
+        assert_eq!(
+            cache.get(&NoiseKey::of(&params(1, 0.8))),
+            Some(42),
+            "a repeated draw must reuse the texture, not rebuild it"
+        );
+    }
+
+    #[test]
+    fn any_parameter_change_is_a_different_texture() {
+        // Bit-exact identity: two draws share a texture only when they would
+        // generate byte-identical pixels.
+        let mut cache = NoiseTextureCache::new(8);
+        cache.insert(NoiseKey::of(&params(1, 0.8)), 42);
+
+        assert_eq!(
+            cache.get(&NoiseKey::of(&params(2, 0.8))),
+            None,
+            "a new seed is new noise"
+        );
+        assert_eq!(
+            cache.get(&NoiseKey::of(&params(1, 0.7999999))),
+            None,
+            "contrast differing in the last float bit is different noise"
+        );
+
+        let mut pink = params(1, 0.8);
+        pink.noise_type = NoiseType::Pink;
+        assert_eq!(cache.get(&NoiseKey::of(&pink)), None);
+
+        let mut bigger = params(1, 0.8);
+        bigger.width = 128;
+        assert_eq!(cache.get(&NoiseKey::of(&bigger)), None);
+    }
+
+    #[test]
+    fn animated_noise_stays_within_the_capacity_bound() {
+        // The leak that motivated this: a distinct seed every update, forever.
+        let mut cache = NoiseTextureCache::new(4);
+        let mut freed = Vec::new();
+
+        for seed in 0..100u64 {
+            freed.extend(cache.insert(NoiseKey::of(&params(seed, 0.8)), seed));
+        }
+
+        // 100 inserted, 96 released, so exactly the 4 most recent are resident.
+        assert_eq!(
+            freed.len(),
+            96,
+            "every evicted texture is reported for release"
+        );
+        assert_eq!(
+            freed.first().copied(),
+            Some(0),
+            "eviction is oldest-first, so the live seeds stay resident"
+        );
+        for seed in 96..100u64 {
+            assert!(cache.get(&NoiseKey::of(&params(seed, 0.8))).is_some());
+        }
+    }
+
+    #[test]
+    fn unchanging_noise_never_evicts_anything() {
+        // A static-noise experiment draws identical params every frame forever.
+        // It must upload once and then evict nothing, no matter how long it runs.
+        let mut cache = NoiseTextureCache::new(4);
+        let mut uploads = 0;
+        let mut freed = Vec::new();
+
+        for _ in 0..100 {
+            let key = NoiseKey::of(&params(7, 0.8));
+            if cache.get(&key).is_none() {
+                uploads += 1;
+                freed.extend(cache.insert(key, 7));
+            }
+        }
+
+        assert_eq!(uploads, 1, "the texture is generated and uploaded once");
+        assert!(freed.is_empty(), "nothing is evicted");
     }
 
     #[test]

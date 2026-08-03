@@ -715,6 +715,16 @@ impl<'a> RenderContext<'a> {
     /// Generates a noise texture on CPU from the given parameters and
     /// displays it in the specified rectangle. For animated noise, change
     /// `params.seed` each frame.
+    ///
+    /// Generated textures are cached by their parameters, so redrawing the same
+    /// noise costs only a bind and a draw. Generating one is expensive — CPU
+    /// noise synthesis, a GPU image allocation, and an upload that blocks until
+    /// the GPU finishes — so a stimulus that changes every frame pays that on
+    /// every frame. Prefer advancing `params.seed` on a slower schedule than
+    /// the refresh rate, or pre-generating the sequence before the trial.
+    ///
+    /// The cache holds a bounded number of textures and evicts oldest-first, so
+    /// long animated sequences do not grow without limit.
     pub fn draw_noise(
         &mut self,
         left: f32,
@@ -723,17 +733,20 @@ impl<'a> RenderContext<'a> {
         bottom: f32,
         params: &NoiseParams,
     ) -> Result<(), VSEError> {
-        let pixels = crate::drawing::noise::generate_noise(params);
-        let handle = self
-            .state
-            .renderer
-            .load_texture_rgba(params.width, params.height, &pixels)?;
+        // Look up BEFORE generating: a hit skips the CPU synthesis too.
+        let texture_id = match self.state.renderer.cached_noise_texture(params) {
+            Some(id) => id,
+            None => {
+                let pixels = crate::drawing::noise::generate_noise(params);
+                self.state.renderer.insert_noise_texture(params, &pixels)?
+            }
+        };
         self.state.renderer.push(DrawCommand::Noise {
             left,
             top,
             right,
             bottom,
-            texture_id: handle.id,
+            texture_id,
         });
         Ok(())
     }
