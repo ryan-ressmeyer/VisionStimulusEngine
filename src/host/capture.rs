@@ -178,6 +178,12 @@ pub fn capture_pipeline_config(config: &VSEConfig) -> PipelineConfig {
         gpu_preference: format!("{:?}", config.gpu_preference),
         present_mode: format!("{:?}", config.present_mode),
         expected_refresh_rate: config.expected_refresh_rate,
+        builtin_pipelines: config
+            .pipeline_suite
+            .key_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     }
 }
 
@@ -386,6 +392,43 @@ mod tests {
             env.display_server == "x11"
                 || env.display_server == "wayland"
                 || env.display_server == "unknown"
+        );
+    }
+
+    // The built pipeline set is part of the recorded metadata that post-hoc
+    // stimulus regeneration reads back: reproducing a session's pixels needs
+    // the same pipelines, not just the same swapchain format and extent.
+
+    #[test]
+    fn pipeline_config_records_the_selected_builtin_pipelines() {
+        use crate::drawing::{BuiltinPipeline, PipelineSuite};
+
+        let config = VSEConfig {
+            pipeline_suite: PipelineSuite::minimal().with(BuiltinPipeline::Dot),
+            ..Default::default()
+        };
+
+        let captured = capture_pipeline_config(&config);
+
+        assert_eq!(captured.builtin_pipelines, vec!["Dot", "FlatColor"]);
+    }
+
+    #[test]
+    fn pipeline_config_records_the_full_suite_by_default() {
+        let captured = capture_pipeline_config(&VSEConfig::default());
+
+        assert_eq!(
+            captured.builtin_pipelines,
+            vec![
+                "AdditiveGabor",
+                "Dot",
+                "FlatColor",
+                "Gabor",
+                "Grating",
+                "MeshNormals",
+                "SubtractiveGabor",
+                "Textured",
+            ]
         );
     }
 }

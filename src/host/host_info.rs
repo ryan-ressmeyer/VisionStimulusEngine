@@ -171,6 +171,14 @@ pub struct PipelineConfig {
     pub gpu_preference: String,
     pub present_mode: String,
     pub expected_refresh_rate: Option<f64>,
+    /// Names of the built-in graphics pipelines compiled for this session
+    /// (see [`PipelineSuite`](crate::drawing::PipelineSuite)), sorted.
+    ///
+    /// Recorded because reproducing a session's pixels post hoc needs the same
+    /// pipeline set, not only the same swapchain format and extent — a draw
+    /// whose pipeline was absent produced nothing on screen, and that has to be
+    /// recoverable from the session metadata alone.
+    pub builtin_pipelines: Vec<String>,
 }
 
 /// Build-time metadata captured by build.rs
