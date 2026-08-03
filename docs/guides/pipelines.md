@@ -1,122 +1,145 @@
 # GPU Pipelines in VSE
 
-## What is a GPU Pipeline?
+## What is a GPU pipeline?
 
-A GPU pipeline is like a compiled recipe that tells the graphics card exactly how to turn vertex data into pixels on screen. It consists of:
+A GPU pipeline is a compiled recipe that turns vertex data into pixels. It consists of:
 
-- **Shaders**: Programs that run on the GPU. A *vertex shader* positions geometry in screen space, and a *fragment shader* computes the color of each pixel.
-- **Fixed-function state**: Configuration for blending (how overlapping things combine), rasterization (how triangles become pixels), and multisampling.
-- **Vertex format**: The layout of per-vertex data (position, color, UV coordinates, etc.).
-- **Push constants**: A small block of parameters sent per-draw-call (viewport size, stimulus parameters).
+- **Shaders**: programs that run on the GPU. A *vertex shader* positions geometry in screen space; a *fragment shader* computes the color of each pixel.
+- **Fixed-function state**: configuration for blending (how overlapping things combine), rasterization (how triangles become pixels), and multisampling.
+- **Vertex format**: the layout of per-vertex data (position, color, UV coordinates).
+- **Push constants**: a small block of parameters sent per draw call (viewport size, stimulus parameters).
 
-**Cost model**: Creating a pipeline is expensive (~10-50ms, involves shader compilation). Binding a pipeline per-frame is nearly free (~nanoseconds). VSE creates all pipelines once at startup in `Renderer::new()`.
+**Cost model**: creating a pipeline is expensive (~10-50 ms, involves shader compilation). Binding a pipeline per frame is nearly free (~nanoseconds). VSE builds all its pipelines once at startup, in `Renderer::new()`.
 
-## How VSE Manages Pipelines
+## How VSE renders a frame
 
-The `Renderer` struct (in `src/drawing/renderer.rs`) owns all pipelines. The rendering flow each frame:
+1. Your code calls `draw_*()` methods on `RenderContext` (`draw_rect()`, `draw_grating()`, `draw_dots()`, ...). Each pushes a command onto a per-frame queue.
+2. `flip()` records the queued commands into one Vulkan command buffer and submits it.
+3. Native 3D draws (`draw_model_normals`) record first, in a depth pass. The 2D draws then record **in the order you called them** (see [Draw order and batching](#draw-order-and-batching)).
+4. Consecutive flat-color draws (rectangles, circles, lines, arcs, text) coalesce into a single batched draw; every other primitive records on its own.
 
-1. Your code calls `draw_*()` methods on `RenderContext` (e.g., `draw_grating()`, `draw_dots()`).
-2. Each call pushes a `DrawCommand` variant onto an internal queue.
-3. When you call `flip()`, the `render()` method iterates the queue:
-   - Groups flat-color draws into a single batch.
-   - Records each textured/parametric/dot draw individually.
-   - Binds the appropriate pipeline, sets push constants, and issues a draw call.
-4. All commands are recorded into a single Vulkan command buffer and submitted to the GPU.
+## Built-in pipelines
 
-## Built-in Pipelines
+VSE ships eight built-in pipelines, identified by the `BuiltinPipeline` enum:
 
-| Pipeline | Draws | Parameters | Shaders |
-|----------|-------|------------|---------|
-| **flat_color** | Rectangles, circles, lines | viewport_size | `flat_color.vert`, `flat_color.frag` |
-| **textured** | Image textures, noise textures | viewport_size, sampler | `textured.vert`, `textured.frag` |
-| **grating** | Sinusoidal/square-wave gratings | frequency, orientation, phase, contrast, background, wave_type | `parametric.vert`, `grating.frag` |
-| **gabor** | Gaussian-windowed gratings | frequency, orientation, phase, contrast, background, sigma | `parametric.vert`, `gabor.frag` |
-| **dot** | Instanced circular dots (RDK) | viewport_size, dot_radius, dot_color | `dot.vert`, `dot.frag` |
+| `BuiltinPipeline` key | Draws | Shaders |
+|---|---|---|
+| `FlatColor` | Rectangles, circles, lines, arcs, text | `flat_color.vert/.frag` |
+| `Textured` | Image and noise textures | `textured.vert/.frag` |
+| `Grating` | Sinusoidal / square-wave gratings | `parametric.vert`, `grating.frag` |
+| `Gabor` | Gaussian-windowed gratings | `parametric.vert`, `gabor.frag` |
+| `AdditiveGabor` / `SubtractiveGabor` | The two-pass additive-Gabor accumulation (`draw_gabor_additive`) | `parametric.vert`, `gabor.frag` |
+| `Dot` | Instanced circular dots (RDK) | `dot.vert/.frag` |
+| `MeshNormals` | Native 3D geometric-normal meshes | `mesh_normals.vert/.frag` |
 
-## Push Constants
+## Choosing which built-ins to build
 
-Push constants are the fastest way to send small amounts of data to shaders. Unlike uniform buffers, they require no GPU memory allocation — the data is embedded directly in the command buffer.
+By default VSE builds all eight. To build only the ones an experiment uses, pass a `PipelineSuite` to the builder:
 
-- **Size limit**: 128 bytes guaranteed by the Vulkan spec (most GPUs support more).
-- **Usage**: VSE uses push constants for all per-draw-call parameters (viewport size, grating frequency, dot color, etc.).
-- **In GLSL**: Declared as `layout(push_constant) uniform PushConstants { ... }`.
-- **In Rust**: vulkano-shaders auto-generates a matching `PushConstants` struct from the GLSL layout.
+```rust
+use vision_stimulus_engine::prelude::*;
 
-## Writing Your Own Pipeline
+// Only flat shapes plus dots — skips compiling the grating/Gabor/texture pipelines.
+let context = VSEContext::builder()
+    .with_pipelines(PipelineSuite::minimal().with(BuiltinPipeline::Dot))
+    .build()?;
+```
 
-To add a custom stimulus pipeline:
+`PipelineSuite::default()` selects all eight, `minimal()` selects `FlatColor` alone, and `empty()` selects none. Add or remove keys with `.with(key)` / `.without(key)`, and query with `.contains(key)`.
 
-### 1. Write shaders
+A `draw_*()` call whose pipeline was not built is skipped at render time, with a one-time warning naming the missing pipeline. Loading a texture requires `Textured` in the suite.
 
-Create vertex and fragment shaders in `src/shaders/`. Example for a checkerboard:
+## Extending VSE with your own rendering
 
-```glsl
-// src/shaders/checker.frag
-#version 460
+Two entry points let you render with pipelines VSE does not ship, at different levels of structure.
 
-layout(push_constant) uniform PushConstants {
-    vec2 viewport_size;
-    vec4 rect;
-    float check_size;  // pixels per square
-} pc;
+### Registering a stimulus pipeline (the structured path)
 
-layout(location = 0) in vec2 v_uv;
-layout(location = 0) out vec4 f_color;
+Implement `StimulusPipeline` to teach VSE a new stimulus. You build your own `GraphicsPipeline` once in `build`, and record draws for your parameters in `record`:
 
-void main() {
-    vec2 rect_size = vec2(pc.rect.z - pc.rect.x, pc.rect.w - pc.rect.y);
-    vec2 pixel = v_uv * rect_size;
-    float checker = mod(floor(pixel.x / pc.check_size) + floor(pixel.y / pc.check_size), 2.0);
-    f_color = vec4(vec3(checker), 1.0);
+```rust
+use vision_stimulus_engine::prelude::*;
+
+struct CheckerParams { size: f32 }
+
+struct CheckerPipeline { pipeline: Option<Arc<GraphicsPipeline>> }
+
+impl StimulusPipeline for CheckerPipeline {
+    type Command = CheckerParams;
+
+    fn build(&mut self, cx: &PipelineBuildCtx) -> Result<(), PipelineError> {
+        // Build a GraphicsPipeline on cx.device(), with a color format
+        // matching cx.color_format(). Store it in self.
+        self.pipeline = Some(build_checker(cx).map_err(|e| PipelineError::Build(e.to_string()))?);
+        Ok(())
+    }
+
+    fn record(
+        &self,
+        recorder: &mut FrameRecorder,
+        cx: &RecordCtx,
+        commands: &[Self::Command],
+    ) -> Result<(), PipelineError> {
+        // Bind your pipeline, push constants from `commands`, draw.
+        // cx.viewport_extent() and cx.memory_allocator() are available.
+        Ok(())
+    }
 }
 ```
 
-### 2. Add shader module declarations
+Register the pipeline once, then enqueue draws each frame:
 
-In `src/drawing/renderer.rs`:
+```rust
+let checker = vse.register_pipeline(CheckerPipeline { pipeline: None })?; // RegisteredPipeline<CheckerParams>
+vse.draw_with(checker, CheckerParams { size: 20.0 });
+```
+
+`register_pipeline` calls your `build` immediately, so call it at setup or between trials, never on the presentation path. The returned handle is `Copy`; its type parameter ties it to your `Command`, so `draw_with` accepts only the matching parameters. Each `draw_with` records in call order, interleaved with the built-in draws around it.
+
+A full working example is `examples/23_registered_pipeline.rs`.
+
+### The raw record hook
+
+When you want to record straight into VSE's frame without the trait, `draw_custom` hands your closure the same raw `FrameRecorder`:
+
+```rust
+vse.draw_custom(move |recorder: &mut FrameRecorder, ctx: &CustomFrameContext| {
+    // Bind a pipeline you built at setup, push constants, draw.
+    // ctx.viewport_extent gives the framebuffer size.
+});
+```
+
+The closure runs inside VSE's active 2D pass with the viewport already set, compositing in call order. It must not begin or end the render pass or transition the target image. Build pipelines and buffers at setup using `vse.device()`, `vse.swapchain().format()`, and `vse.memory_allocator()`. A full working example is `examples/22_custom_pipeline.rs`.
+
+Both hooks expose vulkano's `AutoCommandBufferBuilder` (aliased as `FrameRecorder`) directly, so your code depends on the same vulkano version as VSE.
+
+## Draw order and batching
+
+VSE composites 2D draws in **call order**: a shape drawn after a texture lands on top of it. Consecutive draws that use the same pipeline coalesce into one draw call. In particular, a run of consecutive flat-color draws (including text, which expands to one rectangle per lit glyph pixel) records as a single batched draw.
+
+Interleaving pipelines breaks these runs. Drawing a rectangle, then a texture, then another rectangle records two separate flat batches instead of one. The dominant cost is the lost coalescing, not the pipeline bind itself, which is modest at typical stimulus counts. For throughput, group draws that share a pipeline. Batching and interleaving pull in opposite directions: group for speed, interleave for layering.
+
+Native 3D (`draw_model_normals`) always renders before all 2D draws, in its own depth pass.
+
+## Push constants
+
+Push constants are the fastest way to send small amounts of data to shaders. Unlike uniform buffers, they need no GPU memory allocation; the data is embedded directly in the command buffer.
+
+- **Size limit**: 128 bytes guaranteed by the Vulkan spec (most GPUs support more).
+- **In GLSL**: `layout(push_constant) uniform PushConstants { ... }`.
+- **In Rust**: `vulkano-shaders` generates a matching `PushConstants` struct from the GLSL layout.
+
+## Shaders
+
+The `vulkano_shaders::shader!` macro compiles GLSL to SPIR-V at build time and generates the matching `PushConstants` struct. It takes either a file path or inline source:
 
 ```rust
 mod checker_fs {
     vulkano_shaders::shader! {
         ty: "fragment",
-        path: "src/shaders/checker.frag",
+        path: "src/shaders/checker.frag",   // or: src: "#version 460 ..."
     }
 }
 ```
 
-The `vulkano_shaders::shader!` macro compiles GLSL at build time and generates Rust types including a `PushConstants` struct matching your GLSL layout.
-
-### 3. Write `create_*_pipeline()` method
-
-Follow the pattern of existing methods like `create_grating_pipeline()`:
-
-1. Load vertex and fragment shader modules
-2. Get entry points
-3. Define vertex input state (use `TexturedVertex::per_vertex()` for standard quad-based stimuli)
-4. Create pipeline stages and layout
-5. Create the `GraphicsPipeline` with standard settings
-
-### 4. Add `DrawCommand` variant
-
-In `src/drawing/primitives.rs`:
-
-```rust
-Checker {
-    left: f32, top: f32, right: f32, bottom: f32,
-    check_size: f32,
-},
-```
-
-Add an empty match arm in `generate_flat_color_vertices()` for the new variant.
-
-### 5. Add recording logic in `render()`
-
-Extract matching commands, create vertex buffers, bind pipeline, push constants, draw.
-
-### 6. Add `draw_*()` method on `RenderContext`
-
-In `src/core/context.rs`, add the public API method that pushes the command.
-
-### 7. Add to prelude
-
-Export any new parameter types from `src/drawing/mod.rs` and `src/lib.rs` prelude.
+Because it runs at build time, your experiment crate compiles its own shaders the same way VSE does. To load shaders VSE did not compile into the binary, build a `ShaderModule` from SPIR-V bytes at runtime and supply your own `PushConstants` type.
