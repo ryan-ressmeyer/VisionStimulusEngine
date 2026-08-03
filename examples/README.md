@@ -83,10 +83,12 @@ cargo run -p vse-bevy --release --example 01_bevy_ring_demo
 
 | # | Demo | What it shows |
 |---|------|---------------|
-| 22 | `custom_pipeline` | Bring-your-own `GraphicsPipeline` recorded into VSE's pass via the Tier 2 `draw_custom` raw hook |
-| 23 | `registered_pipeline` | Implement the Tier 1 `StimulusPipeline` trait, register it once, and enqueue call-ordered draws with `draw_with` (interleaved with built-ins) |
+| 21 | `custom_pipeline` | Bring-your-own `GraphicsPipeline` recorded into VSE's pass via the Tier 2 `draw_custom` raw hook |
+| 22 | `registered_pipeline` | Implement the Tier 1 `StimulusPipeline` trait, register it in `run_with_setup`, and enqueue call-ordered draws with `draw_with` (interleaved with built-ins) |
 
 ```bash
-cargo run --release --example 22_custom_pipeline
-cargo run --release --example 23_registered_pipeline
+cargo run --release --example 21_custom_pipeline
+cargo run --release --example 22_registered_pipeline
 ```
+
+See `docs/guides/pipelines.md` for the pipeline model these two demonstrate.

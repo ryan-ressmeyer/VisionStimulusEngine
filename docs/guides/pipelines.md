@@ -9,14 +9,16 @@ A GPU pipeline is a compiled recipe that turns vertex data into pixels. It consi
 - **Vertex format**: the layout of per-vertex data (position, color, UV coordinates).
 - **Push constants**: a small block of parameters sent per draw call (viewport size, stimulus parameters).
 
-**Cost model**: creating a pipeline is expensive (~10-50 ms, involves shader compilation). Binding a pipeline per frame is nearly free (~nanoseconds). VSE builds all its pipelines once at startup, in `Renderer::new()`.
+**Cost model**: creating a pipeline is expensive (~10-50 ms, involves shader compilation). Binding a pipeline per frame is nearly free (~nanoseconds). VSE builds the pipelines you select once at startup, in `Renderer::new()` — see [Choosing which built-ins to build](#choosing-which-builtins-to-build).
 
 ## How VSE renders a frame
 
 1. Your code calls `draw_*()` methods on `RenderContext` (`draw_rect()`, `draw_grating()`, `draw_dots()`, ...). Each pushes a command onto a per-frame queue.
 2. `flip()` records the queued commands into one Vulkan command buffer and submits it.
 3. Native 3D draws (`draw_model_normals`) record first, in a depth pass. The 2D draws then record **in the order you called them** (see [Draw order and batching](#draw-order-and-batching)).
-4. Consecutive flat-color draws (rectangles, circles, lines, arcs, text) coalesce into a single batched draw; every other primitive records on its own.
+4. Runs of adjacent draws that share a pipeline coalesce (see below); everything else records on its own.
+
+Per-frame vertex data is suballocated from a pooled arena rather than a fresh Vulkan buffer per draw, so a steady-state frame creates no buffers at all. Arenas return to the pool once the GPU finishes with them.
 
 ## Built-in pipelines
 
@@ -47,7 +49,26 @@ let context = VSEContext::builder()
 
 `PipelineSuite::default()` selects all eight, `minimal()` selects `FlatColor` alone, and `empty()` selects none. Add or remove keys with `.with(key)` / `.without(key)`, and query with `.contains(key)`.
 
-A `draw_*()` call whose pipeline was not built is skipped at render time, with a one-time warning naming the missing pipeline. Loading a texture requires `Textured` in the suite.
+`AdditiveGabor` and `SubtractiveGabor` must be selected together or not at all. They are the positive-add and negative-subtract passes of one draw, because a normalized swapchain format cannot carry signed modulation through a single pass. Selecting one alone would render half the signed modulation, so `build()` rejects it with `SuiteError::UnpairedGaborPass` before a session can start.
+
+### What happens when a pipeline is missing
+
+Two different failures, because they are knowable at two different times:
+
+- **Setup-time calls fail loudly.** `load_image()`, `load_texture_rgba()`, and `draw_noise()` all create a texture, which needs the `Textured` pipeline's descriptor layout. Without it they return an error.
+- **Draw-time calls are skipped and counted.** A queued `draw_*()` whose pipeline was not built renders nothing. VSE logs this at ERROR the first time it sees each kind, then stays quiet so a 60 Hz loop cannot flood the log.
+
+Because the log goes quiet, check the count rather than the log:
+
+```rust
+if vse.skipped_draw_count() > 0 {
+    for (pipeline, count) in vse.skipped_draws() {
+        eprintln!("{pipeline:?}: {count} draws rendered nothing");
+    }
+}
+```
+
+A non-zero count means frames were presented without a stimulus the experiment asked for. Treat the affected data as suspect. The selected pipeline set is also recorded in `HostInfo.pipeline.builtin_pipelines`, so a session's configuration is recoverable from its metadata after the fact.
 
 ## Extending VSE with your own rendering
 
@@ -55,69 +76,93 @@ Two entry points let you render with pipelines VSE does not ship, at different l
 
 ### Registering a stimulus pipeline (the structured path)
 
-Implement `StimulusPipeline` to teach VSE a new stimulus. You build your own `GraphicsPipeline` once in `build`, and record draws for your parameters in `record`:
+Implement `StimulusPipeline` to teach VSE a new stimulus. `build` creates your `GraphicsPipeline` once and returns it as the pipeline's `Resources`; `record` draws with it:
 
 ```rust
 use vision_stimulus_engine::prelude::*;
 
 struct CheckerParams { size: f32 }
 
-struct CheckerPipeline { pipeline: Option<Arc<GraphicsPipeline>> }
+/// Configuration, if any. GPU state does not live here.
+struct CheckerPipeline;
 
 impl StimulusPipeline for CheckerPipeline {
     type Command = CheckerParams;
+    type Resources = Arc<GraphicsPipeline>;
 
-    fn build(&mut self, cx: &PipelineBuildCtx) -> Result<(), PipelineError> {
-        // Build a GraphicsPipeline on cx.device(), with a color format
-        // matching cx.color_format(). Store it in self.
-        self.pipeline = Some(build_checker(cx).map_err(|e| PipelineError::Build(e.to_string()))?);
-        Ok(())
+    fn build(&self, cx: &PipelineBuildCtx) -> Result<Self::Resources, PipelineError> {
+        // Build on cx.device(), with a color format matching cx.color_format().
+        build_checker(cx).map_err(PipelineError::build)
     }
 
     fn record(
-        &self,
+        &mut self,
+        gpu: &mut Self::Resources,
         recorder: &mut FrameRecorder,
         cx: &RecordCtx,
         commands: &[Self::Command],
     ) -> Result<(), PipelineError> {
-        // Bind your pipeline, push constants from `commands`, draw.
-        // cx.viewport_extent() and cx.memory_allocator() are available.
+        // Bind `gpu`, push constants from `commands`, draw.
+        // cx.device(), cx.viewport_extent(), cx.memory_allocator() are available.
         Ok(())
     }
 }
 ```
 
-Register the pipeline once, then enqueue draws each frame:
+Returning `Resources` from `build` rather than storing them in `self` is what keeps `record` free of an `Option` and an unwrap for a state that cannot happen. `record` takes `&mut self` and `&mut Self::Resources`, so a pipeline can cache a staging buffer or a memoized descriptor set across frames without interior mutability.
+
+Wrap a failing vulkano call with `PipelineError::build` or `PipelineError::record` rather than stringifying it, which keeps the underlying error reachable through `Error::source`.
+
+Register in the setup closure, then enqueue draws each frame:
 
 ```rust
-let checker = vse.register_pipeline(CheckerPipeline { pipeline: None })?; // RegisteredPipeline<CheckerParams>
-vse.draw_with(checker, CheckerParams { size: 20.0 });
+context.run_with_setup(
+    |vse| vse.register_pipeline(CheckerPipeline),
+    move |vse, &mut checker| {
+        vse.draw_with(checker, CheckerParams { size: 20.0 })?;
+        vse.flip(None)?;
+        Ok(())
+    },
+)?;
 ```
 
-`register_pipeline` calls your `build` immediately, so call it at setup or between trials, never on the presentation path. The returned handle is `Copy`; its type parameter ties it to your `Command`, so `draw_with` accepts only the matching parameters. Each `draw_with` records in call order, interleaved with the built-in draws around it.
+`register_pipeline` runs your `build` immediately, and compiling a pipeline costs tens of milliseconds. `run_with_setup` invokes its setup closure once after the GPU exists but before frame 0, which keeps that cost off the presentation path. Registering before the run loop is not possible at all: choosing a presentation-capable Vulkan device requires a surface, and a surface requires a window.
 
-A full working example is `examples/23_registered_pipeline.rs`.
+The returned handle is `Copy`, and its type parameter ties it to your `Command`, so `draw_with` accepts only matching parameters. A handle is also tagged with the context that issued it; using one against a different `VSEContext` returns `PipelineError::ForeignHandle` instead of resolving to whatever pipeline holds that slot.
+
+Call `unregister_pipeline(handle)` when re-registering between trials. Without it, each registration leaks its `GraphicsPipeline` for the rest of the session.
+
+A full working example is `examples/22_registered_pipeline.rs`.
 
 ### The raw record hook
 
 When you want to record straight into VSE's frame without the trait, `draw_custom` hands your closure the same raw `FrameRecorder`:
 
 ```rust
-vse.draw_custom(move |recorder: &mut FrameRecorder, ctx: &CustomFrameContext| {
+vse.draw_custom(move |recorder: &mut FrameRecorder, cx: &RecordCtx| {
     // Bind a pipeline you built at setup, push constants, draw.
-    // ctx.viewport_extent gives the framebuffer size.
+    // cx.viewport_extent() gives the framebuffer size.
 });
 ```
 
-The closure runs inside VSE's active 2D pass with the viewport already set, compositing in call order. It must not begin or end the render pass or transition the target image. Build pipelines and buffers at setup using `vse.device()`, `vse.swapchain().format()`, and `vse.memory_allocator()`. A full working example is `examples/22_custom_pipeline.rs`.
+The closure runs inside VSE's active 2D pass with the viewport already set, compositing at the point in call order where you queued it. It must not begin or end the render pass or transition the target image. Build pipelines and buffers in `run_with_setup`'s setup closure using `vse.device()`, `vse.swapchain().format()`, and `vse.memory_allocator()`. A full working example is `examples/21_custom_pipeline.rs`.
+
+`draw_custom` and `StimulusPipeline::record` receive the same `RecordCtx`, so the two tiers see an identical view of the frame.
 
 Both hooks expose vulkano's `AutoCommandBufferBuilder` (aliased as `FrameRecorder`) directly, so your code depends on the same vulkano version as VSE.
 
 ## Draw order and batching
 
-VSE composites 2D draws in **call order**: a shape drawn after a texture lands on top of it. Consecutive draws that use the same pipeline coalesce into one draw call. In particular, a run of consecutive flat-color draws (including text, which expands to one rectangle per lit glyph pixel) records as a single batched draw.
+VSE composites 2D draws in **call order**. A shape drawn after a texture lands on top of it.
 
-Interleaving pipelines breaks these runs. Drawing a rectangle, then a texture, then another rectangle records two separate flat batches instead of one. The dominant cost is the lost coalescing, not the pipeline bind itself, which is modest at typical stimulus counts. For throughput, group draws that share a pipeline. Batching and interleaving pull in opposite directions: group for speed, interleave for layering.
+Two kinds of adjacent draws merge into a single draw call:
+
+- **Flat-color draws** (rectangles, circles, lines, arcs, and text, which expands to one rectangle per lit glyph pixel). A run of them becomes one vertex buffer and one draw.
+- **Registered draws sharing one pipeline.** A run of N consecutive `draw_with` calls against the same handle reaches your `record` as one slice of N commands, which you can answer with a single instanced draw.
+
+Everything else records on its own. Two consecutive `draw_texture` calls do *not* merge, and neither do two gratings; each carries its own descriptor set or push constants, which a shared draw call cannot express. They still share the vertex arena, so the per-draw cost is a bind and a draw, not an allocation.
+
+Interleaving splits runs. A rectangle, then a texture, then another rectangle records two flat batches instead of one. Grouping draws that share a pipeline is faster; interleaving them is how you control layering. When the two conflict, layering wins — the planner never reorders your draws to improve batching.
 
 Native 3D (`draw_model_normals`) always renders before all 2D draws, in its own depth pass.
 

@@ -1,6 +1,12 @@
 # Design: Flexible & User-Defined Rendering Pipelines
 
-**Status:** Draft / RFC — no implementation yet.
+**Status:** Implemented on `feat/flexible-pipelines`. Tiers 0, 1, and 2 all
+shipped, along with the call-order change in §4-5. §1 below describes the
+architecture as it stood BEFORE this work and is kept as the problem statement;
+it no longer describes current behavior. `docs/guides/pipelines.md` is the
+reference for how the system works now. §7-8 record the plan and the open
+questions as they were at design time; where the implementation diverged, the
+guide wins.
 **Goal:** Let users subselect the built-in pipeline suite, register their own
 pipelines, and (for advanced users) record raw Vulkan draws inside VSE's frame —
 while preserving VSE's timing determinism and teaching the pipeline model along
@@ -52,6 +58,11 @@ Users cannot extend the enum.
 **Draw order is by primitive type, not call order.** A texture always
 composites over all flat shapes regardless of the order `draw_rect` vs
 `draw_texture` was called. This is a load-bearing semantic, not an accident.
+
+> **Superseded.** This was the behavior before the branch; §4-5 replace it with
+> call-order compositing, which is what ships. Adjacent draws sharing a pipeline
+> still coalesce, but a draw issued between them splits the run rather than
+> being reordered around it.
 
 ### The escape hatches that exist today
 
@@ -289,6 +300,11 @@ The `draw_*` public API on `RenderContext` must not break. Sequence:
 ---
 
 ## 8. Open questions & sequencing
+
+> **Resolved.** The work shipped in the order: keyed registry → `PipelineSuite`
+> → Tier 2 (`draw_custom`) → call-order → unified draw queue → Tier 1
+> (`StimulusPipeline`). The questions below are kept as a record of what was
+> undecided at design time; each is answered in `docs/guides/pipelines.md`.
 
 - **First implementation milestone:** Tier 2 (raw hook) vs. the Tier 0 module
   refactor. Tier 2 unblocks users soonest; the module refactor is the structural

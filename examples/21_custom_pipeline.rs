@@ -23,7 +23,7 @@
 //! # Running
 //!
 //! ```bash
-//! cargo run --release --example 22_custom_pipeline
+//! cargo run --release --example 21_custom_pipeline
 //! ```
 
 use std::sync::Arc;

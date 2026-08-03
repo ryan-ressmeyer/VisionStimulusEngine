@@ -22,17 +22,18 @@
 //! swapchain image, the viewport is already set, and `record` must NOT
 //! begin/end the pass. Build your pipeline in `build`, never in `record`.
 //!
-//! Registration is done lazily on the first frame here, because a
-//! [`RenderContext`] (and thus the swapchain color format) is only available
-//! inside the run loop. In a real experiment, register once at setup or between
-//! trials, never on the presentation path.
+//! Registration happens in [`RenderContext::run_with_setup`]'s setup closure,
+//! which runs once before frame 0 — a pipeline takes tens of milliseconds to
+//! compile, so doing it on the presentation path would blow the first frame's
+//! deadline. It cannot happen before the run loop at all: choosing a
+//! presentation-capable Vulkan device needs a surface, which needs a window.
 //!
 //! Press Escape to exit.
 //!
 //! # Running
 //!
 //! ```bash
-//! cargo run --release --example 23_registered_pipeline
+//! cargo run --release --example 22_registered_pipeline
 //! ```
 
 use std::sync::Arc;
@@ -102,15 +103,12 @@ mod radial_fs {
 
 /// A Tier 1 stimulus pipeline: one `GraphicsPipeline`, built once, that paints
 /// an animated radial patch from per-draw push constants.
-struct RadialPipeline {
-    pipeline: Option<Arc<GraphicsPipeline>>,
-}
-
-impl RadialPipeline {
-    fn new() -> Self {
-        Self { pipeline: None }
-    }
-}
+///
+/// The struct itself is empty here because this pipeline takes no
+/// configuration. Anything `build` needs to read would live in these fields;
+/// anything `build` *produces* lives in `Resources` instead, so `record` never
+/// has to deal with a not-yet-built state.
+struct RadialPipeline;
 
 /// Per-draw parameters for [`RadialPipeline`] — the trait's `Command` type.
 #[derive(Clone, Copy)]
@@ -122,15 +120,20 @@ struct RadialParams {
 impl StimulusPipeline for RadialPipeline {
     type Command = RadialParams;
 
-    fn build(&mut self, cx: &PipelineBuildCtx) -> Result<(), PipelineError> {
+    /// The GPU state `build` produces. Returned rather than stashed in `self`,
+    /// so `record` receives a `&mut Arc<GraphicsPipeline>` that is always
+    /// present — no `Option`, no unwrap for a state that cannot occur.
+    type Resources = Arc<GraphicsPipeline>;
+
+    fn build(&self, cx: &PipelineBuildCtx) -> Result<Self::Resources, PipelineError> {
         let device = cx.device().clone();
 
         let vs = radial_vs::load(device.clone())
-            .map_err(|e| PipelineError::Build(e.to_string()))?
+            .map_err(PipelineError::build)?
             .entry_point("main")
             .unwrap();
         let fs = radial_fs::load(device.clone())
-            .map_err(|e| PipelineError::Build(e.to_string()))?
+            .map_err(PipelineError::build)?
             .entry_point("main")
             .unwrap();
 
@@ -143,9 +146,9 @@ impl StimulusPipeline for RadialPipeline {
             device.clone(),
             PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
                 .into_pipeline_layout_create_info(device.clone())
-                .map_err(|e| PipelineError::Build(e.to_string()))?,
+                .map_err(PipelineError::build)?,
         )
-        .map_err(|e| PipelineError::Build(e.to_string()))?;
+        .map_err(PipelineError::build)?;
 
         let pipeline = GraphicsPipeline::new(
             device.clone(),
@@ -179,45 +182,42 @@ impl StimulusPipeline for RadialPipeline {
                 ..GraphicsPipelineCreateInfo::layout(layout)
             },
         )
-        .map_err(|e| PipelineError::Build(e.to_string()))?;
+        .map_err(PipelineError::build)?;
 
-        self.pipeline = Some(pipeline);
-        Ok(())
+        Ok(pipeline)
     }
 
     fn record(
-        &self,
+        &mut self,
+        pipeline: &mut Self::Resources,
         recorder: &mut FrameRecorder,
         _cx: &RecordCtx,
         commands: &[Self::Command],
     ) -> Result<(), PipelineError> {
-        let pipeline = self
-            .pipeline
-            .as_ref()
-            .ok_or_else(|| PipelineError::Record("pipeline not built".into()))?;
-
-        // One ordered entry per `draw_with`, so the slice has exactly one param.
-        // (The slice shape reserves room for future same-pipeline coalescing.)
-        let params = commands[0];
-
-        recorder
-            .bind_pipeline_graphics(pipeline.clone())
-            .map_err(|e| PipelineError::Record(e.to_string()))?
-            .push_constants(
-                pipeline.layout().clone(),
-                0,
-                radial_fs::PushConstants {
-                    tint: params.tint,
-                    phase: params.phase,
-                },
-            )
-            .map_err(|e| PipelineError::Record(e.to_string()))?;
-        // SAFETY: the pipeline takes no vertex/descriptor input; the full-screen
-        // triangle's 3 vertices come from gl_VertexIndex.
-        unsafe {
+        // Every CONSECUTIVE `draw_with` against this pipeline arrives in one
+        // slice, in call order — a run of N draws is one `record` call, not N.
+        // This example issues one draw per command because each needs its own
+        // push constants; a pipeline whose per-draw params fit in a vertex
+        // buffer could upload the whole slice and answer the run with a single
+        // instanced draw.
+        for params in commands {
             recorder
-                .draw(3, 1, 0, 0)
-                .map_err(|e| PipelineError::Record(e.to_string()))?;
+                .bind_pipeline_graphics(pipeline.clone())
+                .map_err(PipelineError::record)?
+                .push_constants(
+                    pipeline.layout().clone(),
+                    0,
+                    radial_fs::PushConstants {
+                        tint: params.tint,
+                        phase: params.phase,
+                    },
+                )
+                .map_err(PipelineError::record)?;
+            // SAFETY: the pipeline takes no vertex/descriptor input; the
+            // full-screen triangle's 3 vertices come from gl_VertexIndex.
+            unsafe {
+                recorder.draw(3, 1, 0, 0).map_err(PipelineError::record)?;
+            }
         }
         Ok(())
     }
@@ -233,51 +233,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_present_mode(PresentMode::Fifo)
         .build()?;
 
-    // Registered lazily on the first frame (see module docs). `RegisteredPipeline`
-    // is `Copy`, so the handle is stashed and reused every frame.
-    let mut handle: Option<RegisteredPipeline<RadialParams>> = None;
     let mut frame: u64 = 0;
 
-    context.run(move |vse| {
-        if vse.key_just_pressed(KeyCode::Escape) {
-            vse.request_exit();
-            return Ok(());
-        }
-
-        let handle = match handle {
-            Some(h) => h,
-            None => {
-                let h = vse.register_pipeline(RadialPipeline::new())?;
-                handle = Some(h);
-                h
+    context.run_with_setup(
+        // Runs once, BEFORE frame 0. Pipeline compilation costs tens of
+        // milliseconds; doing it here keeps it off the presentation path
+        // instead of blowing frame 0's deadline.
+        |vse| vse.register_pipeline(RadialPipeline),
+        move |vse, &mut handle| {
+            if vse.key_just_pressed(KeyCode::Escape) {
+                vse.request_exit();
+                return Ok(());
             }
-        };
 
-        let (w, h) = vse.window_size();
-        let (w, h) = (w as f32, h as f32);
-        let phase = frame as f32 * 0.15;
+            let (w, h) = vse.window_size();
+            let (w, h) = (w as f32, h as f32);
+            let phase = frame as f32 * 0.15;
 
-        // 1. Built-in BEHIND the registered draw: a background stripe.
-        vse.draw_rect(0.0, h * 0.45, w, h * 0.55, Color::rgb(0.15, 0.15, 0.30));
+            // 1. Built-in BEHIND the registered draw: a background stripe.
+            vse.draw_rect(0.0, h * 0.45, w, h * 0.55, Color::rgb(0.15, 0.15, 0.30));
 
-        // 2. Registered Tier 1 draw: the animated radial patch. Its soft edge
-        //    (alpha envelope) lets the stripe show through around it.
-        vse.draw_with(
-            handle,
-            RadialParams {
-                tint: [0.95, 0.75, 0.20, 1.0],
-                phase,
-            },
-        );
+            // 2. Registered Tier 1 draw: the animated radial patch. Its soft edge
+            //    (alpha envelope) lets the stripe show through around it.
+            vse.draw_with(
+                handle,
+                RadialParams {
+                    tint: [0.95, 0.75, 0.20, 1.0],
+                    phase,
+                },
+            )?;
 
-        // 3. Built-in ON TOP of the registered draw: a fixation dot.
-        vse.draw_circle(w * 0.5, h * 0.5, 6.0, Color::WHITE);
+            // 3. Built-in ON TOP of the registered draw: a fixation dot.
+            vse.draw_circle(w * 0.5, h * 0.5, 6.0, Color::WHITE);
 
-        vse.clear()?;
-        vse.flip(None)?;
-        frame += 1;
-        Ok(())
-    })?;
+            vse.clear()?;
+            vse.flip(None)?;
+            frame += 1;
+            Ok(())
+        },
+    )?;
 
     Ok(())
 }
