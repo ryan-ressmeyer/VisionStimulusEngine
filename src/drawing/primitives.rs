@@ -109,6 +109,17 @@ pub(crate) enum DrawCommand {
     /// A user-supplied raw record hook (Tier 2), recorded on its own in call
     /// order so it composites interleaved with built-in draws.
     Custom(CustomDrawFn),
+
+    /// A draw for a user-registered [`StimulusPipeline`] (Tier 1). `id` selects
+    /// the registered pipeline; `payload` is the type-erased `Command` recovered
+    /// at record time. Recorded on its own in call order so it composites
+    /// interleaved with built-in draws.
+    ///
+    /// [`StimulusPipeline`]: crate::drawing::pipeline::StimulusPipeline
+    Registered {
+        id: u64,
+        payload: Box<dyn std::any::Any>,
+    },
 }
 
 /// Generate 6 vertices (2 triangles) for a filled rectangle.

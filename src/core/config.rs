@@ -12,7 +12,7 @@ use super::{
 };
 use crate::data::ExperimentSession;
 use crate::drawing::renderer::RendererError;
-use crate::drawing::{ModelError, PipelineSuite};
+use crate::drawing::{ModelError, PipelineError, PipelineSuite};
 
 use super::context::VSEContext;
 
@@ -38,6 +38,10 @@ pub enum VSEError {
     /// Native 3D model or camera error
     #[error("Model error: {0}")]
     Model(#[from] ModelError),
+
+    /// User-registered Tier 1 pipeline error (build or record).
+    #[error("Pipeline error: {0}")]
+    Pipeline(#[from] PipelineError),
 
     /// Window creation error
     #[error("Window error: {0}")]

@@ -8,6 +8,7 @@ pub(crate) mod font;
 mod gabor;
 mod model;
 pub(crate) mod noise;
+pub(crate) mod pipeline;
 pub(crate) mod primitives;
 pub(crate) mod renderer;
 mod stimuli;
@@ -17,6 +18,9 @@ mod vertex;
 pub use color::Color;
 pub use gabor::GaborParams;
 pub use model::{Bounds3D, ModelError, ModelHandle, ModelInfo, PerspectiveCamera};
+pub use pipeline::{
+    PipelineBuildCtx, PipelineError, RecordCtx, RegisteredPipeline, StimulusPipeline,
+};
 pub use renderer::{BuiltinPipeline, CustomFrameContext, FrameRecorder, PipelineSuite};
 pub use stimuli::{GratingParams, NoiseParams, NoiseType, WaveType};
 pub use texture::TextureHandle;

@@ -48,6 +48,9 @@ use vulkano::{
     sync::GpuFuture,
 };
 
+use super::pipeline::{
+    ErasedStimulusPipeline, PipelineBuildCtx, PipelineError, RecordCtx, StimulusPipeline,
+};
 use super::primitives::{
     arc_vertices, circle_vertices, dot_unit_quad_vertices, line_vertices, rect_vertices,
     textured_quad_vertices, CustomDrawFn, DrawCommand, DrawCommand3D,
@@ -103,7 +106,8 @@ fn draw_kind(cmd: &DrawCommand) -> DrawKind {
         | DrawCommand::Grating { .. }
         | DrawCommand::Gabor { .. }
         | DrawCommand::Dots { .. }
-        | DrawCommand::Custom(_) => DrawKind::NonFlat,
+        | DrawCommand::Custom(_)
+        | DrawCommand::Registered { .. } => DrawKind::NonFlat,
     }
 }
 
@@ -542,6 +546,18 @@ pub(crate) struct Renderer {
     /// which borrow `self` immutably. Ensures we warn once per kind, not once
     /// per frame.
     warned_absent_pipelines: RefCell<HashSet<BuiltinPipeline>>,
+
+    /// User-registered Tier 1 pipelines, keyed by the id handed back in a
+    /// [`RegisteredPipeline`](super::pipeline::RegisteredPipeline). Type-erased
+    /// so the registry is homogeneous; each entry recovers its concrete
+    /// `Command` when recording (see `super::pipeline`).
+    registered: HashMap<u64, Box<dyn ErasedStimulusPipeline>>,
+    /// Next id to assign on [`register`](Self::register).
+    next_registered_id: u64,
+    /// Registered pipeline ids already warned about as absent (a handle whose
+    /// pipeline is missing — should not happen for a valid handle). Warn-once,
+    /// like `warned_absent_pipelines`.
+    warned_absent_registered: RefCell<HashSet<u64>>,
 }
 
 impl Renderer {
@@ -587,7 +603,55 @@ impl Renderer {
             flat_vertex_scratch: Vec::new(),
             dot_instance_scratch: Vec::new(),
             warned_absent_pipelines: RefCell::new(HashSet::new()),
+            registered: HashMap::new(),
+            next_registered_id: 0,
+            warned_absent_registered: RefCell::new(HashSet::new()),
         })
+    }
+
+    /// Register a user Tier 1 [`StimulusPipeline`]: build it once (via
+    /// [`build`](StimulusPipeline::build)) and store it type-erased under a
+    /// fresh id, which the caller wraps in a
+    /// [`RegisteredPipeline`](super::pipeline::RegisteredPipeline).
+    ///
+    /// `color_format` is the swapchain color format (the renderer does not store
+    /// it); it and `self.depth_format` are handed to the pipeline's
+    /// [`PipelineBuildCtx`] so it can create pipelines matching VSE's passes.
+    pub fn register(
+        &mut self,
+        mut pipeline: impl StimulusPipeline,
+        color_format: Format,
+    ) -> Result<u64, PipelineError> {
+        let cx = PipelineBuildCtx {
+            device: &self.device,
+            color_format,
+            depth_format: self.depth_format,
+            memory_allocator: &self.memory_allocator,
+        };
+        pipeline.build(&cx)?;
+        let id = self.next_registered_id;
+        self.next_registered_id = self.next_registered_id.wrapping_add(1);
+        self.registered.insert(id, Box::new(pipeline));
+        Ok(id)
+    }
+
+    /// Enqueue a Tier 1 registered draw: pushes a [`DrawCommand::Registered`]
+    /// carrying the type-erased `Command` payload, so it composites in call
+    /// order interleaved with the built-in draws queued around it.
+    pub fn push_registered(&mut self, id: u64, payload: Box<dyn std::any::Any>) {
+        self.draw_commands
+            .push(DrawCommand::Registered { id, payload });
+    }
+
+    /// Warn once (per id) that a registered draw was skipped because no pipeline
+    /// is registered under its id. Defensive: a valid handle always resolves.
+    fn warn_absent_registered(&self, id: u64) {
+        if self.warned_absent_registered.borrow_mut().insert(id) {
+            tracing::warn!(
+                "skipping registered draw: no pipeline registered under id {id} \
+                 (was register_pipeline called on this VSE context?)"
+            );
+        }
     }
 
     /// Warn once (per pipeline kind) that a queued draw was skipped because its
@@ -918,6 +982,13 @@ impl Renderer {
             .map(|c| draw_kind(c.as_ref().unwrap()))
             .collect();
         let frame = CustomFrameContext { viewport_extent };
+        // Built once for the frame and handed to every Tier 1 registered draw.
+        // Holds a cloned allocator `Arc` (not a `self` borrow), so it does not
+        // conflict with the mutable `self` uses in the built-in arms below.
+        let record_ctx = RecordCtx {
+            viewport_extent,
+            memory_allocator: self.memory_allocator.clone(),
+        };
         for segment in plan_render_segments(&kinds) {
             match segment {
                 RenderSegment::FlatRun { start, end } => {
@@ -977,9 +1048,23 @@ impl Renderer {
                         .take()
                         .expect("each command is recorded exactly once");
                     // Custom draws move their closure out and run it in place;
+                    // registered (Tier 1) draws dispatch to their user pipeline;
                     // every built-in records by reference exactly as before.
                     if let DrawCommand::Custom(record) = cmd {
                         record(&mut builder, &frame);
+                    } else if let DrawCommand::Registered { id, payload } = cmd {
+                        // `self.registered` is a distinct field; `builder` and
+                        // `record_ctx` are locals (record_ctx owns a cloned Arc,
+                        // not a `self` borrow), so this borrow-checks alongside
+                        // the warn-once path in the absent branch.
+                        match self.registered.get(&id) {
+                            Some(pipeline) => {
+                                pipeline
+                                    .record_erased(&mut builder, &record_ctx, &*payload)
+                                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+                            }
+                            None => self.warn_absent_registered(id),
+                        }
                     } else {
                         match &cmd {
                             // Textured draws (Texture and Noise both use the textured pipeline)
@@ -1316,6 +1401,10 @@ impl Renderer {
                             DrawCommand::Custom(_) => {
                                 unreachable!("custom draws are moved out and run above")
                             }
+                            // Registered draws are handled by the `else if let` above.
+                            DrawCommand::Registered { .. } => {
+                                unreachable!("registered draws are dispatched above")
+                            }
                         }
                     }
                 }
@@ -1578,6 +1667,7 @@ impl Renderer {
             DrawCommand::Noise { .. } => {}
             DrawCommand::Dots { .. } => {}
             DrawCommand::Custom(_) => {}
+            DrawCommand::Registered { .. } => {}
         }
     }
 
@@ -2225,6 +2315,18 @@ mod tests {
         // A Tier 2 custom draw records on its own, so it must never coalesce
         // into a flat run — it is NonFlat like every other self-recording draw.
         let cmd = DrawCommand::Custom(Box::new(|_, _| {}));
+        assert_eq!(draw_kind(&cmd), DrawKind::NonFlat);
+    }
+
+    #[test]
+    fn draw_kind_classifies_registered_as_non_flat() {
+        // A Tier 1 registered draw records via its own user pipeline, so it must
+        // never coalesce into a flat run — it is NonFlat like every other
+        // self-recording draw.
+        let cmd = DrawCommand::Registered {
+            id: 0,
+            payload: Box::new(7u32),
+        };
         assert_eq!(draw_kind(&cmd), DrawKind::NonFlat);
     }
 }

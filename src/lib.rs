@@ -44,7 +44,8 @@ pub mod prelude {
     pub use crate::drawing::{
         Bounds3D, BuiltinPipeline, Color, CustomFrameContext, FrameRecorder, GaborParams,
         GratingParams, ModelError, ModelHandle, ModelInfo, NoiseParams, NoiseType,
-        PerspectiveCamera, PipelineSuite, TextureHandle, WaveType,
+        PerspectiveCamera, PipelineBuildCtx, PipelineError, PipelineSuite, RecordCtx,
+        RegisteredPipeline, StimulusPipeline, TextureHandle, WaveType,
     };
     pub use crate::host::HostInfo;
     pub use crate::timing::{

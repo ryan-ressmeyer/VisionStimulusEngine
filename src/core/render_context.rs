@@ -18,7 +18,7 @@ use crate::drawing::primitives::{
 };
 use crate::drawing::{
     Bounds3D, Color, CustomFrameContext, FrameRecorder, GaborParams, GratingParams, ModelHandle,
-    ModelInfo, NoiseParams, PerspectiveCamera, TextureHandle,
+    ModelInfo, NoiseParams, PerspectiveCamera, RegisteredPipeline, StimulusPipeline, TextureHandle,
 };
 use crate::timing::{Clock, ScanoutTimestamp, Timestamp, TimingSource};
 
@@ -774,6 +774,47 @@ impl<'a> RenderContext<'a> {
         record: impl FnOnce(&mut FrameRecorder, &CustomFrameContext) + 'static,
     ) {
         self.state.renderer.push_custom(Box::new(record));
+    }
+
+    /// Register a user-defined Tier 1 [`StimulusPipeline`] and get a typed
+    /// handle to enqueue draws with (see `docs/design/pipeline-flexibility.md`
+    /// §3, Tier 1).
+    ///
+    /// Builds the pipeline **once**, here — call at setup or between trials,
+    /// never on the presentation path. The pipeline's
+    /// [`build`](StimulusPipeline::build) receives a
+    /// [`PipelineBuildCtx`](crate::prelude::PipelineBuildCtx) carrying VSE's
+    /// device, the swapchain color format, the depth format, and the memory
+    /// allocator. The returned [`RegisteredPipeline`] is `Copy`; stash it and
+    /// pass it to [`draw_with`](Self::draw_with) each frame.
+    ///
+    /// # Errors
+    ///
+    /// [`VSEError::Pipeline`] if the pipeline's `build` fails.
+    pub fn register_pipeline<P: StimulusPipeline>(
+        &mut self,
+        pipeline: P,
+    ) -> Result<RegisteredPipeline<P::Command>, VSEError> {
+        let color_format = self.state.swapchain.format();
+        let id = self.state.renderer.register(pipeline, color_format)?;
+        Ok(RegisteredPipeline {
+            id,
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    /// Enqueue one draw for a registered Tier 1 pipeline.
+    ///
+    /// The `command` is this draw's parameters (the pipeline's
+    /// [`Command`](StimulusPipeline::Command) type). It records in call order,
+    /// interleaved with the built-in `draw_*` calls issued around it, when the
+    /// pipeline's [`record`](StimulusPipeline::record) runs during this frame's
+    /// [`flip`](Self::flip). The raw [`FrameRecorder`] is handed to `record` —
+    /// the same low-level access as [`draw_custom`](Self::draw_custom).
+    pub fn draw_with<C: 'static>(&mut self, handle: RegisteredPipeline<C>, command: C) {
+        self.state
+            .renderer
+            .push_registered(handle.id, Box::new(command));
     }
 
     /// Capture a snapshot of the full host machine state.
