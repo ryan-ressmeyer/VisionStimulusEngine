@@ -274,8 +274,27 @@ impl HeadlessContext {
 
     /// The color format frames are rendered in.
     pub fn format(&self) -> Format {
+        self.offscreen().format
+    }
+
+    /// The offscreen target's size in pixels.
+    pub fn extent(&self) -> [u32; 2] {
+        self.offscreen().extent
+    }
+
+    /// Snapshot the host machine and this session's render target.
+    ///
+    /// The [`SwapchainInfo`](crate::host::SwapchainInfo) slot describes the
+    /// offscreen target and says `n/a (headless)` where a presented session
+    /// would report a color space and present mode — so a regeneration's
+    /// metadata is never mistakable for a recording's.
+    pub fn capture_host_info(&self) -> crate::host::HostInfo {
+        super::render_context::capture_host_info(&self.state, &self.config)
+    }
+
+    fn offscreen(&self) -> &OffscreenTarget {
         match &self.state.target {
-            RenderTarget::Offscreen(o) => o.format,
+            RenderTarget::Offscreen(o) => o,
             RenderTarget::Present(_) => unreachable!("a headless context is never presenting"),
         }
     }

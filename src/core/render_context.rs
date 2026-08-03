@@ -943,36 +943,7 @@ impl<'a> RenderContext<'a> {
     /// This is an on-demand operation — call it when you need a snapshot.
     /// The EDID capture shells out to `xrandr`, which may take ~50ms.
     pub fn capture_host_info(&self) -> crate::host::HostInfo {
-        // Headless runs report the offscreen target in place of a swapchain,
-        // and no present-timing observations — there was no presentation to
-        // observe. The `SwapchainInfo` strings say so explicitly.
-        let (render_target, observed) = match &self.state.target {
-            RenderTarget::Present(p) => (
-                crate::host::capture::capture_swapchain_info(&p.swapchain),
-                crate::host::capture::ObservedPresentTiming {
-                    scanout_feedback_populated: p.scanout_feedback_populated,
-                    // Enforcement is not auto-probed (it disrupts frames); `None` here. The
-                    // direct-display characterization example measures and reports it.
-                    absolute_scheduling_enforced: None,
-                    queue_global_priority: p.ext_features.map(|f| f.queue_priority),
-                },
-            ),
-            RenderTarget::Offscreen(o) => (
-                crate::host::capture::capture_offscreen_info(o.format, o.extent),
-                crate::host::capture::ObservedPresentTiming::default(),
-            ),
-        };
-        crate::host::capture::capture_host_info(
-            self.state.device_selector.physical_device(),
-            &self.state.device,
-            self.state
-                .target
-                .present()
-                .and_then(|p| p.window.as_deref()),
-            render_target,
-            self.config,
-            observed,
-        )
+        capture_host_info(self.state, self.config)
     }
 
     /// Whether the driver was observed to actually populate `IMAGE_FIRST_PIXEL_OUT` in
@@ -1277,4 +1248,40 @@ fn monitor_handle_to_info(index: usize, handle: &winit::monitor::MonitorHandle) 
         position: (position.x, position.y),
         video_modes,
     }
+}
+
+/// Snapshot the host machine and this session's render target.
+///
+/// Shared by [`RenderContext::capture_host_info`] and
+/// [`HeadlessContext::capture_host_info`](crate::core::HeadlessContext::capture_host_info):
+/// the headless context has no `RenderContext` to hand out when it is not
+/// running a frame, but the snapshot does not need one.
+pub(super) fn capture_host_info(state: &VSEState, config: &VSEConfig) -> crate::host::HostInfo {
+    // Headless runs report the offscreen target in place of a swapchain,
+    // and no present-timing observations — there was no presentation to
+    // observe. The `SwapchainInfo` strings say so explicitly.
+    let (render_target, observed) = match &state.target {
+        RenderTarget::Present(p) => (
+            crate::host::capture::capture_swapchain_info(&p.swapchain),
+            crate::host::capture::ObservedPresentTiming {
+                scanout_feedback_populated: p.scanout_feedback_populated,
+                // Enforcement is not auto-probed (it disrupts frames); `None` here. The
+                // direct-display characterization example measures and reports it.
+                absolute_scheduling_enforced: None,
+                queue_global_priority: p.ext_features.map(|f| f.queue_priority),
+            },
+        ),
+        RenderTarget::Offscreen(o) => (
+            crate::host::capture::capture_offscreen_info(o.format, o.extent),
+            crate::host::capture::ObservedPresentTiming::default(),
+        ),
+    };
+    crate::host::capture::capture_host_info(
+        state.device_selector.physical_device(),
+        &state.device,
+        state.target.present().and_then(|p| p.window.as_deref()),
+        render_target,
+        config,
+        observed,
+    )
 }

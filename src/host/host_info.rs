@@ -1,9 +1,14 @@
 //! Host information data structures
 //!
-//! All structs derive Serialize for flexible output (JSON, TOML, etc.)
+//! All structs derive Serialize for flexible output (JSON, TOML, etc.) and
+//! Deserialize so a recorded snapshot can be read back — post-hoc stimulus
+//! regeneration reconstructs its render target from exactly this metadata
+//! (see [`VSEContextBuilder::with_headless_from_host_info`]).
+//!
+//! [`VSEContextBuilder::with_headless_from_host_info`]: crate::prelude::VSEContextBuilder::with_headless_from_host_info
 //! and Debug/Clone for inspection and copying.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Complete snapshot of host machine state at capture time.
 ///
@@ -21,7 +26,7 @@ use serde::Serialize;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostInfo {
     /// ISO 8601 timestamp of when this snapshot was captured
     pub captured_at: String,
@@ -50,7 +55,7 @@ pub struct HostInfo {
 }
 
 /// Operating system information
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OsInfo {
     pub name: String,
     pub version: String,
@@ -59,7 +64,7 @@ pub struct OsInfo {
 }
 
 /// CPU information
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CpuInfo {
     pub brand: String,
     pub physical_cores: usize,
@@ -68,7 +73,7 @@ pub struct CpuInfo {
 }
 
 /// Memory information (in bytes)
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryInfo {
     pub total_bytes: u64,
     pub available_bytes: u64,
@@ -76,7 +81,7 @@ pub struct MemoryInfo {
 }
 
 /// GPU hardware information from Vulkan physical device properties
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuInfo {
     pub device_name: String,
     pub vendor_id: u32,
@@ -98,7 +103,7 @@ pub struct GpuInfo {
 /// whether hardware present timing was even available, and how tightly the CPU and GPU
 /// clocks can be correlated (the basis for aligning stimulus onset with external hardware).
 /// See `docs/clock-synchronization.md`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimingCapabilities {
     /// `VK_EXT_present_timing` — hardware scanout timestamps + scheduled presents.
     pub present_timing: bool,
@@ -144,7 +149,7 @@ pub struct TimingCapabilities {
 }
 
 /// Display/monitor information from winit
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DisplayInfo {
     pub monitor_name: Option<String>,
     pub refresh_rate_millihertz: Option<u32>,
@@ -154,7 +159,7 @@ pub struct DisplayInfo {
 }
 
 /// Actually negotiated swapchain state (may differ from what was requested)
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapchainInfo {
     pub image_format: String,
     pub color_space: String,
@@ -164,7 +169,7 @@ pub struct SwapchainInfo {
 }
 
 /// User-configured pipeline settings from the builder
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
     pub window_size: (u32, u32),
     pub clear_color: [f32; 4],
@@ -182,7 +187,7 @@ pub struct PipelineConfig {
 }
 
 /// Build-time metadata captured by build.rs
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildInfo {
     pub vse_version: String,
     pub git_commit_hash: Option<String>,
@@ -214,7 +219,7 @@ impl BuildInfo {
 }
 
 /// Runtime environment information
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeEnv {
     pub username: String,
     pub display_server: String,
@@ -226,7 +231,7 @@ pub struct RuntimeEnv {
 }
 
 /// EDID monitor identification data parsed from xrandr
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdidInfo {
     pub raw_hex: String,
     pub manufacturer: Option<String>,

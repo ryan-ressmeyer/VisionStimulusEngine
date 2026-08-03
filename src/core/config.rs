@@ -352,6 +352,53 @@ impl VSEContextBuilder {
         self
     }
 
+    /// Configure a headless session to reproduce a recorded one, taking the
+    /// color format, extent, and pipeline suite from its
+    /// [`HostInfo`](crate::host::HostInfo).
+    ///
+    /// This is the intended entry point for post-hoc stimulus regeneration.
+    /// Driving the target from the recording rather than from hand-passed
+    /// parameters is the point: a format or suite that differs from the
+    /// recorded session produces different pixels, and the difference is easy
+    /// to introduce and hard to notice by eye.
+    ///
+    /// The clear color, refresh rate, and any other builder settings are yours
+    /// to set — [`PipelineConfig`](crate::host::PipelineConfig) records the
+    /// first two if you want them, but they are not applied automatically.
+    ///
+    /// Finish with [`build_headless`](Self::build_headless).
+    ///
+    /// # Errors
+    ///
+    /// [`VSEError::Window`] if the recorded color format is not one this
+    /// version can name, and [`VSEError::Renderer`] if the recorded pipeline
+    /// set contains a built-in this version does not have. Both mean the
+    /// recording cannot be faithfully reproduced here, so neither is silently
+    /// tolerated.
+    pub fn with_headless_from_host_info(
+        mut self,
+        info: &crate::host::HostInfo,
+    ) -> Result<Self, VSEError> {
+        let format = parse_recorded_format(&info.swapchain.image_format).ok_or_else(|| {
+            VSEError::Window(format!(
+                "recorded color format {:?} is not one this VSE version can reconstruct; \
+                 regenerating in a different format would not reproduce the recorded pixels",
+                info.swapchain.image_format
+            ))
+        })?;
+
+        let suite = PipelineSuite::from_key_names(&info.pipeline.builtin_pipelines)
+            .map_err(RendererError::from)?;
+
+        self.config.headless = Some(HeadlessConfig {
+            width: info.swapchain.extent[0],
+            height: info.swapchain.extent[1],
+            format,
+        });
+        self.config.pipeline_suite = suite;
+        Ok(self)
+    }
+
     /// Override the offscreen color format set by
     /// [`with_headless`](Self::with_headless).
     ///
@@ -450,6 +497,27 @@ impl Default for VSEContextBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Recover a [`Format`](vulkano::format::Format) from the `{:?}` name recorded
+/// in [`SwapchainInfo::image_format`](crate::host::SwapchainInfo).
+///
+/// Covers the 8-bit and 10-bit color formats a swapchain actually negotiates,
+/// plus the headless defaults. Deliberately a fixed table rather than a
+/// wildcard: an unrecognized name must be an error the caller sees, not a
+/// silent substitution that changes the regenerated pixels.
+fn parse_recorded_format(name: &str) -> Option<vulkano::format::Format> {
+    use vulkano::format::Format;
+    Some(match name {
+        "B8G8R8A8_SRGB" => Format::B8G8R8A8_SRGB,
+        "B8G8R8A8_UNORM" => Format::B8G8R8A8_UNORM,
+        "R8G8B8A8_SRGB" => Format::R8G8B8A8_SRGB,
+        "R8G8B8A8_UNORM" => Format::R8G8B8A8_UNORM,
+        "A2B10G10R10_UNORM_PACK32" => Format::A2B10G10R10_UNORM_PACK32,
+        "A2R10G10B10_UNORM_PACK32" => Format::A2R10G10B10_UNORM_PACK32,
+        "R16G16B16A16_SFLOAT" => Format::R16G16B16A16_SFLOAT,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

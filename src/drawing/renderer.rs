@@ -338,6 +338,27 @@ impl BuiltinPipeline {
             Self::MeshNormals => "MeshNormals",
         }
     }
+
+    /// Recover a key from the stable name [`name`](Self::name) produces.
+    ///
+    /// The inverse direction, used when rebuilding a session's
+    /// [`PipelineSuite`] from recorded metadata. `None` for a name this VSE
+    /// version does not know — which, for a regeneration, means the recording
+    /// came from a version that shipped a built-in this one lacks, and the
+    /// caller must say so rather than silently rendering without it.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let all = [
+            Self::FlatColor,
+            Self::Textured,
+            Self::Grating,
+            Self::Gabor,
+            Self::AdditiveGabor,
+            Self::SubtractiveGabor,
+            Self::Dot,
+            Self::MeshNormals,
+        ];
+        all.into_iter().find(|key| key.name() == name)
+    }
 }
 
 /// A [`PipelineSuite`] that cannot render correctly as configured.
@@ -356,6 +377,15 @@ pub enum SuiteError {
          the other renders half the signed modulation. Select both, or neither"
     )]
     UnpairedGaborPass,
+
+    /// A recorded pipeline name this VSE version does not know — see
+    /// [`PipelineSuite::from_key_names`].
+    #[error(
+        "unknown built-in pipeline {0:?} in the recorded pipeline set; the recording \
+         was probably made by a VSE version shipping a built-in this one lacks, so its \
+         stimuli cannot be faithfully regenerated here"
+    )]
+    UnknownPipeline(String),
 }
 
 /// The set of built-in pipelines to build for a session.
@@ -456,6 +486,25 @@ impl PipelineSuite {
         let mut names: Vec<&'static str> = self.enabled.iter().map(|key| key.name()).collect();
         names.sort_unstable();
         names
+    }
+
+    /// Rebuild a suite from the names [`key_names`](Self::key_names) recorded.
+    ///
+    /// # Errors
+    ///
+    /// [`SuiteError::UnknownPipeline`] if a name is not one this VSE version
+    /// knows. Regeneration must fail loudly here: silently dropping a pipeline
+    /// the recording used would produce a frame missing a stimulus, which is
+    /// exactly the failure that must never pass for a faithful reproduction.
+    pub fn from_key_names<S: AsRef<str>>(names: &[S]) -> Result<Self, SuiteError> {
+        let mut enabled = HashSet::new();
+        for name in names {
+            let name = name.as_ref();
+            let key = BuiltinPipeline::from_name(name)
+                .ok_or_else(|| SuiteError::UnknownPipeline(name.to_string()))?;
+            enabled.insert(key);
+        }
+        Ok(Self { enabled })
     }
 }
 
