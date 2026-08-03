@@ -78,3 +78,13 @@ Complex 3D and VR-ready scenes remain available through the `vse-bevy` crate, wh
 ```bash
 cargo run -p vse-bevy --release --example 01_bevy_ring_demo
 ```
+
+## Advanced rendering
+
+| # | Demo | What it shows |
+|---|------|---------------|
+| 22 | `custom_pipeline` | Bring-your-own `GraphicsPipeline` recorded into VSE's pass via the Tier 2 `draw_custom` raw hook |
+
+```bash
+cargo run --release --example 22_custom_pipeline
+```

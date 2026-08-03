@@ -17,8 +17,8 @@ use crate::drawing::primitives::{
     default_arc_segments, default_circle_segments, DrawCommand, DrawCommand3D,
 };
 use crate::drawing::{
-    Bounds3D, Color, GaborParams, GratingParams, ModelHandle, ModelInfo, NoiseParams,
-    PerspectiveCamera, TextureHandle,
+    Bounds3D, Color, CustomFrameContext, FrameRecorder, GaborParams, GratingParams, ModelHandle,
+    ModelInfo, NoiseParams, PerspectiveCamera, TextureHandle,
 };
 use crate::timing::{Clock, ScanoutTimestamp, Timestamp, TimingSource};
 
@@ -730,6 +730,50 @@ impl<'a> RenderContext<'a> {
             radius,
             color,
         });
+    }
+
+    /// Record raw Vulkan draws into VSE's active render pass this frame
+    /// (Tier 2 "raw record hook" — the low-level escape for advanced users; see
+    /// `docs/design/pipeline-flexibility.md` §3).
+    ///
+    /// The closure is invoked once, during this frame's [`flip`](Self::flip),
+    /// with a `&mut` [`FrameRecorder`] (the exact vulkano
+    /// `AutoCommandBufferBuilder` VSE records into) and a
+    /// [`CustomFrameContext`]. Queue as many as you like; each runs in the order
+    /// it was queued. The queue is drained every frame, so a frame with no
+    /// `draw_custom` call behaves exactly as before.
+    ///
+    /// # Where and how the closure runs — the contract
+    ///
+    /// - It executes **inside an already-active dynamic-rendering pass**, after
+    ///   all of VSE's built-in 2D draws (flat shapes, textures, gratings/Gabors,
+    ///   dots). Custom draws therefore composite **on top of** the built-ins.
+    ///   (Call-order interleaving with built-ins is a later phase.)
+    /// - The color attachment is the swapchain image
+    ///   (format = [`swapchain().format()`](SwapchainManager::format)); there is
+    ///   **no depth attachment** in this 2D pass.
+    /// - The **viewport is already set** to the full framebuffer
+    ///   ([`CustomFrameContext::viewport_extent`]); a pipeline built with dynamic
+    ///   viewport state needs no `set_viewport` of its own.
+    ///
+    /// The closure **must not** call `begin_rendering` / `end_rendering`, end the
+    /// pass, or transition the target image's layout — VSE owns those. Do:
+    /// bind a [`GraphicsPipeline`](vulkano::pipeline::GraphicsPipeline) you built
+    /// once at setup (compatible with the swapchain color format, no depth), set
+    /// push constants, bind vertex/index/instance buffers, and issue draws.
+    ///
+    /// Build pipelines and buffers **at setup / between trials, never here on the
+    /// presentation path**, using the exposed [`device()`](Self::device),
+    /// [`swapchain().format()`](SwapchainManager::format), and
+    /// [`memory_allocator()`](Self::memory_allocator).
+    ///
+    /// Recording errors from the builder are the caller's to handle (the vulkano
+    /// calls return `Result`); this hook does not surface them.
+    pub fn draw_custom(
+        &mut self,
+        record: impl FnOnce(&mut FrameRecorder, &CustomFrameContext) + 'static,
+    ) {
+        self.state.renderer.push_custom(Box::new(record));
     }
 
     /// Capture a snapshot of the full host machine state.

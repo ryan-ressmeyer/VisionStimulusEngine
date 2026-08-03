@@ -410,6 +410,46 @@ struct TextureResources {
     height: u32,
 }
 
+/// The concrete command-buffer builder VSE records every frame into.
+///
+/// This is the exact primary `AutoCommandBufferBuilder` used inside
+/// [`Renderer::render_with_underlay`]; a [`RenderContext::draw_custom`] closure
+/// records into a `&mut FrameRecorder`. Exposing the concrete vulkano type
+/// intentionally couples VSE's public API to vulkano's version — the same
+/// accepted tradeoff as the [`device()`]/[`queue()`]/[`swapchain()`] escape
+/// hatches (see `docs/design/pipeline-flexibility.md` §3, Tier 2).
+///
+/// Most callers never need to name this: the closure parameter types are
+/// inferred at the `draw_custom` call site. It is exported so helper functions
+/// that take the builder can spell the type.
+///
+/// [`RenderContext::draw_custom`]: crate::prelude::RenderContext::draw_custom
+/// [`device()`]: crate::prelude::RenderContext::device
+/// [`queue()`]: crate::prelude::RenderContext::queue
+/// [`swapchain()`]: crate::prelude::RenderContext::swapchain
+pub type FrameRecorder = AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>;
+
+/// Per-frame context handed to a [`RenderContext::draw_custom`] closure
+/// alongside the [`FrameRecorder`].
+///
+/// A struct (not a bare tuple) so fields can be added later without breaking
+/// existing custom-draw closures.
+///
+/// [`RenderContext::draw_custom`]: crate::prelude::RenderContext::draw_custom
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CustomFrameContext {
+    /// The framebuffer extent (in pixels) VSE used for this frame's built-in
+    /// passes. The dynamic viewport is already set to cover this extent when
+    /// the closure runs, so custom pipelines using dynamic viewport state need
+    /// not set it themselves.
+    pub viewport_extent: [u32; 2],
+}
+
+/// A user-supplied custom draw recorded into the active 2D render pass
+/// (Tier 2 raw hook). Boxed, single-shot, run once per frame. No `Send` bound:
+/// custom draws are invoked single-threaded within `render`.
+type CustomDraw = Box<dyn FnOnce(&mut FrameRecorder, &CustomFrameContext)>;
+
 /// The Renderer manages graphics pipelines and converts draw commands
 /// into GPU command buffers.
 pub(crate) struct Renderer {
@@ -431,6 +471,9 @@ pub(crate) struct Renderer {
 
     draw_commands: Vec<DrawCommand>,
     draw_commands_3d: Vec<DrawCommand3D>,
+    /// User-supplied raw record hooks (Tier 2). Drained and run each frame
+    /// inside the final 2D pass, on top of the built-in draws.
+    custom_draws: Vec<CustomDraw>,
     flat_vertex_scratch: Vec<Vertex2D>,
     dot_instance_scratch: Vec<DotInstance>,
 
@@ -481,6 +524,7 @@ impl Renderer {
             next_texture_id: 0,
             draw_commands: Vec::new(),
             draw_commands_3d: Vec::with_capacity(16),
+            custom_draws: Vec::new(),
             flat_vertex_scratch: Vec::new(),
             dot_instance_scratch: Vec::new(),
             warned_absent_pipelines: RefCell::new(HashSet::new()),
@@ -506,6 +550,12 @@ impl Renderer {
 
     pub fn push_3d(&mut self, command: DrawCommand3D) {
         self.draw_commands_3d.push(command);
+    }
+
+    /// Queue a user-supplied raw record hook (Tier 2). Runs once, inside the
+    /// final 2D render pass, after all built-in 2D draws this frame.
+    pub fn push_custom(&mut self, record: CustomDraw) {
+        self.custom_draws.push(record);
     }
 
     pub fn load_model(&mut self, path: impl AsRef<Path>) -> Result<ModelHandle, RendererError> {
@@ -1114,6 +1164,20 @@ impl Renderer {
                 builder
                     .draw(6, instance_count, 0, 0)
                     .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+            }
+        }
+
+        // User-recorded custom draws (Tier 2 raw hook). These run inside the
+        // active 2D render pass, AFTER every built-in 2D pass (flat / textured /
+        // grating-gabor / dots) and immediately BEFORE end_rendering(), so they
+        // composite on top of all built-in draws. `mem::take` drains the queue
+        // every frame exactly like `draw_commands`: with no custom draws the
+        // loop is empty and this block is a no-op, identical to before.
+        let custom_draws = std::mem::take(&mut self.custom_draws);
+        if !custom_draws.is_empty() {
+            let frame = CustomFrameContext { viewport_extent };
+            for record in custom_draws {
+                record(&mut builder, &frame);
             }
         }
 
@@ -1808,6 +1872,21 @@ mod tests {
         let suite = suite.without(BuiltinPipeline::Dot);
         assert!(!suite.contains(BuiltinPipeline::Dot));
         assert!(suite.contains(BuiltinPipeline::Gabor));
+    }
+
+    #[test]
+    fn custom_frame_context_carries_viewport_extent() {
+        // Device-free: the context is a plain value struct built from the
+        // frame's viewport extent. The pixel behavior of `draw_custom` needs a
+        // Vulkan device + display and is verified visually via
+        // `examples/22_custom_pipeline.rs`.
+        let frame = CustomFrameContext {
+            viewport_extent: [1920, 1080],
+        };
+        assert_eq!(frame.viewport_extent, [1920, 1080]);
+        // Copy semantics: the struct is cheap to hand to each closure.
+        let copy = frame;
+        assert_eq!(copy, frame);
     }
 
     #[test]
