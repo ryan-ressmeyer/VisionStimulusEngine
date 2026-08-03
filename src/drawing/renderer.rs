@@ -69,6 +69,73 @@ use super::vertex::{DotInstance, TexturedVertex, Vertex2D, Vertex3D};
 
 const MESH_FRONT_FACE: FrontFace = FrontFace::CounterClockwise;
 
+/// Whether a queued 2D draw uses the coalescing flat-color pipeline
+/// (`Rect`/`Circle`/`Line`/`Arc`) or records on its own like every other
+/// primitive. Used to plan call-order compositing without a Vulkan device.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum DrawKind {
+    Flat,
+    NonFlat,
+}
+
+/// One unit of the ordered 2D render plan produced by [`plan_render_segments`].
+///
+/// Either a run of consecutive flat-color commands coalesced into a single flat
+/// draw, or a single non-flat command recorded on its own. In both cases the
+/// indices refer to positions in the ordered `draw_commands` queue.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum RenderSegment {
+    /// Consecutive flat-color commands `[start, end)`, coalesced into one draw.
+    FlatRun { start: usize, end: usize },
+    /// A single non-flat command at this index.
+    Single(usize),
+}
+
+/// Classify a draw command as flat-color (coalescing) or not.
+fn draw_kind(cmd: &DrawCommand) -> DrawKind {
+    match cmd {
+        DrawCommand::Rect { .. }
+        | DrawCommand::Circle { .. }
+        | DrawCommand::Line { .. }
+        | DrawCommand::Arc { .. } => DrawKind::Flat,
+        DrawCommand::Texture { .. }
+        | DrawCommand::Noise { .. }
+        | DrawCommand::Grating { .. }
+        | DrawCommand::Gabor { .. }
+        | DrawCommand::Dots { .. } => DrawKind::NonFlat,
+    }
+}
+
+/// Partition ordered draw kinds into the call-order render plan: each maximal
+/// run of consecutive `Flat` commands becomes one [`RenderSegment::FlatRun`],
+/// and every `NonFlat` command becomes its own [`RenderSegment::Single`], with
+/// call order preserved. Pure and device-free — the regression net for
+/// call-order compositing (see `docs/design/pipeline-flexibility.md` §4-5).
+fn plan_render_segments(kinds: &[DrawKind]) -> Vec<RenderSegment> {
+    let mut segments = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for (i, kind) in kinds.iter().enumerate() {
+        match kind {
+            DrawKind::Flat => {
+                run_start.get_or_insert(i);
+            }
+            DrawKind::NonFlat => {
+                if let Some(start) = run_start.take() {
+                    segments.push(RenderSegment::FlatRun { start, end: i });
+                }
+                segments.push(RenderSegment::Single(i));
+            }
+        }
+    }
+    if let Some(start) = run_start.take() {
+        segments.push(RenderSegment::FlatRun {
+            start,
+            end: kinds.len(),
+        });
+    }
+    segments
+}
+
 fn additive_gabor_blend() -> AttachmentBlend {
     gabor_accumulation_blend(vulkano::pipeline::graphics::color_blend::BlendOp::Add)
 }
@@ -829,254 +896,155 @@ impl Renderer {
             .set_viewport(0, [viewport].into_iter().collect())
             .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
 
-        // Generate flat-color vertices from queued commands
-        self.fill_flat_color_vertices();
-        if !self.flat_vertex_scratch.is_empty() {
-            if let Some(flat_color_pipeline) = self.pipelines.get_opt(BuiltinPipeline::FlatColor) {
-                let vertex_buffer = Buffer::from_iter(
-                    self.memory_allocator.clone(),
-                    BufferCreateInfo {
-                        usage: BufferUsage::VERTEX_BUFFER,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                        ..Default::default()
-                    },
-                    self.flat_vertex_scratch.iter().copied(),
-                )
-                .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
-
-                let vertex_count = vertex_buffer.len() as u32;
-                builder
-                    .bind_pipeline_graphics(flat_color_pipeline.clone())
-                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                    .push_constants(
-                        flat_color_pipeline.layout().clone(),
-                        0,
-                        flat_color_vs::PushConstants {
-                            viewport_size: [viewport_extent[0] as f32, viewport_extent[1] as f32],
+        // Record the queued 2D commands in CALL ORDER. Consecutive flat-color
+        // commands (Rect/Circle/Line/Arc) coalesce into a single flat draw;
+        // every other primitive (Texture/Noise/Grating/Gabor/Dots) records on
+        // its own. This replaces the former type-ordered passes (all flats,
+        // then textures, then gratings/gabors, then dots) with call-order
+        // compositing, while preserving the flat-color batch for each run of
+        // consecutive flats (docs/design/pipeline-flexibility.md §4-5). The
+        // per-command recording — buffers, push constants, blend/two-pass
+        // selection, descriptor sets, dot instancing, degenerate-input guards,
+        // and warn-once absent-pipeline gating — is byte-for-byte unchanged;
+        // only the order and the flat-coalescing scope differ.
+        let kinds: Vec<DrawKind> = self.draw_commands.iter().map(draw_kind).collect();
+        for segment in plan_render_segments(&kinds) {
+            match segment {
+                RenderSegment::FlatRun { start, end } => {
+                    self.fill_flat_run(start, end);
+                    if self.flat_vertex_scratch.is_empty() {
+                        continue;
+                    }
+                    let Some(flat_color_pipeline) =
+                        self.pipelines.get_opt(BuiltinPipeline::FlatColor)
+                    else {
+                        self.warn_absent_pipeline(BuiltinPipeline::FlatColor);
+                        continue;
+                    };
+                    let vertex_buffer = Buffer::from_iter(
+                        self.memory_allocator.clone(),
+                        BufferCreateInfo {
+                            usage: BufferUsage::VERTEX_BUFFER,
+                            ..Default::default()
                         },
+                        AllocationCreateInfo {
+                            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                            ..Default::default()
+                        },
+                        self.flat_vertex_scratch.iter().copied(),
                     )
-                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                    .bind_vertex_buffers(0, vertex_buffer)
-                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
-                // SAFETY: vertex data matches the pipeline's vertex input state
-                unsafe {
+                    .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
+
+                    let vertex_count = vertex_buffer.len() as u32;
                     builder
-                        .draw(vertex_count, 1, 0, 0)
+                        .bind_pipeline_graphics(flat_color_pipeline.clone())
+                        .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                        .push_constants(
+                            flat_color_pipeline.layout().clone(),
+                            0,
+                            flat_color_vs::PushConstants {
+                                viewport_size: [
+                                    viewport_extent[0] as f32,
+                                    viewport_extent[1] as f32,
+                                ],
+                            },
+                        )
+                        .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                        .bind_vertex_buffers(0, vertex_buffer)
                         .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
-                }
-            } else {
-                self.warn_absent_pipeline(BuiltinPipeline::FlatColor);
-            }
-        }
-
-        // Textured draws (Texture and Noise both use the textured pipeline)
-        for cmd in &self.draw_commands {
-            let (texture_id, left, top, right, bottom) = match cmd {
-                DrawCommand::Texture {
-                    texture_id,
-                    left,
-                    top,
-                    right,
-                    bottom,
-                }
-                | DrawCommand::Noise {
-                    texture_id,
-                    left,
-                    top,
-                    right,
-                    bottom,
-                } => (*texture_id, *left, *top, *right, *bottom),
-                _ => continue,
-            };
-
-            let Some(textured_pipeline) = self.pipelines.get_opt(BuiltinPipeline::Textured) else {
-                self.warn_absent_pipeline(BuiltinPipeline::Textured);
-                continue;
-            };
-
-            let resources = self
-                .textures
-                .get(&texture_id)
-                .ok_or(RendererError::TextureNotFound(texture_id))?;
-
-            let tex_vertices = textured_quad_vertices(left, top, right, bottom);
-            let vertex_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                tex_vertices,
-            )
-            .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
-
-            builder
-                .bind_pipeline_graphics(textured_pipeline.clone())
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                .push_constants(
-                    textured_pipeline.layout().clone(),
-                    0,
-                    textured_vs::PushConstants {
-                        viewport_size: [viewport_extent[0] as f32, viewport_extent[1] as f32],
-                    },
-                )
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    textured_pipeline.layout().clone(),
-                    0,
-                    resources.descriptor_set.clone(),
-                )
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                .bind_vertex_buffers(0, vertex_buffer)
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
-            // SAFETY: vertex/descriptor data matches the pipeline's input state
-            unsafe {
-                builder
-                    .draw(6, 1, 0, 0)
-                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
-            }
-        }
-
-        // Grating and Gabor draws
-        for cmd in &self.draw_commands {
-            let (
-                is_grating,
-                left,
-                top,
-                right,
-                bottom,
-                frequency,
-                orientation,
-                phase,
-                contrast,
-                background,
-                sigma,
-                aspect_ratio,
-                wave_type,
-                additive,
-            ) = match cmd {
-                DrawCommand::Grating {
-                    left,
-                    top,
-                    right,
-                    bottom,
-                    params,
-                } => (
-                    true,
-                    *left,
-                    *top,
-                    *right,
-                    *bottom,
-                    params.frequency,
-                    params.orientation,
-                    params.phase,
-                    params.contrast,
-                    params.background,
-                    0.0f32,
-                    1.0f32,
-                    match params.wave {
-                        WaveType::Sine => 0u32,
-                        WaveType::Square => 1u32,
-                    },
-                    false,
-                ),
-                DrawCommand::Gabor {
-                    left,
-                    top,
-                    right,
-                    bottom,
-                    params,
-                    additive,
-                } => (
-                    false,
-                    *left,
-                    *top,
-                    *right,
-                    *bottom,
-                    params.frequency,
-                    params.orientation,
-                    params.phase,
-                    params.contrast,
-                    params.background,
-                    params.sigma,
-                    params.aspect_ratio,
-                    0u32,
-                    *additive,
-                ),
-                _ => continue,
-            };
-            let quad = textured_quad_vertices(left, top, right, bottom);
-            let vertex_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                quad,
-            )
-            .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
-
-            let first_pass = if is_grating {
-                let Some(pipeline) = self.pipelines.get_opt(BuiltinPipeline::Grating) else {
-                    self.warn_absent_pipeline(BuiltinPipeline::Grating);
-                    continue;
-                };
-                (pipeline, 0u32)
-            } else if additive {
-                let Some(pipeline) = self.pipelines.get_opt(BuiltinPipeline::AdditiveGabor) else {
-                    self.warn_absent_pipeline(BuiltinPipeline::AdditiveGabor);
-                    continue;
-                };
-                (pipeline, 1u32)
-            } else {
-                let Some(pipeline) = self.pipelines.get_opt(BuiltinPipeline::Gabor) else {
-                    self.warn_absent_pipeline(BuiltinPipeline::Gabor);
-                    continue;
-                };
-                (pipeline, 0u32)
-            };
-            // Normalized swapchain formats cannot reliably carry a negative
-            // fragment source into ONE+ONE blending. Split signed modulation
-            // into positive-add and negative-magnitude subtract passes. If the
-            // subtractive pipeline is absent, skip just the second pass.
-            let second_pass = if additive {
-                match self.pipelines.get_opt(BuiltinPipeline::SubtractiveGabor) {
-                    Some(pipeline) => Some((pipeline, 2u32)),
-                    None => {
-                        self.warn_absent_pipeline(BuiltinPipeline::SubtractiveGabor);
-                        None
+                    // SAFETY: vertex data matches the pipeline's vertex input state
+                    unsafe {
+                        builder
+                            .draw(vertex_count, 1, 0, 0)
+                            .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
                     }
                 }
-            } else {
-                None
-            };
+                RenderSegment::Single(i) => match &self.draw_commands[i] {
+                    // Textured draws (Texture and Noise both use the textured pipeline)
+                    DrawCommand::Texture {
+                        texture_id,
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    }
+                    | DrawCommand::Noise {
+                        texture_id,
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    } => {
+                        let (texture_id, left, top, right, bottom) =
+                            (*texture_id, *left, *top, *right, *bottom);
 
-            for (pipeline, composite_mode) in std::iter::once(first_pass).chain(second_pass) {
-                builder
-                    .bind_pipeline_graphics(pipeline.clone())
-                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                    .push_constants(
-                        pipeline.layout().clone(),
-                        0,
-                        parametric_vs::PushConstants {
-                            viewport_size: [viewport_extent[0] as f32, viewport_extent[1] as f32]
-                                .into(),
-                            rect: [left, top, right, bottom],
+                        let Some(textured_pipeline) =
+                            self.pipelines.get_opt(BuiltinPipeline::Textured)
+                        else {
+                            self.warn_absent_pipeline(BuiltinPipeline::Textured);
+                            continue;
+                        };
+
+                        let resources = self
+                            .textures
+                            .get(&texture_id)
+                            .ok_or(RendererError::TextureNotFound(texture_id))?;
+
+                        let tex_vertices = textured_quad_vertices(left, top, right, bottom);
+                        let vertex_buffer = Buffer::from_iter(
+                            self.memory_allocator.clone(),
+                            BufferCreateInfo {
+                                usage: BufferUsage::VERTEX_BUFFER,
+                                ..Default::default()
+                            },
+                            AllocationCreateInfo {
+                                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                                ..Default::default()
+                            },
+                            tex_vertices,
+                        )
+                        .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
+
+                        builder
+                            .bind_pipeline_graphics(textured_pipeline.clone())
+                            .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                            .push_constants(
+                                textured_pipeline.layout().clone(),
+                                0,
+                                textured_vs::PushConstants {
+                                    viewport_size: [
+                                        viewport_extent[0] as f32,
+                                        viewport_extent[1] as f32,
+                                    ],
+                                },
+                            )
+                            .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Graphics,
+                                textured_pipeline.layout().clone(),
+                                0,
+                                resources.descriptor_set.clone(),
+                            )
+                            .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                            .bind_vertex_buffers(0, vertex_buffer)
+                            .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+                        // SAFETY: vertex/descriptor data matches the pipeline's input state
+                        unsafe {
+                            builder
+                                .draw(6, 1, 0, 0)
+                                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+                        }
+                    }
+                    // Grating and Gabor draws
+                    cmd @ (DrawCommand::Grating { .. } | DrawCommand::Gabor { .. }) => {
+                        let (
+                            is_grating,
+                            left,
+                            top,
+                            right,
+                            bottom,
                             frequency,
                             orientation,
                             phase,
@@ -1085,85 +1053,226 @@ impl Renderer {
                             sigma,
                             aspect_ratio,
                             wave_type,
-                            composite_mode,
-                        },
-                    )
-                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                    .bind_vertex_buffers(0, vertex_buffer.clone())
-                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
-                unsafe {
-                    builder
-                        .draw(6, 1, 0, 0)
-                        .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
-                }
-            }
-        }
+                            additive,
+                        ) = match cmd {
+                            DrawCommand::Grating {
+                                left,
+                                top,
+                                right,
+                                bottom,
+                                params,
+                            } => (
+                                true,
+                                *left,
+                                *top,
+                                *right,
+                                *bottom,
+                                params.frequency,
+                                params.orientation,
+                                params.phase,
+                                params.contrast,
+                                params.background,
+                                0.0f32,
+                                1.0f32,
+                                match params.wave {
+                                    WaveType::Sine => 0u32,
+                                    WaveType::Square => 1u32,
+                                },
+                                false,
+                            ),
+                            DrawCommand::Gabor {
+                                left,
+                                top,
+                                right,
+                                bottom,
+                                params,
+                                additive,
+                            } => (
+                                false,
+                                *left,
+                                *top,
+                                *right,
+                                *bottom,
+                                params.frequency,
+                                params.orientation,
+                                params.phase,
+                                params.contrast,
+                                params.background,
+                                params.sigma,
+                                params.aspect_ratio,
+                                0u32,
+                                *additive,
+                            ),
+                            _ => unreachable!("outer match guarantees Grating or Gabor"),
+                        };
+                        let quad = textured_quad_vertices(left, top, right, bottom);
+                        let vertex_buffer = Buffer::from_iter(
+                            self.memory_allocator.clone(),
+                            BufferCreateInfo {
+                                usage: BufferUsage::VERTEX_BUFFER,
+                                ..Default::default()
+                            },
+                            AllocationCreateInfo {
+                                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                                ..Default::default()
+                            },
+                            quad,
+                        )
+                        .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
 
-        // Dot draws (instanced rendering)
-        for cmd in &self.draw_commands {
-            let (positions, radius, color) = match cmd {
-                DrawCommand::Dots {
-                    positions,
-                    radius,
-                    color,
-                } => (positions, *radius, *color),
-                _ => continue,
-            };
+                        let first_pass = if is_grating {
+                            let Some(pipeline) = self.pipelines.get_opt(BuiltinPipeline::Grating)
+                            else {
+                                self.warn_absent_pipeline(BuiltinPipeline::Grating);
+                                continue;
+                            };
+                            (pipeline, 0u32)
+                        } else if additive {
+                            let Some(pipeline) =
+                                self.pipelines.get_opt(BuiltinPipeline::AdditiveGabor)
+                            else {
+                                self.warn_absent_pipeline(BuiltinPipeline::AdditiveGabor);
+                                continue;
+                            };
+                            (pipeline, 1u32)
+                        } else {
+                            let Some(pipeline) = self.pipelines.get_opt(BuiltinPipeline::Gabor)
+                            else {
+                                self.warn_absent_pipeline(BuiltinPipeline::Gabor);
+                                continue;
+                            };
+                            (pipeline, 0u32)
+                        };
+                        // Normalized swapchain formats cannot reliably carry a negative
+                        // fragment source into ONE+ONE blending. Split signed modulation
+                        // into positive-add and negative-magnitude subtract passes. If the
+                        // subtractive pipeline is absent, skip just the second pass.
+                        let second_pass = if additive {
+                            match self.pipelines.get_opt(BuiltinPipeline::SubtractiveGabor) {
+                                Some(pipeline) => Some((pipeline, 2u32)),
+                                None => {
+                                    self.warn_absent_pipeline(BuiltinPipeline::SubtractiveGabor);
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
 
-            if positions.is_empty() {
-                continue;
-            }
+                        for (pipeline, composite_mode) in
+                            std::iter::once(first_pass).chain(second_pass)
+                        {
+                            builder
+                                .bind_pipeline_graphics(pipeline.clone())
+                                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                                .push_constants(
+                                    pipeline.layout().clone(),
+                                    0,
+                                    parametric_vs::PushConstants {
+                                        viewport_size: [
+                                            viewport_extent[0] as f32,
+                                            viewport_extent[1] as f32,
+                                        ]
+                                        .into(),
+                                        rect: [left, top, right, bottom],
+                                        frequency,
+                                        orientation,
+                                        phase,
+                                        contrast,
+                                        background,
+                                        sigma,
+                                        aspect_ratio,
+                                        wave_type,
+                                        composite_mode,
+                                    },
+                                )
+                                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                                .bind_vertex_buffers(0, vertex_buffer.clone())
+                                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+                            unsafe {
+                                builder
+                                    .draw(6, 1, 0, 0)
+                                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+                            }
+                        }
+                    }
+                    // Dot draws (instanced rendering)
+                    DrawCommand::Dots {
+                        positions,
+                        radius,
+                        color,
+                    } => {
+                        let (radius, color) = (*radius, *color);
+                        if positions.is_empty() {
+                            continue;
+                        }
 
-            self.dot_instance_scratch.clear();
-            self.dot_instance_scratch.extend(
-                positions
-                    .iter()
-                    .copied()
-                    .map(|position| DotInstance { position }),
-            );
-            let instance_count = self.dot_instance_scratch.len() as u32;
+                        self.dot_instance_scratch.clear();
+                        self.dot_instance_scratch.extend(
+                            positions
+                                .iter()
+                                .copied()
+                                .map(|position| DotInstance { position }),
+                        );
+                        let instance_count = self.dot_instance_scratch.len() as u32;
 
-            let instance_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
+                        let instance_buffer = Buffer::from_iter(
+                            self.memory_allocator.clone(),
+                            BufferCreateInfo {
+                                usage: BufferUsage::VERTEX_BUFFER,
+                                ..Default::default()
+                            },
+                            AllocationCreateInfo {
+                                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                                ..Default::default()
+                            },
+                            self.dot_instance_scratch.iter().copied(),
+                        )
+                        .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
+
+                        let Some(dot_pipeline) = self.pipelines.get_opt(BuiltinPipeline::Dot)
+                        else {
+                            self.warn_absent_pipeline(BuiltinPipeline::Dot);
+                            continue;
+                        };
+
+                        let c = color.to_array();
+                        builder
+                            .bind_pipeline_graphics(dot_pipeline.clone())
+                            .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                            .push_constants(
+                                dot_pipeline.layout().clone(),
+                                0,
+                                dot_vs::PushConstants {
+                                    viewport_size: [
+                                        viewport_extent[0] as f32,
+                                        viewport_extent[1] as f32,
+                                    ],
+                                    dot_radius: radius,
+                                    _pad: 0.0,
+                                    dot_color: c,
+                                },
+                            )
+                            .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                            .bind_vertex_buffers(0, (self.dot_quad_buffer.clone(), instance_buffer))
+                            .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+                        unsafe {
+                            builder
+                                .draw(6, instance_count, 0, 0)
+                                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+                        }
+                    }
+                    // Flat-color commands are recorded only inside FlatRun
+                    // segments; the planner never emits them as Single.
+                    DrawCommand::Rect { .. }
+                    | DrawCommand::Circle { .. }
+                    | DrawCommand::Line { .. }
+                    | DrawCommand::Arc { .. } => {
+                        unreachable!("flat-color commands are recorded via FlatRun segments")
+                    }
                 },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                self.dot_instance_scratch.iter().copied(),
-            )
-            .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
-
-            let Some(dot_pipeline) = self.pipelines.get_opt(BuiltinPipeline::Dot) else {
-                self.warn_absent_pipeline(BuiltinPipeline::Dot);
-                continue;
-            };
-
-            let c = color.to_array();
-            builder
-                .bind_pipeline_graphics(dot_pipeline.clone())
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                .push_constants(
-                    dot_pipeline.layout().clone(),
-                    0,
-                    dot_vs::PushConstants {
-                        viewport_size: [viewport_extent[0] as f32, viewport_extent[1] as f32],
-                        dot_radius: radius,
-                        _pad: 0.0,
-                        dot_color: c,
-                    },
-                )
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                .bind_vertex_buffers(0, (self.dot_quad_buffer.clone(), instance_buffer))
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
-            unsafe {
-                builder
-                    .draw(6, instance_count, 0, 0)
-                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
             }
         }
 
@@ -1343,88 +1452,95 @@ impl Renderer {
         self.textures.remove(&handle.id);
     }
 
-    fn fill_flat_color_vertices(&mut self) {
+    /// Coalesce the flat-color commands in `draw_commands[start..end]` (a run of
+    /// consecutive flats, per the call-order plan) into `flat_vertex_scratch`,
+    /// ready for a single flat-color draw. The scratch buffer is cleared first,
+    /// so each run flushes independently.
+    fn fill_flat_run(&mut self, start: usize, end: usize) {
         self.flat_vertex_scratch.clear();
+        for cmd in &self.draw_commands[start..end] {
+            Self::append_flat_command_vertices(&mut self.flat_vertex_scratch, cmd);
+        }
+    }
 
-        for cmd in &self.draw_commands {
-            match cmd {
-                DrawCommand::Rect {
-                    left,
-                    top,
-                    right,
-                    bottom,
-                    color,
-                } => {
-                    if left >= right || top >= bottom {
-                        continue;
-                    }
-                    self.flat_vertex_scratch
-                        .extend_from_slice(&rect_vertices(*left, *top, *right, *bottom, *color));
+    /// Append one flat-color command's triangles to `scratch`, preserving the
+    /// degenerate-input guards (empty rect, non-positive radius/width/thickness,
+    /// zero-length line, vanishing arc span). Non-flat commands contribute
+    /// nothing; the call-order plan never routes them here.
+    fn append_flat_command_vertices(scratch: &mut Vec<Vertex2D>, cmd: &DrawCommand) {
+        match cmd {
+            DrawCommand::Rect {
+                left,
+                top,
+                right,
+                bottom,
+                color,
+            } => {
+                if left >= right || top >= bottom {
+                    return;
                 }
-                DrawCommand::Circle {
-                    cx,
-                    cy,
-                    radius,
-                    color,
-                    segments,
-                } => {
-                    if *radius <= 0.0 {
-                        continue;
-                    }
-                    self.flat_vertex_scratch
-                        .extend(circle_vertices(*cx, *cy, *radius, *color, *segments));
-                }
-                DrawCommand::Line {
-                    x1,
-                    y1,
-                    x2,
-                    y2,
-                    width,
-                    color,
-                } => {
-                    if *width <= 0.0 {
-                        continue;
-                    }
-                    // Skip zero-length lines
-                    let dx = x2 - x1;
-                    let dy = y2 - y1;
-                    if dx * dx + dy * dy < 1e-12 {
-                        continue;
-                    }
-                    self.flat_vertex_scratch
-                        .extend_from_slice(&line_vertices(*x1, *y1, *x2, *y2, *width, *color));
-                }
-                DrawCommand::Arc {
-                    cx,
-                    cy,
-                    radius,
-                    start_angle,
-                    end_angle,
-                    thickness,
-                    color,
-                    segments,
-                } => {
-                    if *radius <= 0.0 || *thickness <= 0.0 || (end_angle - start_angle).abs() < 1e-6
-                    {
-                        continue;
-                    }
-                    self.flat_vertex_scratch.extend(arc_vertices(
-                        *cx,
-                        *cy,
-                        *radius,
-                        *start_angle,
-                        *end_angle,
-                        *thickness,
-                        *color,
-                        *segments,
-                    ));
-                }
-                DrawCommand::Texture { .. } => {}
-                DrawCommand::Grating { .. } => {}
-                DrawCommand::Gabor { .. } => {}
-                DrawCommand::Noise { .. } => {}
-                DrawCommand::Dots { .. } => {}
+                scratch.extend_from_slice(&rect_vertices(*left, *top, *right, *bottom, *color));
             }
+            DrawCommand::Circle {
+                cx,
+                cy,
+                radius,
+                color,
+                segments,
+            } => {
+                if *radius <= 0.0 {
+                    return;
+                }
+                scratch.extend(circle_vertices(*cx, *cy, *radius, *color, *segments));
+            }
+            DrawCommand::Line {
+                x1,
+                y1,
+                x2,
+                y2,
+                width,
+                color,
+            } => {
+                if *width <= 0.0 {
+                    return;
+                }
+                // Skip zero-length lines
+                let dx = x2 - x1;
+                let dy = y2 - y1;
+                if dx * dx + dy * dy < 1e-12 {
+                    return;
+                }
+                scratch.extend_from_slice(&line_vertices(*x1, *y1, *x2, *y2, *width, *color));
+            }
+            DrawCommand::Arc {
+                cx,
+                cy,
+                radius,
+                start_angle,
+                end_angle,
+                thickness,
+                color,
+                segments,
+            } => {
+                if *radius <= 0.0 || *thickness <= 0.0 || (end_angle - start_angle).abs() < 1e-6 {
+                    return;
+                }
+                scratch.extend(arc_vertices(
+                    *cx,
+                    *cy,
+                    *radius,
+                    *start_angle,
+                    *end_angle,
+                    *thickness,
+                    *color,
+                    *segments,
+                ));
+            }
+            DrawCommand::Texture { .. } => {}
+            DrawCommand::Grating { .. } => {}
+            DrawCommand::Gabor { .. } => {}
+            DrawCommand::Noise { .. } => {}
+            DrawCommand::Dots { .. } => {}
         }
     }
 
@@ -1911,5 +2027,159 @@ mod tests {
         assert_eq!(blend.src_alpha_blend_factor, BlendFactor::Zero);
         assert_eq!(blend.dst_alpha_blend_factor, BlendFactor::One);
         assert_eq!(blend.alpha_blend_op, BlendOp::Add);
+    }
+
+    // --- Call-order render planning (device-free) ---
+    //
+    // These lock the ordering + flat-coalescing-scope decision that
+    // `render_with_underlay` consumes. Pixel output needs a display, so this
+    // pure plan is the regression net for call-order compositing.
+
+    use super::super::color::Color;
+
+    #[test]
+    fn plan_empty_input_yields_no_segments() {
+        assert_eq!(plan_render_segments(&[]), vec![]);
+    }
+
+    #[test]
+    fn plan_all_flat_coalesces_into_one_run() {
+        let kinds = [DrawKind::Flat, DrawKind::Flat, DrawKind::Flat];
+        assert_eq!(
+            plan_render_segments(&kinds),
+            vec![RenderSegment::FlatRun { start: 0, end: 3 }]
+        );
+    }
+
+    #[test]
+    fn plan_all_non_flat_yields_single_segments_in_order() {
+        let kinds = [DrawKind::NonFlat, DrawKind::NonFlat, DrawKind::NonFlat];
+        assert_eq!(
+            plan_render_segments(&kinds),
+            vec![
+                RenderSegment::Single(0),
+                RenderSegment::Single(1),
+                RenderSegment::Single(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_flat_then_texture_then_flat_yields_three_ordered_segments() {
+        // The load-bearing behavior change: a flat, a non-flat, then a flat
+        // must produce three segments in call order (not "all flats first").
+        let kinds = [DrawKind::Flat, DrawKind::NonFlat, DrawKind::Flat];
+        assert_eq!(
+            plan_render_segments(&kinds),
+            vec![
+                RenderSegment::FlatRun { start: 0, end: 1 },
+                RenderSegment::Single(1),
+                RenderSegment::FlatRun { start: 2, end: 3 },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_coalesces_only_consecutive_flats() {
+        // F F N F F N F -> run[0,2), single(2), run[3,5), single(5), run[6,7)
+        let kinds = [
+            DrawKind::Flat,
+            DrawKind::Flat,
+            DrawKind::NonFlat,
+            DrawKind::Flat,
+            DrawKind::Flat,
+            DrawKind::NonFlat,
+            DrawKind::Flat,
+        ];
+        assert_eq!(
+            plan_render_segments(&kinds),
+            vec![
+                RenderSegment::FlatRun { start: 0, end: 2 },
+                RenderSegment::Single(2),
+                RenderSegment::FlatRun { start: 3, end: 5 },
+                RenderSegment::Single(5),
+                RenderSegment::FlatRun { start: 6, end: 7 },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_leading_nonflat_and_trailing_flat_run_are_kept() {
+        let kinds = [DrawKind::NonFlat, DrawKind::Flat, DrawKind::Flat];
+        assert_eq!(
+            plan_render_segments(&kinds),
+            vec![
+                RenderSegment::Single(0),
+                RenderSegment::FlatRun { start: 1, end: 3 },
+            ]
+        );
+    }
+
+    #[test]
+    fn draw_kind_classifies_flat_and_non_flat_commands() {
+        // Flat-color family (coalesces).
+        let flats = [
+            DrawCommand::Rect {
+                left: 0.0,
+                top: 0.0,
+                right: 1.0,
+                bottom: 1.0,
+                color: Color::WHITE,
+            },
+            DrawCommand::Circle {
+                cx: 0.0,
+                cy: 0.0,
+                radius: 1.0,
+                color: Color::WHITE,
+                segments: 16,
+            },
+            DrawCommand::Line {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 1.0,
+                y2: 1.0,
+                width: 1.0,
+                color: Color::WHITE,
+            },
+            DrawCommand::Arc {
+                cx: 0.0,
+                cy: 0.0,
+                radius: 1.0,
+                start_angle: 0.0,
+                end_angle: 1.0,
+                thickness: 1.0,
+                color: Color::WHITE,
+                segments: 16,
+            },
+        ];
+        for cmd in &flats {
+            assert_eq!(draw_kind(cmd), DrawKind::Flat);
+        }
+
+        // Everything else records on its own.
+        let non_flats = [
+            DrawCommand::Texture {
+                texture_id: 0,
+                left: 0.0,
+                top: 0.0,
+                right: 1.0,
+                bottom: 1.0,
+            },
+            DrawCommand::Noise {
+                texture_id: 0,
+                left: 0.0,
+                top: 0.0,
+                right: 1.0,
+                bottom: 1.0,
+            },
+            DrawCommand::Dots {
+                positions: vec![],
+                radius: 1.0,
+                color: Color::WHITE,
+            },
+        ];
+        for cmd in &non_flats {
+            assert_eq!(draw_kind(cmd), DrawKind::NonFlat);
+        }
     }
 }
