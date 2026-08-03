@@ -1,8 +1,15 @@
 use super::color::Color;
 use super::stimuli::GratingParams;
 use super::vertex::{DotInstance, TexturedVertex, Vertex2D};
+use crate::drawing::renderer::{CustomFrameContext, FrameRecorder};
 use crate::drawing::GaborParams;
 use glam::Mat4;
+
+/// A user-supplied raw record hook (Tier 2). Boxed, single-shot, run once per
+/// frame inside the active 2D render pass. No `Send` bound: custom draws are
+/// invoked single-threaded within `render`. Carried by [`DrawCommand::Custom`]
+/// so it composites in call order alongside built-in draws.
+pub(crate) type CustomDrawFn = Box<dyn FnOnce(&mut FrameRecorder, &CustomFrameContext)>;
 
 /// A queued native 3D draw. Model resources are resident before this command is created.
 pub(crate) enum DrawCommand3D {
@@ -98,6 +105,10 @@ pub(crate) enum DrawCommand {
         color: Color,
         segments: u32,
     },
+
+    /// A user-supplied raw record hook (Tier 2), recorded on its own in call
+    /// order so it composites interleaved with built-in draws.
+    Custom(CustomDrawFn),
 }
 
 /// Generate 6 vertices (2 triangles) for a filled rectangle.
