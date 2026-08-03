@@ -168,6 +168,115 @@ mod mesh_normals_fs {
     }
 }
 
+/// Key identifying one of VSE's built-in graphics pipelines.
+///
+/// The full suite is always constructed today; this key lets `render()` fetch
+/// each pipeline by identity rather than by a named `Renderer` field, which is
+/// the prerequisite for later suite-subselection and user-registered pipelines
+/// (see `docs/design/pipeline-flexibility.md`).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum BuiltinPipeline {
+    FlatColor,
+    Textured,
+    Grating,
+    Gabor,
+    AdditiveGabor,
+    SubtractiveGabor,
+    Dot,
+    MeshNormals,
+}
+
+/// Builds a single built-in pipeline. The uniform `(device, swapchain_format,
+/// depth_format)` signature lets every built-in — including the depth-using
+/// mesh-normals pipeline — be constructed from one descriptor list.
+type BuiltinPipelineBuilder =
+    fn(&Arc<Device>, Format, Format) -> Result<Arc<GraphicsPipeline>, RendererError>;
+
+/// A built-in pipeline's key paired with the code that builds it.
+struct BuiltinPipelineDescriptor {
+    key: BuiltinPipeline,
+    build: BuiltinPipelineBuilder,
+}
+
+/// The list of built-in pipeline descriptors that make up the default suite.
+///
+/// This is device-free: it only names the pipelines and their builders, so the
+/// registry's key set can be asserted without a Vulkan device.
+fn builtin_pipeline_descriptors() -> [BuiltinPipelineDescriptor; 8] {
+    [
+        BuiltinPipelineDescriptor {
+            key: BuiltinPipeline::FlatColor,
+            build: |device, fmt, _depth| Renderer::create_flat_color_pipeline(device, fmt),
+        },
+        BuiltinPipelineDescriptor {
+            key: BuiltinPipeline::Textured,
+            build: |device, fmt, _depth| Renderer::create_textured_pipeline(device, fmt),
+        },
+        BuiltinPipelineDescriptor {
+            key: BuiltinPipeline::Grating,
+            build: |device, fmt, _depth| Renderer::create_grating_pipeline(device, fmt),
+        },
+        BuiltinPipelineDescriptor {
+            key: BuiltinPipeline::Gabor,
+            build: |device, fmt, _depth| {
+                Renderer::create_gabor_pipeline(device, fmt, AttachmentBlend::alpha())
+            },
+        },
+        BuiltinPipelineDescriptor {
+            key: BuiltinPipeline::AdditiveGabor,
+            build: |device, fmt, _depth| {
+                Renderer::create_gabor_pipeline(device, fmt, additive_gabor_blend())
+            },
+        },
+        BuiltinPipelineDescriptor {
+            key: BuiltinPipeline::SubtractiveGabor,
+            build: |device, fmt, _depth| {
+                Renderer::create_gabor_pipeline(device, fmt, subtractive_gabor_blend())
+            },
+        },
+        BuiltinPipelineDescriptor {
+            key: BuiltinPipeline::Dot,
+            build: |device, fmt, _depth| Renderer::create_dot_pipeline(device, fmt),
+        },
+        BuiltinPipelineDescriptor {
+            key: BuiltinPipeline::MeshNormals,
+            build: |device, fmt, depth| Renderer::create_mesh_normals_pipeline(device, fmt, depth),
+        },
+    ]
+}
+
+/// The built graphics pipelines, keyed by [`BuiltinPipeline`].
+///
+/// Owns the `Arc<GraphicsPipeline>`s that used to live in named `Renderer`
+/// fields. Lookup happens once per pass (not per pixel), so a `HashMap` is fine.
+pub(crate) struct Pipelines {
+    pipelines: HashMap<BuiltinPipeline, Arc<GraphicsPipeline>>,
+}
+
+impl Pipelines {
+    /// Build the full built-in suite from [`builtin_pipeline_descriptors`].
+    fn new(
+        device: &Arc<Device>,
+        swapchain_format: Format,
+        depth_format: Format,
+    ) -> Result<Self, RendererError> {
+        let mut pipelines = HashMap::new();
+        for descriptor in builtin_pipeline_descriptors() {
+            let pipeline = (descriptor.build)(device, swapchain_format, depth_format)?;
+            pipelines.insert(descriptor.key, pipeline);
+        }
+        Ok(Self { pipelines })
+    }
+
+    /// Fetch a built-in pipeline by key. Panics if the key is absent, which for
+    /// the always-complete built-in suite is a programming error.
+    fn get(&self, key: BuiltinPipeline) -> &Arc<GraphicsPipeline> {
+        self.pipelines
+            .get(&key)
+            .expect("built-in pipeline missing from registry")
+    }
+}
+
 /// Errors that can occur in the renderer.
 #[derive(Error, Debug)]
 pub enum RendererError {
@@ -236,15 +345,8 @@ pub(crate) struct Renderer {
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
 
-    flat_color_pipeline: Arc<GraphicsPipeline>,
-    textured_pipeline: Arc<GraphicsPipeline>,
-    grating_pipeline: Arc<GraphicsPipeline>,
-    gabor_pipeline: Arc<GraphicsPipeline>,
-    additive_gabor_pipeline: Arc<GraphicsPipeline>,
-    subtractive_gabor_pipeline: Arc<GraphicsPipeline>,
-    dot_pipeline: Arc<GraphicsPipeline>,
+    pipelines: Pipelines,
     dot_quad_buffer: Subbuffer<[DotInstance]>,
-    mesh_normals_pipeline: Arc<GraphicsPipeline>,
     depth_format: Format,
     depth_views: Vec<Arc<ImageView>>,
 
@@ -276,20 +378,9 @@ impl Renderer {
             StandardDescriptorSetAllocator::new(device.clone(), Default::default()),
         );
 
-        let flat_color_pipeline = Self::create_flat_color_pipeline(&device, swapchain_format)?;
-        let textured_pipeline = Self::create_textured_pipeline(&device, swapchain_format)?;
-        let grating_pipeline = Self::create_grating_pipeline(&device, swapchain_format)?;
-        let gabor_pipeline =
-            Self::create_gabor_pipeline(&device, swapchain_format, AttachmentBlend::alpha())?;
-        let additive_gabor_pipeline =
-            Self::create_gabor_pipeline(&device, swapchain_format, additive_gabor_blend())?;
-        let subtractive_gabor_pipeline =
-            Self::create_gabor_pipeline(&device, swapchain_format, subtractive_gabor_blend())?;
-        let dot_pipeline = Self::create_dot_pipeline(&device, swapchain_format)?;
         let dot_quad_buffer = Self::create_dot_quad_buffer(memory_allocator.clone())?;
         let depth_format = Self::select_depth_format(&device)?;
-        let mesh_normals_pipeline =
-            Self::create_mesh_normals_pipeline(&device, swapchain_format, depth_format)?;
+        let pipelines = Pipelines::new(&device, swapchain_format, depth_format)?;
         let depth_views =
             Self::create_depth_views(memory_allocator.clone(), depth_format, image_count, extent)?;
 
@@ -299,15 +390,8 @@ impl Renderer {
             command_buffer_allocator,
             memory_allocator,
             descriptor_set_allocator,
-            flat_color_pipeline,
-            textured_pipeline,
-            grating_pipeline,
-            gabor_pipeline,
-            additive_gabor_pipeline,
-            subtractive_gabor_pipeline,
-            dot_pipeline,
+            pipelines,
             dot_quad_buffer,
-            mesh_normals_pipeline,
             depth_format,
             depth_views,
             textures: HashMap::new(),
@@ -535,11 +619,12 @@ impl Renderer {
                 for instance in &model.instances {
                     let primitive = &model.primitives[instance.primitive_index];
                     let world = *model_transform * instance.local_transform;
+                    let mesh_normals_pipeline = self.pipelines.get(BuiltinPipeline::MeshNormals);
                     builder
-                        .bind_pipeline_graphics(self.mesh_normals_pipeline.clone())
+                        .bind_pipeline_graphics(mesh_normals_pipeline.clone())
                         .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
                         .push_constants(
-                            self.mesh_normals_pipeline.layout().clone(),
+                            mesh_normals_pipeline.layout().clone(),
                             0,
                             mesh_normals_vs::PushConstants {
                                 model: world.to_cols_array_2d(),
@@ -614,11 +699,12 @@ impl Renderer {
             .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
 
             let vertex_count = vertex_buffer.len() as u32;
+            let flat_color_pipeline = self.pipelines.get(BuiltinPipeline::FlatColor);
             builder
-                .bind_pipeline_graphics(self.flat_color_pipeline.clone())
+                .bind_pipeline_graphics(flat_color_pipeline.clone())
                 .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
                 .push_constants(
-                    self.flat_color_pipeline.layout().clone(),
+                    flat_color_pipeline.layout().clone(),
                     0,
                     flat_color_vs::PushConstants {
                         viewport_size: [viewport_extent[0] as f32, viewport_extent[1] as f32],
@@ -676,11 +762,12 @@ impl Renderer {
             )
             .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
 
+            let textured_pipeline = self.pipelines.get(BuiltinPipeline::Textured);
             builder
-                .bind_pipeline_graphics(self.textured_pipeline.clone())
+                .bind_pipeline_graphics(textured_pipeline.clone())
                 .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
                 .push_constants(
-                    self.textured_pipeline.layout().clone(),
+                    textured_pipeline.layout().clone(),
                     0,
                     textured_vs::PushConstants {
                         viewport_size: [viewport_extent[0] as f32, viewport_extent[1] as f32],
@@ -689,7 +776,7 @@ impl Renderer {
                 .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
                 .bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
-                    self.textured_pipeline.layout().clone(),
+                    textured_pipeline.layout().clone(),
                     0,
                     resources.descriptor_set.clone(),
                 )
@@ -789,16 +876,17 @@ impl Renderer {
             .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
 
             let first_pass = if is_grating {
-                (&self.grating_pipeline, 0u32)
+                (self.pipelines.get(BuiltinPipeline::Grating), 0u32)
             } else if additive {
-                (&self.additive_gabor_pipeline, 1u32)
+                (self.pipelines.get(BuiltinPipeline::AdditiveGabor), 1u32)
             } else {
-                (&self.gabor_pipeline, 0u32)
+                (self.pipelines.get(BuiltinPipeline::Gabor), 0u32)
             };
             // Normalized swapchain formats cannot reliably carry a negative
             // fragment source into ONE+ONE blending. Split signed modulation
             // into positive-add and negative-magnitude subtract passes.
-            let second_pass = additive.then_some((&self.subtractive_gabor_pipeline, 2u32));
+            let second_pass =
+                additive.then_some((self.pipelines.get(BuiltinPipeline::SubtractiveGabor), 2u32));
 
             for (pipeline, composite_mode) in std::iter::once(first_pass).chain(second_pass) {
                 builder
@@ -873,11 +961,12 @@ impl Renderer {
             .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
 
             let c = color.to_array();
+            let dot_pipeline = self.pipelines.get(BuiltinPipeline::Dot);
             builder
-                .bind_pipeline_graphics(self.dot_pipeline.clone())
+                .bind_pipeline_graphics(dot_pipeline.clone())
                 .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
                 .push_constants(
-                    self.dot_pipeline.layout().clone(),
+                    dot_pipeline.layout().clone(),
                     0,
                     dot_vs::PushConstants {
                         viewport_size: [viewport_extent[0] as f32, viewport_extent[1] as f32],
@@ -1007,7 +1096,8 @@ impl Renderer {
 
         // Create descriptor set
         let layout = self
-            .textured_pipeline
+            .pipelines
+            .get(BuiltinPipeline::Textured)
             .layout()
             .set_layouts()
             .first()
@@ -1506,6 +1596,33 @@ mod tests {
     #[test]
     fn gltf_counter_clockwise_faces_are_front_facing() {
         assert_eq!(MESH_FRONT_FACE, FrontFace::CounterClockwise);
+    }
+
+    #[test]
+    fn builtin_descriptors_cover_exactly_the_eight_builtin_pipelines() {
+        use std::collections::HashSet;
+
+        let keys: HashSet<BuiltinPipeline> = builtin_pipeline_descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.key)
+            .collect();
+
+        let expected: HashSet<BuiltinPipeline> = [
+            BuiltinPipeline::FlatColor,
+            BuiltinPipeline::Textured,
+            BuiltinPipeline::Grating,
+            BuiltinPipeline::Gabor,
+            BuiltinPipeline::AdditiveGabor,
+            BuiltinPipeline::SubtractiveGabor,
+            BuiltinPipeline::Dot,
+            BuiltinPipeline::MeshNormals,
+        ]
+        .into_iter()
+        .collect();
+
+        // Exactly the eight built-ins, no duplicates (array len already asserts 8).
+        assert_eq!(keys.len(), 8, "descriptor keys must be unique");
+        assert_eq!(keys, expected);
     }
 
     #[test]
