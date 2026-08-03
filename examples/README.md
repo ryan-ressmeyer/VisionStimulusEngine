@@ -92,3 +92,16 @@ cargo run --release --example 22_registered_pipeline
 ```
 
 See `docs/guides/pipelines.md` for the pipeline model these two demonstrate.
+
+## Reproducibility without a display
+
+| # | Demo | What it shows |
+|---|------|---------------|
+| 23 | `headless_regeneration` | Render offscreen with no window, rebuild the render target from a recorded session's `HostInfo`, and regenerate its stimuli as PNGs with per-frame hashes |
+
+```bash
+cargo run --release --example 23_headless_regeneration
+```
+
+Needs a GPU but no display, compositor, or window — it runs over SSH. Run it
+twice and compare the printed hashes. See `docs/guides/headless.md`.

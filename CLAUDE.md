@@ -25,6 +25,20 @@ Vision scientists studying primate visual processing who need:
 
 This is an early-stage Rust workspace with the core VSE crate plus experimental integration crates under `crates/`. The repository now contains working Vulkan presentation code, timing infrastructure, example experiments, host/session logging, and documentation. Historical planning notes and bundled reference PDFs have been removed from git.
 
+### Render targets
+
+`VSEState` holds a `RenderTarget` that is either `Present` (window/display,
+swapchain, present engine, scanout timing) or `Offscreen` (headless). One
+`RenderContext` drives both, so an experiment's render closure runs unchanged in
+either — which is what makes a session's stimuli regenerable through the same
+code path that displayed them.
+
+Headless needs a GPU but no display, so it is also where pixel-level tests and
+record-path benchmarks live (`tests/headless_pixels.rs`,
+`benches/frame_timing.rs`). Its flip timing is synthesized, not measured, and is
+tagged `TimingSource::Offscreen` so regenerated data can never be mistaken for
+recorded data. See `docs/guides/headless.md`.
+
 ## Development Commands
 
 ### Building and Testing

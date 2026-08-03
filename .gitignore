@@ -26,6 +26,9 @@ Thumbs.db
 metacontrast_*.png
 stimulus_*.png
 
+# Demo output (headless regeneration example)
+/headless_regeneration_out/
+
 # Git worktrees
 .worktrees/
 bevy_ring_frame.ppm
