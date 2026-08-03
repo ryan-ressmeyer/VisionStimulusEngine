@@ -163,6 +163,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TimingSource::ExtPresentTiming => vse.scanout_to_host(
                     ScanoutTimestamp::from_nanos(flip.present_time.as_micros() * 1_000),
                 ),
+                // Reaction time needs a real host clock; a headless run has none.
+                TimingSource::Offscreen => None,
             };
             if let Some(shown_at_host) = shown_at_host {
                 state = Rt::Go {

@@ -26,18 +26,29 @@ impl<'a> RenderContext<'a> {
     ///
     /// Returns `VSEError` if presentation fails.
     pub fn flip(&mut self, target_time: Option<Timestamp>) -> Result<FlipInfo, VSEError> {
-        if self.state.minimized {
+        // Headless: no swapchain to acquire from and nothing to present to.
+        if self.state.target.offscreen_mut().is_some() {
+            return self.flip_offscreen(target_time);
+        }
+
+        if self.state.target.present_expect().minimized {
             let info = FlipInfo::skipped(self.state.frame_number);
             self.state.frame_number += 1;
             return Ok(info);
         }
 
         // Handle swapchain recreation if needed
-        let (dsw, dsh) = self.state.display_size;
+        let (dsw, dsh) = self.state.target.present_expect_mut().display_size;
         let win_size_arr = [dsw, dsh];
-        if self.state.swapchain.needs_recreation() {
+        if self
+            .state
+            .target
+            .present_expect_mut()
+            .swapchain
+            .needs_recreation()
+        {
             // Drain in-flight raw presents before the swapchain (and its images) is retired.
-            if let Some(engine) = &mut self.state.present_engine {
+            if let Some(engine) = &mut self.state.target.present_expect_mut().present_engine {
                 engine.wait_idle();
             }
             self.state.recreate_swapchain(win_size_arr)?;
@@ -46,26 +57,38 @@ impl<'a> RenderContext<'a> {
         // On the EXT present-timing backend, take the raw acquire/submit/present path (attaches
         // present-id + timing pNext, reads scanout feedback). The CPU-estimate path below is
         // unchanged.
-        if self.state.present_engine.is_some() {
+        if self
+            .state
+            .target
+            .present_expect_mut()
+            .present_engine
+            .is_some()
+        {
             return self.flip_ext(target_time);
         }
 
         // Acquire next image
-        let (image_index, _suboptimal, acquire_future) =
-            match self.state.swapchain.acquire_next_image() {
-                Ok(result) => result,
-                Err(SwapchainError::OutOfDate) => {
-                    self.state.recreate_swapchain(win_size_arr)?;
-                    let info = FlipInfo::skipped(self.state.frame_number);
-                    self.state.frame_number += 1;
-                    return Ok(info);
-                }
-                Err(e) => return Err(e.into()),
-            };
+        let (image_index, _suboptimal, acquire_future) = match self
+            .state
+            .target
+            .present_expect_mut()
+            .swapchain
+            .acquire_next_image()
+        {
+            Ok(result) => result,
+            Err(SwapchainError::OutOfDate) => {
+                self.state.recreate_swapchain(win_size_arr)?;
+                let info = FlipInfo::skipped(self.state.frame_number);
+                self.state.frame_number += 1;
+                return Ok(info);
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         // Get the image to render to
-        let image = self.state.swapchain.images()[image_index as usize].clone();
-        let extent = self.state.swapchain.extent();
+        let image =
+            self.state.target.present_expect_mut().swapchain.images()[image_index as usize].clone();
+        let extent = self.state.target.present_expect_mut().swapchain.extent();
 
         // Record and execute drawing commands via renderer
         let command_buffer = self.state.renderer.render(
@@ -84,6 +107,8 @@ impl<'a> RenderContext<'a> {
         // If target time specified, wait/schedule
         if let Some(target) = target_time {
             self.state
+                .target
+                .present_expect_mut()
                 .timing_provider
                 .wait_for_target(target, &self.state.clock);
         }
@@ -92,11 +117,11 @@ impl<'a> RenderContext<'a> {
         let submit_time = self.state.clock.now();
 
         // Present (submits to GPU and waits for fence)
-        match self
-            .state
-            .swapchain
-            .present(self.state.queue.clone(), image_index, future)
-        {
+        match self.state.target.present_expect_mut().swapchain.present(
+            self.state.queue.clone(),
+            image_index,
+            future,
+        ) {
             Ok(()) => {}
             Err(SwapchainError::OutOfDate) => {
                 // Will recreate on next frame
@@ -110,23 +135,34 @@ impl<'a> RenderContext<'a> {
         // --- TIMING: capture present time via provider ---
         let present_time = self
             .state
+            .target
+            .present_expect_mut()
             .timing_provider
             .record_present_time(&self.state.clock);
 
         // Establish the scanout epoch / feed the opt-in host-clock bridge (off hot path).
-        self.state.update_clocks();
+        self.state
+            .target
+            .present_expect_mut()
+            .update_clocks(&self.state.clock);
 
         // Compute inter-frame duration
         let frame_duration = self
             .state
+            .target
+            .present_expect_mut()
             .last_present_time
             .map(|prev| present_time.duration_since(prev));
 
         self.state
+            .target
+            .present_expect_mut()
             .update_refresh_detection(frame_duration, true, true);
 
         let expected = self
             .state
+            .target
+            .present_expect_mut()
             .expected_frame_duration
             .unwrap_or(Duration::from_micros(16_667)); // 60 Hz fallback
 
@@ -137,7 +173,12 @@ impl<'a> RenderContext<'a> {
 
         let flip_info = FlipInfo {
             frame_number: self.state.frame_number,
-            timing_source: self.state.timing_provider.source(),
+            timing_source: self
+                .state
+                .target
+                .present_expect_mut()
+                .timing_provider
+                .source(),
             submit_time,
             present_time,
             present_id,
@@ -154,10 +195,92 @@ impl<'a> RenderContext<'a> {
         }
 
         // Update state for next frame
-        self.state.last_present_time = Some(present_time);
+        self.state.target.present_expect_mut().last_present_time = Some(present_time);
         self.state.frame_number += 1;
 
         // Clear input event queue after the frame
+        self.state.input.clear_events();
+
+        Ok(flip_info)
+    }
+
+    /// Headless flip: render into the offscreen image, copy it back to host
+    /// memory, and hand the pixels to the run loop's sink.
+    ///
+    /// Blocks on the fence — there is no vblank to pipeline against, and the
+    /// readback is only valid once the GPU is done. `target_time` is accepted
+    /// and recorded but never waited on: pacing an offscreen render against a
+    /// wall clock would only slow regeneration down.
+    ///
+    /// The returned [`FlipInfo`] carries [`TimingSource::Offscreen`] and a
+    /// synthesized `present_time` of `frame_number × frame_interval`.
+    fn flip_offscreen(&mut self, target_time: Option<Timestamp>) -> Result<FlipInfo, VSEError> {
+        use vulkano::sync::GpuFuture as _;
+
+        let clear_color = self.config.clear_color;
+        let submit_time = self.state.clock.now();
+
+        let offscreen = self
+            .state
+            .target
+            .offscreen_mut()
+            .expect("flip_offscreen called on a presenting context");
+        let image = offscreen.image.clone();
+        let extent = offscreen.extent;
+        let readback = offscreen.readback.clone();
+        let frame_interval = offscreen.frame_interval;
+
+        let command_buffer =
+            self.state
+                .renderer
+                .render_to_offscreen(image, 0, clear_color, extent, &readback)?;
+
+        let future = vulkano::sync::now(self.state.device.clone())
+            .then_execute(self.state.queue.clone(), command_buffer)
+            .map_err(|e: vulkano::command_buffer::CommandBufferExecError| {
+                FrameError::ExecutionFailed(e.to_string())
+            })?
+            .then_signal_fence_and_flush()
+            .map_err(|e| FrameError::ExecutionFailed(e.to_string()))?;
+        future
+            .wait(None)
+            .map_err(|e| FrameError::ExecutionFailed(e.to_string()))?;
+
+        let bytes = readback
+            .read()
+            .map_err(|e| FrameError::ExecutionFailed(format!("readback map failed: {e}")))?
+            .to_vec();
+
+        let frame_number = self.state.frame_number;
+        // Synthesized, not measured: the k-th frame is nominally shown one
+        // refresh interval after the (k-1)-th. See `TimingSource::Offscreen`.
+        let present_time =
+            Timestamp::from_micros(frame_number.saturating_mul(frame_interval.as_micros() as u64));
+
+        let flip_info = FlipInfo {
+            frame_number,
+            timing_source: crate::timing::TimingSource::Offscreen,
+            submit_time,
+            present_time,
+            present_id: 0,
+            target_time,
+            on_target: true,
+            missed: false,
+            missed_count: 0,
+            skipped: false,
+        };
+
+        self.state
+            .target
+            .offscreen_mut()
+            .expect("flip_offscreen called on a presenting context")
+            .push_capture(frame_number, bytes);
+
+        if let Some(recording) = &mut self.state.recording {
+            recording.on_flip(flip_info.clone());
+        }
+
+        self.state.frame_number += 1;
         self.state.input.clear_events();
 
         Ok(flip_info)
@@ -175,13 +298,21 @@ impl<'a> RenderContext<'a> {
         use vulkano::VulkanObject;
 
         let clear_color = self.config.clear_color;
-        let swapchain_handle = self.state.swapchain.swapchain().handle();
-        let (dsw, dsh) = self.state.display_size;
+        let swapchain_handle = self
+            .state
+            .target
+            .present_expect_mut()
+            .swapchain
+            .swapchain()
+            .handle();
+        let (dsw, dsh) = self.state.target.present_expect_mut().display_size;
         let win_size_arr = [dsw, dsh];
 
         // --- Acquire (raw, signals the slot's acquire semaphore) ---
         let (image_index, acquire_suboptimal, slot) = match self
             .state
+            .target
+            .present_expect_mut()
             .present_engine
             .as_mut()
             .expect("flip_ext called without a present engine")
@@ -189,7 +320,7 @@ impl<'a> RenderContext<'a> {
         {
             Ok(r) => r,
             Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                if let Some(engine) = &mut self.state.present_engine {
+                if let Some(engine) = &mut self.state.target.present_expect_mut().present_engine {
                     engine.wait_idle();
                 }
                 self.state.recreate_swapchain(win_size_arr)?;
@@ -202,15 +333,27 @@ impl<'a> RenderContext<'a> {
             }
         };
         if acquire_suboptimal {
-            self.state.swapchain.mark_needs_recreation();
+            self.state
+                .target
+                .present_expect_mut()
+                .swapchain
+                .mark_needs_recreation();
         }
 
         // --- External frame source: release completed slots, take this frame's underlay ---
-        if let Some(src) = self.state.external_source.as_mut() {
+        if let Some(src) = self
+            .state
+            .target
+            .present_expect_mut()
+            .external_source
+            .as_mut()
+        {
             src.pump_releases();
         }
         let ext_frames = self
             .state
+            .target
+            .present_expect_mut()
             .external_source
             .as_mut()
             .and_then(|src| src.take_frames());
@@ -218,32 +361,46 @@ impl<'a> RenderContext<'a> {
             .as_ref()
             .map(|f| crate::drawing::renderer::ExternalUnderlay {
                 image: f.image.clone(),
-                readback: self.state.external_readback.take(),
+                readback: self
+                    .state
+                    .target
+                    .present_expect_mut()
+                    .external_readback
+                    .take(),
             });
 
         // --- Render into the acquired image ---
-        let image = self.state.swapchain.images()[image_index as usize].clone();
-        let extent = self.state.swapchain.extent();
+        let image =
+            self.state.target.present_expect_mut().swapchain.images()[image_index as usize].clone();
+        let extent = self.state.target.present_expect_mut().swapchain.extent();
         let command_buffer = self.state.renderer.render_with_underlay(
             image,
             image_index as usize,
             clear_color,
             extent,
             underlay.as_ref(),
+            None,
         )?;
 
         // Hardware scheduling: express the target (scanout-domain µs) as an absolute scanout time
         // for `VkPresentTimingInfoEXT.targetTime`. Falls back to unscheduled when the scanout
         // epoch/domain isn't known yet (the very first flip, before `t=0` is established).
-        let scheduled = target_time.and_then(|t| self.state.scheduled_target(t));
+        let scheduled =
+            target_time.and_then(|t| self.state.target.present_expect_mut().scheduled_target(t));
 
         // Software scanout-domain pacing: not every driver enforces `targetTime` (Intel/ANV/Mesa
         // 26.1 does not), so pace the present ourselves against the scanout clock. Harmless when the
         // driver *does* honor the hardware target above. Sync path only (buffered stays pipelined).
         if let Some(target) = target_time {
-            self.state.note_scheduling_once();
-            if let Some(refresh) = self.state.refresh_interval() {
-                self.state.pace_to_scanout_target(target, refresh);
+            self.state
+                .target
+                .present_expect_mut()
+                .note_scheduling_once();
+            if let Some(refresh) = self.state.target.present_expect_mut().refresh_interval() {
+                self.state
+                    .target
+                    .present_expect_mut()
+                    .pace_to_scanout_target(target, refresh);
             }
         }
 
@@ -257,6 +414,8 @@ impl<'a> RenderContext<'a> {
             .unwrap_or_default();
         let outcome = self
             .state
+            .target
+            .present_expect_mut()
             .present_engine
             .as_mut()
             .expect("flip_ext called without a present engine")
@@ -271,45 +430,75 @@ impl<'a> RenderContext<'a> {
             )
             .map_err(SwapchainError::PresentFailed)?;
         if outcome.suboptimal {
-            self.state.swapchain.mark_needs_recreation();
+            self.state
+                .target
+                .present_expect_mut()
+                .swapchain
+                .mark_needs_recreation();
         }
         // Release back-edge: releasable slots return to the producer once this
         // submit's fence signals. In latched mode, the displayed slot remains
         // owned by VSE until a replacement submit succeeds.
-        if let (Some(f), Some(src)) = (ext_frames, self.state.external_source.as_mut()) {
+        if let (Some(f), Some(src)) = (
+            ext_frames,
+            self.state
+                .target
+                .present_expect_mut()
+                .external_source
+                .as_mut(),
+        ) {
             src.on_submitted(&f);
             src.on_consumed(&f.slots, outcome.fence.clone());
         }
 
         // Synchronous flip(): block on the render fence (GPU render done) before sampling — cheap,
         // and keeps the command buffer alive. The scanout-time wait below paces to the vblank.
-        if let Some(engine) = &self.state.present_engine {
+        if let Some(engine) = &self.state.target.present_expect_mut().present_engine {
             engine.wait_frame(slot);
         }
 
         // Establish the scanout epoch on the first flip / feed the opt-in host-clock bridge (off
         // hot path). Must run before rebasing scanout feedback into scanout-domain time below.
-        self.state.update_clocks();
+        self.state
+            .target
+            .present_expect_mut()
+            .update_clocks(&self.state.clock);
 
         // Block until THIS frame has begun scanout, so its IMAGE_FIRST_PIXEL_OUT feedback record
         // has landed (feedback lags the present by ~1 vblank — that lag is why the sync path needs
         // present-wait2). Only legal on a present-wait2 swapchain, so gate on that; falls back to
         // CPU fence time when present-wait2 is unavailable or the wait times out.
         const SCANOUT_WAIT_NS: u64 = 250_000_000; // 250 ms safety cap (≫ one vblank)
-        let waited = self.state.swapchain.present_wait2_enabled()
+        let waited = self
+            .state
+            .target
+            .present_expect_mut()
+            .swapchain
+            .present_wait2_enabled()
             && self
                 .state
+                .target
+                .present_expect_mut()
                 .timing_provider
                 .wait_for_present(outcome.present_id, SCANOUT_WAIT_NS);
 
         // Drain confirmed scanout records ONCE (destructive dequeue) and cache them: populates
         // `scanout_by_present_id` (present-id keyed) and `recent_scanouts` (for `scanout_feedback()`).
-        let feedback = self.state.timing_provider.query_scanouts();
-        self.state.ingest_scanout_feedback(feedback);
-        if let Some(last) = self.state.recent_scanouts.last() {
+        let feedback = self
+            .state
+            .target
+            .present_expect_mut()
+            .timing_provider
+            .query_scanouts();
+        self.state
+            .target
+            .present_expect_mut()
+            .ingest_scanout_feedback(feedback);
+        let present = self.state.target.present_expect();
+        if let Some(last) = present.recent_scanouts.last() {
             debug!(
                 "scanout feedback: {} record(s); latest present_id={} first_pixel_out={:?} domain={}",
-                self.state.recent_scanouts.len(),
+                present.recent_scanouts.len(),
                 last.present_id,
                 last.first_pixel_out_ns,
                 last.time_domain
@@ -327,12 +516,25 @@ impl<'a> RenderContext<'a> {
         //      the scanout epoch is established).
         let scanout_present = self
             .state
+            .target
+            .present_expect_mut()
             .take_scanout_for(outcome.present_id)
             .and_then(|fb| fb.first_pixel_out_ns)
-            .and_then(|ns| self.state.scanout_present_time(ns))
-            .or_else(|| waited.then(|| self.state.sample_scanout_now()).flatten());
+            .and_then(|ns| {
+                self.state
+                    .target
+                    .present_expect_mut()
+                    .scanout_present_time(ns)
+            })
+            .or_else(|| {
+                waited
+                    .then(|| self.state.target.present_expect_mut().sample_scanout_now())
+                    .flatten()
+            });
         let present_time = scanout_present.unwrap_or_else(|| {
             self.state
+                .target
+                .present_expect_mut()
                 .timing_provider
                 .record_present_time(&self.state.clock)
         });
@@ -348,14 +550,20 @@ impl<'a> RenderContext<'a> {
         // --- Shared bottom half: refresh detect, missed-frame detection, FlipInfo assembly ---
         let frame_duration = self
             .state
+            .target
+            .present_expect_mut()
             .last_present_time
             .map(|prev| present_time.duration_since(prev));
 
         self.state
+            .target
+            .present_expect_mut()
             .update_refresh_detection(frame_duration, true, false);
 
         let expected = self
             .state
+            .target
+            .present_expect_mut()
             .expected_frame_duration
             .unwrap_or(Duration::from_micros(16_667));
 
@@ -363,7 +571,12 @@ impl<'a> RenderContext<'a> {
 
         let flip_info = FlipInfo {
             frame_number: self.state.frame_number,
-            timing_source: self.state.timing_provider.source(),
+            timing_source: self
+                .state
+                .target
+                .present_expect_mut()
+                .timing_provider
+                .source(),
             submit_time,
             present_time,
             present_id: outcome.present_id,
@@ -378,7 +591,7 @@ impl<'a> RenderContext<'a> {
             recording.on_flip(flip_info.clone());
         }
 
-        self.state.last_present_time = Some(present_time);
+        self.state.target.present_expect_mut().last_present_time = Some(present_time);
         self.state.frame_number += 1;
         self.state.input.clear_events();
 
@@ -409,42 +622,60 @@ impl<'a> RenderContext<'a> {
         target_time: Option<Timestamp>,
         payload: T,
     ) -> Result<(), VSEError> {
-        if !self.state.in_buffered_mode {
+        if !self.state.target.present_expect_mut().in_buffered_mode {
             return Err(VSEError::NotInBufferedMode);
         }
 
-        if self.state.minimized {
+        if self.state.target.present_expect_mut().minimized {
             // Skip silently — no fence, no payload stored; run_buffered() skips push.
             self.state.frame_number += 1;
             return Ok(());
         }
 
         // On the EXT backend, submit through the raw present engine (present-id + timing chain).
-        if self.state.present_engine.is_some() {
+        if self
+            .state
+            .target
+            .present_expect_mut()
+            .present_engine
+            .is_some()
+        {
             return self.flip_with_payload_ext(target_time, payload);
         }
 
         // Recreate swapchain if needed
-        let (dsw, dsh) = self.state.display_size;
+        let (dsw, dsh) = self.state.target.present_expect_mut().display_size;
         let win_size_arr = [dsw, dsh];
-        if self.state.swapchain.needs_recreation() {
+        if self
+            .state
+            .target
+            .present_expect_mut()
+            .swapchain
+            .needs_recreation()
+        {
             self.state.recreate_swapchain(win_size_arr)?;
         }
 
         // Acquire next image (natural backpressure from driver)
-        let (image_index, _suboptimal, acquire_future) =
-            match self.state.swapchain.acquire_next_image() {
-                Ok(r) => r,
-                Err(SwapchainError::OutOfDate) => {
-                    self.state.recreate_swapchain(win_size_arr)?;
-                    self.state.frame_number += 1;
-                    return Ok(());
-                }
-                Err(e) => return Err(e.into()),
-            };
+        let (image_index, _suboptimal, acquire_future) = match self
+            .state
+            .target
+            .present_expect_mut()
+            .swapchain
+            .acquire_next_image()
+        {
+            Ok(r) => r,
+            Err(SwapchainError::OutOfDate) => {
+                self.state.recreate_swapchain(win_size_arr)?;
+                self.state.frame_number += 1;
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
 
-        let image = self.state.swapchain.images()[image_index as usize].clone();
-        let extent = self.state.swapchain.extent();
+        let image =
+            self.state.target.present_expect_mut().swapchain.images()[image_index as usize].clone();
+        let extent = self.state.target.present_expect_mut().swapchain.extent();
 
         let command_buffer = self.state.renderer.render(
             image,
@@ -462,6 +693,8 @@ impl<'a> RenderContext<'a> {
         // Optional CPU spin-wait for scheduled present time
         if let Some(target) = target_time {
             self.state
+                .target
+                .present_expect_mut()
                 .timing_provider
                 .wait_for_target(target, &self.state.clock);
         }
@@ -469,23 +702,32 @@ impl<'a> RenderContext<'a> {
         let submit_time = self.state.clock.now();
 
         // Non-blocking submit — returns immediately, keeps fence alive
-        let in_flight = self.state.swapchain.submit_nonblocking(
-            self.state.queue.clone(),
-            image_index,
-            future,
-        )?;
+        let in_flight = self
+            .state
+            .target
+            .present_expect_mut()
+            .swapchain
+            .submit_nonblocking(self.state.queue.clone(), image_index, future)?;
 
         let estimated_present = self.state.clock.now();
 
         // Establish the scanout epoch / feed the opt-in host-clock bridge (off hot path).
-        self.state.update_clocks();
+        self.state
+            .target
+            .present_expect_mut()
+            .update_clocks(&self.state.clock);
 
         // present_id is assigned by the EXT present path; 0 on the CPU-estimate path.
         let present_id: u64 = 0;
 
         let estimated_flip = FlipInfo {
             frame_number: self.state.frame_number,
-            timing_source: self.state.timing_provider.source(),
+            timing_source: self
+                .state
+                .target
+                .present_expect_mut()
+                .timing_provider
+                .source(),
             submit_time,
             present_time: estimated_present,
             present_id,
@@ -497,10 +739,15 @@ impl<'a> RenderContext<'a> {
         };
 
         // Store payload for run_buffered() to pick up after callback returns
-        self.state.buffered_pending_payload = Some(Box::new(payload));
+        self.state
+            .target
+            .present_expect_mut()
+            .buffered_pending_payload = Some(Box::new(payload));
 
         // Store (estimated_flip, fence) — correlated with pending_frames by FIFO order
         self.state
+            .target
+            .present_expect_mut()
             .buffered_in_flight
             .push_back((estimated_flip, in_flight));
 
@@ -527,12 +774,24 @@ impl<'a> RenderContext<'a> {
         use vulkano::VulkanObject;
 
         let clear_color = self.config.clear_color;
-        let swapchain_handle = self.state.swapchain.swapchain().handle();
-        let (dsw, dsh) = self.state.display_size;
+        let swapchain_handle = self
+            .state
+            .target
+            .present_expect_mut()
+            .swapchain
+            .swapchain()
+            .handle();
+        let (dsw, dsh) = self.state.target.present_expect_mut().display_size;
         let win_size_arr = [dsw, dsh];
 
-        if self.state.swapchain.needs_recreation() {
-            if let Some(engine) = &mut self.state.present_engine {
+        if self
+            .state
+            .target
+            .present_expect_mut()
+            .swapchain
+            .needs_recreation()
+        {
+            if let Some(engine) = &mut self.state.target.present_expect_mut().present_engine {
                 engine.wait_idle();
             }
             self.state.recreate_swapchain(win_size_arr)?;
@@ -541,6 +800,8 @@ impl<'a> RenderContext<'a> {
         // --- Acquire (raw) ---
         let (image_index, acquire_suboptimal, slot) = match self
             .state
+            .target
+            .present_expect_mut()
             .present_engine
             .as_mut()
             .expect("flip_with_payload_ext called without a present engine")
@@ -548,7 +809,7 @@ impl<'a> RenderContext<'a> {
         {
             Ok(r) => r,
             Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                if let Some(engine) = &mut self.state.present_engine {
+                if let Some(engine) = &mut self.state.target.present_expect_mut().present_engine {
                     engine.wait_idle();
                 }
                 self.state.recreate_swapchain(win_size_arr)?;
@@ -558,15 +819,27 @@ impl<'a> RenderContext<'a> {
             Err(e) => return Err(SwapchainError::AcquireFailed(format!("{e:?}")).into()),
         };
         if acquire_suboptimal {
-            self.state.swapchain.mark_needs_recreation();
+            self.state
+                .target
+                .present_expect_mut()
+                .swapchain
+                .mark_needs_recreation();
         }
 
         // --- External frame source: release completed slots, take this frame's underlay ---
-        if let Some(src) = self.state.external_source.as_mut() {
+        if let Some(src) = self
+            .state
+            .target
+            .present_expect_mut()
+            .external_source
+            .as_mut()
+        {
             src.pump_releases();
         }
         let ext_frames = self
             .state
+            .target
+            .present_expect_mut()
             .external_source
             .as_mut()
             .and_then(|src| src.take_frames());
@@ -574,23 +847,31 @@ impl<'a> RenderContext<'a> {
             .as_ref()
             .map(|f| crate::drawing::renderer::ExternalUnderlay {
                 image: f.image.clone(),
-                readback: self.state.external_readback.take(),
+                readback: self
+                    .state
+                    .target
+                    .present_expect_mut()
+                    .external_readback
+                    .take(),
             });
 
         // --- Render ---
-        let image = self.state.swapchain.images()[image_index as usize].clone();
-        let extent = self.state.swapchain.extent();
+        let image =
+            self.state.target.present_expect_mut().swapchain.images()[image_index as usize].clone();
+        let extent = self.state.target.present_expect_mut().swapchain.extent();
         let command_buffer = self.state.renderer.render_with_underlay(
             image,
             image_index as usize,
             clear_color,
             extent,
             underlay.as_ref(),
+            None,
         )?;
 
         // Hardware scheduling (no CPU spin): express the target as an absolute scanout time for
         // the driver. Falls back to unscheduled before the scanout epoch/domain is known.
-        let scheduled = target_time.and_then(|t| self.state.scheduled_target(t));
+        let scheduled =
+            target_time.and_then(|t| self.state.target.present_expect_mut().scheduled_target(t));
 
         let submit_time = self.state.clock.now();
 
@@ -602,6 +883,8 @@ impl<'a> RenderContext<'a> {
             .unwrap_or_default();
         let outcome = self
             .state
+            .target
+            .present_expect_mut()
             .present_engine
             .as_mut()
             .expect("flip_with_payload_ext called without a present engine")
@@ -616,30 +899,57 @@ impl<'a> RenderContext<'a> {
             )
             .map_err(SwapchainError::PresentFailed)?;
         if outcome.suboptimal {
-            self.state.swapchain.mark_needs_recreation();
+            self.state
+                .target
+                .present_expect_mut()
+                .swapchain
+                .mark_needs_recreation();
         }
         // Release back-edge: releasable slots return to the producer once this
         // submit's fence signals. In latched mode, the displayed slot remains
         // owned by VSE until a replacement submit succeeds.
-        if let (Some(f), Some(src)) = (&ext_frames, self.state.external_source.as_mut()) {
+        if let (Some(f), Some(src)) = (
+            &ext_frames,
+            self.state
+                .target
+                .present_expect_mut()
+                .external_source
+                .as_mut(),
+        ) {
             src.on_submitted(f);
             src.on_consumed(&f.slots, outcome.fence.clone());
         }
 
         let estimated_present = self.state.clock.now();
-        self.state.update_clocks();
+        self.state
+            .target
+            .present_expect_mut()
+            .update_clocks(&self.state.clock);
 
         // Drain confirmed scanout records once (destructive read) and cache them for
         // present-id-keyed confirmation in `build_confirmed_flip`.
-        let feedback = self.state.timing_provider.query_scanouts();
-        self.state.ingest_scanout_feedback(feedback);
+        let feedback = self
+            .state
+            .target
+            .present_expect_mut()
+            .timing_provider
+            .query_scanouts();
+        self.state
+            .target
+            .present_expect_mut()
+            .ingest_scanout_feedback(feedback);
 
         let in_flight: Box<dyn crate::core::buffered::InFlightFuture> =
             Box::new(EngineInFlight::new(outcome.fence));
 
         let estimated_flip = FlipInfo {
             frame_number: self.state.frame_number,
-            timing_source: self.state.timing_provider.source(),
+            timing_source: self
+                .state
+                .target
+                .present_expect_mut()
+                .timing_provider
+                .source(),
             submit_time,
             present_time: estimated_present,
             present_id: outcome.present_id,
@@ -650,8 +960,13 @@ impl<'a> RenderContext<'a> {
             skipped: false,
         };
 
-        self.state.buffered_pending_payload = Some(Box::new(payload));
         self.state
+            .target
+            .present_expect_mut()
+            .buffered_pending_payload = Some(Box::new(payload));
+        self.state
+            .target
+            .present_expect_mut()
             .buffered_in_flight
             .push_back((estimated_flip, in_flight));
 

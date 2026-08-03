@@ -189,11 +189,12 @@ impl VSEContext {
                             WindowEvent::Resized(new_size) => {
                                 debug!("Window resized to {}x{}", new_size.width, new_size.height);
                                 if new_size.width == 0 || new_size.height == 0 {
-                                    s.minimized = true;
+                                    s.target.present_expect_mut().minimized = true;
                                 } else {
-                                    s.minimized = false;
-                                    s.display_size = (new_size.width, new_size.height);
-                                    s.swapchain.mark_needs_recreation();
+                                    let present = s.target.present_expect_mut();
+                                    present.minimized = false;
+                                    present.display_size = (new_size.width, new_size.height);
+                                    present.swapchain.mark_needs_recreation();
                                 }
                             }
                             WindowEvent::KeyboardInput { .. }
@@ -203,7 +204,7 @@ impl VSEContext {
                                 s.handle_winit_input(&window_event);
                             }
                             WindowEvent::RedrawRequested => {
-                                if s.minimized {
+                                if s.target.present_expect().minimized {
                                     return;
                                 }
 
@@ -236,7 +237,7 @@ impl VSEContext {
                     }
                     Event::AboutToWait => {
                         if let Some(s) = &state {
-                            if let Some(w) = &s.window {
+                            if let Some(w) = &s.target.present_expect().window {
                                 w.request_redraw();
                             }
                         }
@@ -378,9 +379,14 @@ impl VSEContext {
                                     pending_flip: None,
                                     last_claimed_frame: None,
                                 });
-                                s.in_buffered_mode = true;
+                                s.target.present_expect_mut().in_buffered_mode = true;
                                 let required = (config.depth + 1) as u32;
-                                if let Err(e) = s.swapchain.ensure_image_count(required) {
+                                if let Err(e) = s
+                                    .target
+                                    .present_expect_mut()
+                                    .swapchain
+                                    .ensure_image_count(required)
+                                {
                                     *error_clone.borrow_mut() = Some(e.into());
                                     elwt.exit();
                                     return;
@@ -388,8 +394,9 @@ impl VSEContext {
                                 // The raw present engine pipelines `depth + 1` frames, so its
                                 // sync ring must have at least that many slots (+1 slack) or a
                                 // slot's fence would be reset while its frame is still in flight.
-                                if let Some(engine) = &mut s.present_engine {
-                                    let slots = s.swapchain.images().len() + 1;
+                                let present = s.target.present_expect_mut();
+                                if let Some(engine) = &mut present.present_engine {
+                                    let slots = present.swapchain.images().len() + 1;
                                     if !engine.ensure_ring(slots) {
                                         *error_clone.borrow_mut() = Some(VSEError::Swapchain(
                                             SwapchainError::CreationFailed(
@@ -425,11 +432,12 @@ impl VSEContext {
                             WindowEvent::Resized(new_size) => {
                                 debug!("Window resized to {}x{}", new_size.width, new_size.height);
                                 if new_size.width == 0 || new_size.height == 0 {
-                                    s.minimized = true;
+                                    s.target.present_expect_mut().minimized = true;
                                 } else {
-                                    s.minimized = false;
-                                    s.display_size = (new_size.width, new_size.height);
-                                    s.swapchain.mark_needs_recreation();
+                                    let present = s.target.present_expect_mut();
+                                    present.minimized = false;
+                                    present.display_size = (new_size.width, new_size.height);
+                                    present.swapchain.mark_needs_recreation();
                                 }
                             }
                             WindowEvent::KeyboardInput { .. }
@@ -439,20 +447,26 @@ impl VSEContext {
                                 s.handle_winit_input(&window_event);
                             }
                             WindowEvent::RedrawRequested => {
-                                if s.minimized {
+                                if s.target.present_expect().minimized {
                                     return;
                                 }
 
                                 // ── Phase 1: Check for confirmed presentation ──────────
                                 let oldest_complete = s
+                                    .target
+                                    .present_expect()
                                     .buffered_in_flight
                                     .front()
                                     .map(|(_, fence)| fence.is_complete())
                                     .unwrap_or(false);
 
                                 if oldest_complete {
-                                    let (estimated_flip, fence) =
-                                        s.buffered_in_flight.pop_front().unwrap();
+                                    let (estimated_flip, fence) = s
+                                        .target
+                                        .present_expect_mut()
+                                        .buffered_in_flight
+                                        .pop_front()
+                                        .unwrap();
                                     fence.wait_blocking();
 
                                     if let Some(pf) = pending_frames.borrow_mut().pop_front() {
@@ -460,9 +474,12 @@ impl VSEContext {
                                             pf.frame_number, pf.estimated_flip.frame_number,
                                             "PendingFrame FIFO mismatch"
                                         );
-                                        let confirmed = s.build_confirmed_flip(estimated_flip);
-                                        s.buffered_confirmed_flip = Some(confirmed.clone());
-                                        s.buffered_record_called_this_presented = false;
+                                        let clock = &s.clock;
+                                        let present = s.target.present_expect_mut();
+                                        let confirmed =
+                                            present.build_confirmed_flip(clock, estimated_flip);
+                                        present.buffered_confirmed_flip = Some(confirmed.clone());
+                                        present.buffered_record_called_this_presented = false;
 
                                         let mut render_ctx = RenderContext {
                                             state: s,
@@ -479,7 +496,8 @@ impl VSEContext {
                                             elwt.exit();
                                             return;
                                         }
-                                        s.buffered_confirmed_flip = None;
+                                        s.target.present_expect_mut().buffered_confirmed_flip =
+                                            None;
                                     }
                                 }
 
@@ -494,7 +512,7 @@ impl VSEContext {
                                     if let Some(recording) = &mut s.recording {
                                         recording.on_shutdown();
                                     }
-                                    s.in_buffered_mode = false;
+                                    s.target.present_expect_mut().in_buffered_mode = false;
                                     elwt.exit();
                                     return;
                                 }
@@ -512,12 +530,17 @@ impl VSEContext {
                                     }
 
                                     // Pick up payload stored by flip_with_payload()
-                                    if let Some(raw) = s.buffered_pending_payload.take() {
+                                    if let Some(raw) = s
+                                        .target
+                                        .present_expect_mut()
+                                        .buffered_pending_payload
+                                        .take()
+                                    {
                                         let payload = *raw
                                             .downcast::<T>()
                                             .expect("buffered payload type mismatch");
                                         if let Some((estimated_flip, _)) =
-                                            s.buffered_in_flight.back()
+                                            s.target.present_expect().buffered_in_flight.back()
                                         {
                                             let ef = estimated_flip.clone();
                                             pending_frames.borrow_mut().push_back(PendingFrame {
@@ -541,7 +564,7 @@ impl VSEContext {
                                     if let Some(recording) = &mut s.recording {
                                         recording.on_shutdown();
                                     }
-                                    s.in_buffered_mode = false;
+                                    s.target.present_expect_mut().in_buffered_mode = false;
                                     elwt.exit();
                                 }
                             }
@@ -550,14 +573,14 @@ impl VSEContext {
                     }
                     Event::AboutToWait => {
                         if let Some(s) = &state {
-                            if let Some(w) = &s.window {
+                            if let Some(w) = &s.target.present_expect().window {
                                 w.request_redraw();
                             }
                         }
                     }
                     Event::LoopExiting => {
                         if let Some(s) = &mut state {
-                            s.in_buffered_mode = false;
+                            s.target.present_expect_mut().in_buffered_mode = false;
                             if let Some(recording) = &mut s.recording {
                                 recording.on_shutdown();
                             }
@@ -590,16 +613,23 @@ impl VSEContext {
         T: std::any::Any + serde::Serialize + Send + 'static,
         F: FnMut(FlipEvent<T>, &mut RenderContext<'_>) -> Result<(), VSEError>,
     {
-        while let Some((estimated_flip, fence)) = state.buffered_in_flight.pop_front() {
+        while let Some((estimated_flip, fence)) = state
+            .target
+            .present_expect_mut()
+            .buffered_in_flight
+            .pop_front()
+        {
             fence.wait_blocking();
             if let Some(pf) = pending_frames.borrow_mut().pop_front() {
                 debug_assert_eq!(
                     pf.frame_number, pf.estimated_flip.frame_number,
                     "PendingFrame FIFO mismatch"
                 );
-                let confirmed = state.build_confirmed_flip(estimated_flip);
-                state.buffered_confirmed_flip = Some(confirmed.clone());
-                state.buffered_record_called_this_presented = false;
+                let clock = &state.clock;
+                let present = state.target.present_expect_mut();
+                let confirmed = present.build_confirmed_flip(clock, estimated_flip);
+                present.buffered_confirmed_flip = Some(confirmed.clone());
+                present.buffered_record_called_this_presented = false;
                 let mut render_ctx = RenderContext { state, config };
                 let _ = callback(
                     FlipEvent::Presented {
@@ -608,7 +638,7 @@ impl VSEContext {
                     },
                     &mut render_ctx,
                 );
-                state.buffered_confirmed_flip = None;
+                state.target.present_expect_mut().buffered_confirmed_flip = None;
             }
         }
     }

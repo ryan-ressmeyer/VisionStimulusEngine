@@ -133,7 +133,7 @@ fn build_checker_pipeline(vse: &RenderContext) -> Arc<GraphicsPipeline> {
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
             subpass: Some(
                 PipelineRenderingCreateInfo {
-                    color_attachment_formats: vec![Some(vse.swapchain().format())],
+                    color_attachment_formats: vec![Some(vse.color_format())],
                     ..Default::default()
                 }
                 .into(),

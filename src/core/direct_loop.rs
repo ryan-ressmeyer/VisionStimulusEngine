@@ -7,7 +7,7 @@ use tracing::{info, warn};
 use super::config::VSEError;
 use super::context::{RenderContext, VSEContext};
 use super::input::AcquisitionMethod;
-use super::state::{InputSource, RecordingState};
+use super::state::{InputSource, RecordingState, VSEState};
 
 impl VSEContext {
     /// Run the direct display render loop (no winit).
@@ -55,7 +55,7 @@ impl VSEContext {
         // Capture whether we need to restore the VT console on exit.
         // Only applies to bare-TTY acquisition paths (not Xlib).
         let restore_vt = matches!(
-            state.acquired_display,
+            state.target.present_expect().acquired_display,
             Some(AcquisitionMethod::NoCompositor) | Some(AcquisitionMethod::DrmAcquire)
         );
 
@@ -66,8 +66,16 @@ impl VSEContext {
                 break None;
             }
 
-            if let InputSource::Evdev(ref mut reader) = state.input_source {
-                reader.poll(&mut state.input, &state.clock);
+            // Disjoint field borrows: the evdev reader lives in the present
+            // target, the input state and clock in the core.
+            let VSEState {
+                target,
+                input,
+                clock,
+                ..
+            } = &mut state;
+            if let InputSource::Evdev(ref mut reader) = target.present_expect_mut().input_source {
+                reader.poll(input, clock);
             }
 
             let mut render_ctx = RenderContext {

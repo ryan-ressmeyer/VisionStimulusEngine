@@ -134,6 +134,20 @@ pub struct VSEConfig {
     /// Which built-in graphics pipelines to compile at startup
     /// (see [`VSEContextBuilder::with_pipelines`]). Defaults to the full suite.
     pub pipeline_suite: PipelineSuite,
+    /// Offscreen render target, when the session is headless
+    /// (see [`VSEContextBuilder::with_headless`]). `None` for a displayed session.
+    pub headless: Option<HeadlessConfig>,
+}
+
+/// Offscreen target settings for a headless session.
+///
+/// For regeneration these must match the recorded session: a different color
+/// format or extent produces different bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadlessConfig {
+    pub width: u32,
+    pub height: u32,
+    pub format: vulkano::format::Format,
 }
 
 impl Default for VSEConfig {
@@ -153,6 +167,7 @@ impl Default for VSEConfig {
             direct_display_acquisition_order: None,
             host_clock_bridge: false,
             pipeline_suite: PipelineSuite::default(),
+            headless: None,
         }
     }
 }
@@ -318,6 +333,36 @@ impl VSEContextBuilder {
         self
     }
 
+    /// Render offscreen at `width` × `height` instead of to a display.
+    ///
+    /// The color format defaults to `B8G8R8A8_SRGB`, which is what the
+    /// swapchain negotiates on most systems (it prefers an sRGB format). For
+    /// regenerating a recorded session, prefer
+    /// [`with_headless_from_host_info`](Self::with_headless_from_host_info),
+    /// which takes format, extent, and pipeline suite from the recording rather
+    /// than from your memory of it.
+    ///
+    /// Finish with [`build_headless`](Self::build_headless), not `build`.
+    pub fn with_headless(mut self, width: u32, height: u32) -> Self {
+        self.config.headless = Some(HeadlessConfig {
+            width,
+            height,
+            format: vulkano::format::Format::B8G8R8A8_SRGB,
+        });
+        self
+    }
+
+    /// Override the offscreen color format set by
+    /// [`with_headless`](Self::with_headless).
+    ///
+    /// Has no effect unless the session is headless.
+    pub fn with_headless_format(mut self, format: vulkano::format::Format) -> Self {
+        if let Some(headless) = &mut self.config.headless {
+            headless.format = format;
+        }
+        self
+    }
+
     /// Attach an experiment session for data recording.
     ///
     /// Enables `record_frame()`, `record_annotation()`, and `record_event()`
@@ -363,6 +408,41 @@ impl VSEContextBuilder {
             session: self.session,
             event_loop,
         })
+    }
+
+    /// Build a headless (offscreen) context.
+    ///
+    /// Unlike [`build`](Self::build), this constructs the GPU state
+    /// immediately: with no surface to negotiate, nothing has to wait for a run
+    /// loop. Requires [`with_headless`](Self::with_headless).
+    ///
+    /// # Errors
+    ///
+    /// [`VSEError::Window`] if the builder was not configured headless, plus
+    /// the usual device and renderer errors.
+    pub fn build_headless(self) -> Result<crate::core::HeadlessContext, VSEError> {
+        self.config
+            .pipeline_suite
+            .validate()
+            .map_err(RendererError::from)?;
+
+        let headless = self.config.headless.ok_or_else(|| {
+            VSEError::Window(
+                "build_headless() requires .with_headless(width, height) on the builder".into(),
+            )
+        })?;
+
+        info!(
+            "Headless VSE context: {}x{}, {:?}",
+            headless.width, headless.height, headless.format
+        );
+
+        crate::core::HeadlessContext::new(
+            self.config,
+            self.session,
+            headless.format,
+            [headless.width, headless.height],
+        )
     }
 }
 

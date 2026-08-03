@@ -10,6 +10,11 @@ pub enum TimingSource {
     ExtPresentTiming,
     /// CPU estimation via std::time::Instant around fence wait.
     CpuEstimate,
+    /// No display at all — headless (offscreen) rendering. Frame times are
+    /// synthesized from a nominal refresh interval, never measured. Data
+    /// recorded under this source describes regenerated stimuli, not a
+    /// presented session.
+    Offscreen,
 }
 
 impl std::fmt::Display for TimingSource {
@@ -17,6 +22,7 @@ impl std::fmt::Display for TimingSource {
         match self {
             TimingSource::ExtPresentTiming => write!(f, "ExtPresentTiming"),
             TimingSource::CpuEstimate => write!(f, "CpuEstimate"),
+            TimingSource::Offscreen => write!(f, "Offscreen"),
         }
     }
 }

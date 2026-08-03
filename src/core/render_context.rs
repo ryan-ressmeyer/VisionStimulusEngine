@@ -10,7 +10,7 @@ use super::config::{VSEConfig, VSEError};
 use super::input::{
     DisplayBackend, InputEvent, KeyCode, MonitorInfo, MouseButton, VideoModeInfo, WindowMode,
 };
-use super::state::VSEState;
+use super::state::{RenderTarget, VSEState};
 use super::swapchain::SwapchainManager;
 use crate::data::messages::FrameMessage;
 use crate::drawing::primitives::{
@@ -71,9 +71,17 @@ impl<'a> RenderContext<'a> {
     /// - [`VSEError::NoConfirmedFlip`] if called in the `FlipEvent::Render` arm.
     pub fn record_frame<F: serde::Serialize>(&mut self, data: F) -> Result<(), VSEError> {
         // Buffered mode: use the confirmed flip set by run_buffered() before this callback.
-        if self.state.in_buffered_mode {
+        // A headless session has no present target and is never buffered.
+        let in_buffered_mode = self
+            .state
+            .target
+            .present()
+            .is_some_and(|p| p.in_buffered_mode);
+        if in_buffered_mode {
             let flip = self
                 .state
+                .target
+                .present_expect()
                 .buffered_confirmed_flip
                 .clone()
                 .ok_or(VSEError::NoConfirmedFlip)?;
@@ -92,7 +100,10 @@ impl<'a> RenderContext<'a> {
                 })
                 .map_err(|e| VSEError::DataRecording(e.to_string()))?;
 
-            self.state.buffered_record_called_this_presented = true;
+            self.state
+                .target
+                .present_expect_mut()
+                .buffered_record_called_this_presented = true;
             return Ok(());
         }
 
@@ -190,7 +201,10 @@ impl<'a> RenderContext<'a> {
     ///
     /// In fullscreen modes this returns the monitor's native resolution.
     pub fn window_size(&self) -> (u32, u32) {
-        self.state.display_size
+        match &self.state.target {
+            RenderTarget::Present(p) => p.display_size,
+            RenderTarget::Offscreen(o) => (o.extent[0], o.extent[1]),
+        }
     }
 
     /// Get the device (for advanced users)
@@ -203,9 +217,26 @@ impl<'a> RenderContext<'a> {
         &self.state.queue
     }
 
-    /// Get the swapchain manager (for advanced users)
-    pub fn swapchain(&self) -> &SwapchainManager {
-        &self.state.swapchain
+    /// Get the swapchain manager (for advanced users).
+    ///
+    /// `None` in a headless session, which renders to an offscreen image and
+    /// has no swapchain. For the color format alone — the usual reason to reach
+    /// for this — prefer [`color_format`](Self::color_format), which answers in
+    /// both modes.
+    pub fn swapchain(&self) -> Option<&SwapchainManager> {
+        self.state.target.present().map(|p| &p.swapchain)
+    }
+
+    /// The color format this session renders into: the negotiated swapchain
+    /// format when presenting, the offscreen image's format when headless.
+    ///
+    /// This is the format a user pipeline must be built against, and the one a
+    /// headless regeneration must match to reproduce a recorded session's bytes.
+    pub fn color_format(&self) -> vulkano::format::Format {
+        match &self.state.target {
+            RenderTarget::Present(p) => p.swapchain.format(),
+            RenderTarget::Offscreen(o) => o.format,
+        }
     }
 
     /// Get the GPU name
@@ -215,7 +246,10 @@ impl<'a> RenderContext<'a> {
 
     /// Get the active timing source.
     pub fn timing_source(&self) -> TimingSource {
-        self.state.timing_provider.source()
+        match &self.state.target {
+            RenderTarget::Present(p) => p.timing_provider.source(),
+            RenderTarget::Offscreen(_) => TimingSource::Offscreen,
+        }
     }
 
     /// Get the timing clock (for correlating with external events).
@@ -260,7 +294,12 @@ impl<'a> RenderContext<'a> {
         policy: crate::core::external_frame::ExternalFramePolicy,
     ) -> Result<(), VSEError> {
         use crate::core::external_frame::{ExternalFrameError, ExternalFrameRing};
-        if self.state.present_engine.is_none() {
+        let present = self.state.target.present().ok_or_else(|| {
+            ExternalFrameError::Unsupported(
+                "external frame sources require a presented session (this one is headless)".into(),
+            )
+        })?;
+        if present.present_engine.is_none() {
             return Err(ExternalFrameError::Unsupported(
                 "external frame sources require the ExtPresentTiming backend \
                  (CPU-estimate timing path active)"
@@ -268,7 +307,7 @@ impl<'a> RenderContext<'a> {
             )
             .into());
         }
-        if self.state.external_source.is_some() {
+        if present.external_source.is_some() {
             return Err(ExternalFrameError::Unsupported(
                 "an external frame source is already attached".into(),
             )
@@ -290,7 +329,7 @@ impl<'a> RenderContext<'a> {
             ring.extent()[0],
             ring.extent()[1],
         );
-        self.state.external_source = Some(ring);
+        self.state.target.present_expect_mut().external_source = Some(ring);
         Ok(())
     }
 
@@ -315,11 +354,16 @@ impl<'a> RenderContext<'a> {
         slot: vse_external_frame::SlotIndex,
         timeline_value: Option<u64>,
     ) -> Result<(), VSEError> {
-        let src = self.state.external_source.as_mut().ok_or_else(|| {
-            crate::core::external_frame::ExternalFrameError::Unsupported(
-                "no external frame source attached".into(),
-            )
-        })?;
+        let src = self
+            .state
+            .target
+            .present_mut()
+            .and_then(|p| p.external_source.as_mut())
+            .ok_or_else(|| {
+                crate::core::external_frame::ExternalFrameError::Unsupported(
+                    "no external frame source attached".into(),
+                )
+            })?;
         src.note_ready_with_value(slot, timeline_value)?;
         Ok(())
     }
@@ -328,8 +372,11 @@ impl<'a> RenderContext<'a> {
     /// `buffer` (determinism-harness hook). The copy is recorded in the same
     /// command buffer as the underlay consumption; the buffer is safe to read
     /// once that flip is confirmed (fence signaled / `Presented` delivered).
+    /// A no-op in a headless session, which has no external-frame seam.
     pub fn arm_external_readback(&mut self, buffer: vulkano::buffer::Subbuffer<[u8]>) {
-        self.state.external_readback = Some(buffer);
+        if let Some(present) = self.state.target.present_mut() {
+            present.external_readback = Some(buffer);
+        }
     }
 
     /// VSE's device memory allocator, for creating buffers on VSE's device
@@ -368,7 +415,11 @@ impl<'a> RenderContext<'a> {
 
     /// Display refresh interval reported by the timing backend or detected from flips.
     pub fn refresh_interval(&self) -> Option<std::time::Duration> {
-        self.state.refresh_interval()
+        match &self.state.target {
+            RenderTarget::Present(p) => p.refresh_interval(),
+            // Headless: the nominal interval used to synthesize flip times.
+            RenderTarget::Offscreen(o) => Some(o.frame_interval),
+        }
     }
 
     /// Sample the display's `PRESENT_STAGE_LOCAL` scanout clock against `CLOCK_MONOTONIC`.
@@ -377,7 +428,11 @@ impl<'a> RenderContext<'a> {
     /// probed. Used to characterize the clock offset and relative drift that the present-timing
     /// calibration must correct. See `docs/clock-synchronization.md`.
     pub fn sample_present_calibration(&self) -> Option<crate::timing::CalibrationSample> {
-        self.state.timing_provider.sample_present_calibration()
+        self.state
+            .target
+            .present()?
+            .timing_provider
+            .sample_present_calibration()
     }
 
     /// Read back confirmed per-present scanout timings from the driver's past-timing ring
@@ -393,7 +448,11 @@ impl<'a> RenderContext<'a> {
     /// (each record is dequeued once), so `flip()` drains once per frame and caches the result
     /// here — this accessor never re-drains, and calling it repeatedly returns the same records.
     pub fn scanout_feedback(&self) -> Vec<crate::core::ScanoutFeedback> {
-        self.state.recent_scanouts.clone()
+        self.state
+            .target
+            .present()
+            .map(|p| p.recent_scanouts.clone())
+            .unwrap_or_default()
     }
 
     /// Read the current scanout-clock time — VSE's primary experimental clock.
@@ -401,8 +460,9 @@ impl<'a> RenderContext<'a> {
     /// Returns time since the session's scanout epoch (`t=0`, established on the first flip).
     /// `None` on the CPU-estimate path, or before the first flip has established the epoch.
     pub fn scanout_now(&self) -> Option<ScanoutTimestamp> {
-        let clock = self.state.scanout_clock?;
-        let sample = self.state.timing_provider.sample_present_calibration()?;
+        let present = self.state.target.present()?;
+        let clock = present.scanout_clock?;
+        let sample = present.timing_provider.sample_present_calibration()?;
         Some(clock.rebase(sample.stage_ns))
     }
 
@@ -413,8 +473,9 @@ impl<'a> RenderContext<'a> {
     /// warmed up, and the scanout epoch is established. This is the intended way to place
     /// host-originated events on the scanout timeline.
     pub fn host_to_scanout(&self, ts: Timestamp) -> Option<ScanoutTimestamp> {
-        let clock = self.state.scanout_clock?;
-        let bridge = self.state.host_bridge.as_ref()?;
+        let present = self.state.target.present()?;
+        let clock = present.scanout_clock?;
+        let bridge = present.host_bridge.as_ref()?;
         let mono_ns = self.state.clock.to_monotonic_nanos(ts)?;
         let stage_ns = bridge.host_to_scanout_ns(mono_ns)?;
         Some(clock.rebase(stage_ns))
@@ -424,8 +485,9 @@ impl<'a> RenderContext<'a> {
     ///
     /// Inverse of [`host_to_scanout`](Self::host_to_scanout); same availability conditions.
     pub fn scanout_to_host(&self, ts: ScanoutTimestamp) -> Option<Timestamp> {
-        let clock = self.state.scanout_clock?;
-        let bridge = self.state.host_bridge.as_ref()?;
+        let present = self.state.target.present()?;
+        let clock = present.scanout_clock?;
+        let bridge = present.host_bridge.as_ref()?;
         let stage_ns = clock.epoch_stage_ns().saturating_add(ts.as_nanos());
         let mono_ns = bridge.scanout_to_host_ns(stage_ns)?;
         self.state.clock.from_monotonic_nanos(mono_ns)
@@ -435,7 +497,12 @@ impl<'a> RenderContext<'a> {
     ///
     /// `None` unless the bridge is enabled and warmed up.
     pub fn host_clock_bridge_drift_ppm(&self) -> Option<f64> {
-        self.state.host_bridge.as_ref()?.drift_ppm()
+        self.state
+            .target
+            .present()?
+            .host_bridge
+            .as_ref()?
+            .drift_ppm()
     }
 
     // === Drawing primitives ===
@@ -827,7 +894,7 @@ impl<'a> RenderContext<'a> {
         &mut self,
         pipeline: P,
     ) -> Result<RegisteredPipeline<P::Command>, VSEError> {
-        let color_format = self.state.swapchain.format();
+        let color_format = self.color_format();
         Ok(self.state.renderer.register(pipeline, color_format)?)
     }
 
@@ -876,19 +943,35 @@ impl<'a> RenderContext<'a> {
     /// This is an on-demand operation — call it when you need a snapshot.
     /// The EDID capture shells out to `xrandr`, which may take ~50ms.
     pub fn capture_host_info(&self) -> crate::host::HostInfo {
+        // Headless runs report the offscreen target in place of a swapchain,
+        // and no present-timing observations — there was no presentation to
+        // observe. The `SwapchainInfo` strings say so explicitly.
+        let (render_target, observed) = match &self.state.target {
+            RenderTarget::Present(p) => (
+                crate::host::capture::capture_swapchain_info(&p.swapchain),
+                crate::host::capture::ObservedPresentTiming {
+                    scanout_feedback_populated: p.scanout_feedback_populated,
+                    // Enforcement is not auto-probed (it disrupts frames); `None` here. The
+                    // direct-display characterization example measures and reports it.
+                    absolute_scheduling_enforced: None,
+                    queue_global_priority: p.ext_features.map(|f| f.queue_priority),
+                },
+            ),
+            RenderTarget::Offscreen(o) => (
+                crate::host::capture::capture_offscreen_info(o.format, o.extent),
+                crate::host::capture::ObservedPresentTiming::default(),
+            ),
+        };
         crate::host::capture::capture_host_info(
             self.state.device_selector.physical_device(),
             &self.state.device,
-            self.state.window.as_deref(),
-            &self.state.swapchain,
+            self.state
+                .target
+                .present()
+                .and_then(|p| p.window.as_deref()),
+            render_target,
             self.config,
-            crate::host::capture::ObservedPresentTiming {
-                scanout_feedback_populated: self.state.scanout_feedback_populated,
-                // Enforcement is not auto-probed (it disrupts frames); `None` here. The
-                // direct-display characterization example measures and reports it.
-                absolute_scheduling_enforced: None,
-                queue_global_priority: self.state.ext_features.map(|f| f.queue_priority),
-            },
+            observed,
         )
     }
 
@@ -901,7 +984,7 @@ impl<'a> RenderContext<'a> {
     /// or the CPU-estimate backend). A guardrail against trusting an advertised-but-unimplemented
     /// feature. See `docs/clock-synchronization.md`.
     pub fn scanout_feedback_populated(&self) -> Option<bool> {
-        self.state.scanout_feedback_populated
+        self.state.target.present()?.scanout_feedback_populated
     }
 
     // === Input polling (frame-aligned) ===
@@ -950,22 +1033,28 @@ impl<'a> RenderContext<'a> {
 
     /// Set whether the mouse cursor is visible.
     pub fn set_cursor_visible(&mut self, visible: bool) {
-        self.state.cursor_visible = visible;
-        if let Some(w) = &self.state.window {
+        let Some(present) = self.state.target.present_mut() else {
+            return;
+        };
+        present.cursor_visible = visible;
+        if let Some(w) = &present.window {
             w.set_cursor_visible(visible);
         }
     }
 
     /// Move the cursor to the specified position (logical pixels).
     pub fn set_cursor_position(&self, x: f64, y: f64) {
-        if let Some(w) = &self.state.window {
+        if let Some(w) = self.state.target.present().and_then(|p| p.window.as_ref()) {
             let _ = w.set_cursor_position(LogicalPosition::new(x, y));
         }
     }
 
     /// Returns whether the cursor is currently visible.
     pub fn cursor_visible(&self) -> bool {
-        self.state.cursor_visible
+        self.state
+            .target
+            .present()
+            .is_some_and(|p| p.cursor_visible)
     }
 
     // === Display backend detection ===
@@ -988,13 +1077,16 @@ impl<'a> RenderContext<'a> {
     /// ```
     pub fn display_backend(&self) -> DisplayBackend {
         // Direct display mode: no window, check the stored acquisition method
-        if let Some(method) = self.state.acquired_display {
+        let Some(present) = self.state.target.present() else {
+            return DisplayBackend::Unknown;
+        };
+        if let Some(method) = present.acquired_display {
             return DisplayBackend::DirectDisplay { method };
         }
 
         // Compositor mode: detect from raw window handle
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        if let Some(window) = &self.state.window {
+        if let Some(window) = &present.window {
             return match window.window_handle().map(|h| h.as_raw()) {
                 Ok(RawWindowHandle::Wayland(_)) => DisplayBackend::Wayland,
                 Ok(RawWindowHandle::Xcb(_)) | Ok(RawWindowHandle::Xlib(_)) => DisplayBackend::X11,
@@ -1015,7 +1107,7 @@ impl<'a> RenderContext<'a> {
     /// output via multiple `wl_output` globals. Monitors are considered identical if
     /// they share the same name, resolution, and desktop position.
     pub fn available_monitors(&self) -> Vec<MonitorInfo> {
-        let window = match &self.state.window {
+        let window = match self.state.target.present().and_then(|p| p.window.as_ref()) {
             Some(w) => w,
             None => return vec![],
         };
@@ -1036,6 +1128,8 @@ impl<'a> RenderContext<'a> {
     /// Get information about the primary monitor, if available.
     pub fn primary_monitor(&self) -> Option<MonitorInfo> {
         self.state
+            .target
+            .present()?
             .window
             .as_ref()?
             .primary_monitor()
@@ -1044,7 +1138,7 @@ impl<'a> RenderContext<'a> {
 
     /// Get all video modes for a monitor by index.
     pub fn video_modes(&self, monitor_index: usize) -> Vec<VideoModeInfo> {
-        let window = match &self.state.window {
+        let window = match self.state.target.present().and_then(|p| p.window.as_ref()) {
             Some(w) => w,
             None => return vec![],
         };
@@ -1067,7 +1161,7 @@ impl<'a> RenderContext<'a> {
 
     /// Get all video modes for the current monitor (the monitor the window is on).
     pub fn current_monitor_video_modes(&self) -> Vec<VideoModeInfo> {
-        let window = match &self.state.window {
+        let window = match self.state.target.present().and_then(|p| p.window.as_ref()) {
             Some(w) => w,
             None => return vec![],
         };
@@ -1088,8 +1182,14 @@ impl<'a> RenderContext<'a> {
     }
 
     /// Get the current window display mode.
+    /// The window display mode. Reports [`WindowMode::Windowed`] in a headless
+    /// session, which has no window at all.
     pub fn window_mode(&self) -> WindowMode {
-        self.state.window_mode
+        self.state
+            .target
+            .present()
+            .map(|p| p.window_mode)
+            .unwrap_or_default()
     }
 
     /// Change the window display mode at runtime.
@@ -1102,7 +1202,11 @@ impl<'a> RenderContext<'a> {
             warn!("set_window_mode(DirectDisplay) has no effect — use WindowMode::DirectDisplay in the builder");
             return;
         }
-        if let Some(w) = &self.state.window {
+        let Some(present) = self.state.target.present_mut() else {
+            warn!("set_window_mode() has no effect in a headless session");
+            return;
+        };
+        if let Some(w) = &present.window {
             let fullscreen = match mode {
                 WindowMode::Windowed => None,
                 WindowMode::DirectDisplay => unreachable!(),
@@ -1133,13 +1237,13 @@ impl<'a> RenderContext<'a> {
             // Auto-update cursor visibility if not explicitly overridden by config
             if self.config.cursor_visible.is_none() {
                 let visible = matches!(mode, WindowMode::Windowed);
-                self.state.cursor_visible = visible;
+                present.cursor_visible = visible;
                 w.set_cursor_visible(visible);
             }
         } else {
             warn!("set_window_mode() has no effect in DirectDisplay mode");
         }
-        self.state.window_mode = mode;
+        present.window_mode = mode;
     }
 }
 

@@ -75,23 +75,91 @@ impl RecordingState {
     }
 }
 
-/// Internal state that requires an active window
+/// Internal runtime state.
+///
+/// The fields here are the ones that exist in **every** mode: the GPU core
+/// (device, queue, renderer) plus session bookkeeping. Everything that only
+/// means something once frames reach a display lives in
+/// [`RenderTarget::Present`], and everything specific to rendering with no
+/// display lives in [`RenderTarget::Offscreen`]. That split is what lets one
+/// [`RenderContext`](super::render_context::RenderContext) — and therefore one
+/// experiment closure — drive both a windowed session and a headless
+/// regeneration of it.
 pub(super) struct VSEState {
-    pub(super) window: Option<Arc<Window>>, // None in DirectDisplay mode
     pub(super) device_selector: DeviceSelector,
     pub(super) device: Arc<vulkano::device::Device>,
     pub(super) queue: Arc<vulkano::device::Queue>,
+    pub(super) renderer: Renderer,
+    pub(super) clock: Clock,
+    pub(super) frame_number: u64,
+    pub(super) should_close: bool,
+    pub(super) input: InputState,
+    /// Optional data recording session.
+    pub(super) recording: Option<RecordingState>,
+    /// Where rendered frames go: a swapchain, or offscreen images + readback.
+    pub(super) target: RenderTarget,
+}
+
+/// Where this session's frames go.
+///
+/// Selecting a presentation-capable Vulkan device requires a surface, and a
+/// surface requires a window — so `Present` can only be built inside the
+/// windowing callback. `Offscreen` has no such constraint (any graphics queue
+/// will do) and is therefore constructed eagerly, before any run loop.
+pub(super) enum RenderTarget {
+    /// Boxed: the presentation target is an order of magnitude larger than the
+    /// offscreen one, and `VSEState` is moved during initialization.
+    Present(Box<PresentTarget>),
+    Offscreen(super::headless::OffscreenTarget),
+}
+
+impl RenderTarget {
+    pub(super) fn present(&self) -> Option<&PresentTarget> {
+        match self {
+            RenderTarget::Present(p) => Some(p),
+            RenderTarget::Offscreen(_) => None,
+        }
+    }
+
+    pub(super) fn present_mut(&mut self) -> Option<&mut PresentTarget> {
+        match self {
+            RenderTarget::Present(p) => Some(p),
+            RenderTarget::Offscreen(_) => None,
+        }
+    }
+
+    pub(super) fn offscreen_mut(&mut self) -> Option<&mut super::headless::OffscreenTarget> {
+        match self {
+            RenderTarget::Offscreen(o) => Some(o),
+            RenderTarget::Present(_) => None,
+        }
+    }
+
+    /// The presentation target on a code path only reachable while presenting.
+    ///
+    /// Panics headless, deliberately: the callers are the swapchain acquire /
+    /// present engine paths, which a headless flip never enters.
+    pub(super) fn present_expect(&self) -> &PresentTarget {
+        self.present()
+            .expect("presentation-only path reached with no swapchain")
+    }
+
+    pub(super) fn present_expect_mut(&mut self) -> &mut PresentTarget {
+        self.present_mut()
+            .expect("presentation-only path reached with no swapchain")
+    }
+}
+
+/// State that exists only when frames are presented to a display.
+pub(super) struct PresentTarget {
+    pub(super) window: Option<Arc<Window>>, // None in DirectDisplay mode
     pub(super) swapchain: SwapchainManager,
     #[allow(dead_code)]
     pub(super) frame_builder: FrameBuilder,
-    pub(super) renderer: Renderer,
-    pub(super) should_close: bool,
     pub(super) minimized: bool,
-    pub(super) input: InputState,
     pub(super) cursor_visible: bool,
     pub(super) window_mode: WindowMode,
     // Timing state
-    pub(super) clock: Clock,
     pub(super) timing_provider: Box<dyn TimingProvider>,
     /// Raw acquire/submit/present engine for the EXT present-timing path. `None` on the
     /// CPU-estimate path (which keeps using vulkano's present).
@@ -106,7 +174,6 @@ pub(super) struct VSEState {
     /// and looks them up by the confirming frame's `present_id` (see `build_confirmed_flip`).
     /// Pruned on lookup to stay bounded (present ids are monotonic).
     pub(super) scanout_by_present_id: std::collections::HashMap<u64, ScanoutFeedback>,
-    pub(super) frame_number: u64,
     pub(super) last_present_time: Option<Timestamp>,
     /// `IMAGE_FIRST_PIXEL_OUT` scanout time (present-stage-local ns) of the last frame confirmed
     /// with hardware feedback, for computing scanout-delta missed detection on the buffered path.
@@ -142,8 +209,6 @@ pub(super) struct VSEState {
     pub(super) display_size: (u32, u32),
     /// Which acquisition method succeeded, if in DirectDisplay mode.
     pub(super) acquired_display: Option<AcquisitionMethod>,
-    /// Optional data recording session.
-    pub(super) recording: Option<RecordingState>,
 
     // --- Buffered flip state (None/false when using synchronous run()) ---
     /// Transit slot: flip_with_payload() stores the payload here as a type-erased
@@ -297,23 +362,62 @@ fn update_refresh_auto_detection(
 }
 
 impl VSEState {
-    /// Recreate the swapchain from the current surface and notify the timing provider so it
-    /// refreshes any cached swapchain handle (a retired handle is UB to query).
+    /// Recreate the swapchain and refresh the renderer's depth attachments.
+    ///
+    /// Lives on `VSEState` rather than `PresentTarget` because it spans both:
+    /// the swapchain is presentation state, the depth images are the renderer's.
     pub(super) fn recreate_swapchain(&mut self, win_size: [u32; 2]) -> Result<(), VSEError> {
-        self.swapchain.recreate_from_surface(win_size)?;
-        self.renderer
-            .recreate_depth_attachments(self.swapchain.images().len(), self.swapchain.extent())?;
-        self.timing_provider
-            .on_swapchain_recreated(self.swapchain.swapchain());
+        let present = self.target.present_expect_mut();
+        present.swapchain.recreate_from_surface(win_size)?;
+        self.renderer.recreate_depth_attachments(
+            present.swapchain.images().len(),
+            present.swapchain.extent(),
+        )?;
+        present
+            .timing_provider
+            .on_swapchain_recreated(present.swapchain.swapchain());
         Ok(())
     }
 
+    pub(super) fn handle_winit_input(&mut self, event: &WindowEvent) {
+        match event {
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(key_code) = event.physical_key {
+                    self.input.handle_key(
+                        key_code,
+                        event.logical_key.clone(),
+                        event.state,
+                        self.clock.now(),
+                    );
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.input
+                    .handle_cursor_moved(position.x, position.y, self.clock.now());
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.input
+                    .handle_mouse_button((*button).into(), *state, self.clock.now());
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (*x as f64, *y as f64),
+                    MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
+                };
+                self.input.handle_mouse_wheel(dx, dy, self.clock.now());
+            }
+            _ => {}
+        }
+    }
+}
+
+impl PresentTarget {
     /// Per-flip clock maintenance: establish the scanout epoch on the first flip and, when the
     /// host-clock bridge is enabled, feed it a low-rate calibration sample. One calibrated read
     /// serves both. A no-op on the CPU-estimate path (the provider's sampler returns `None`).
-    pub(super) fn update_clocks(&mut self) {
+    pub(super) fn update_clocks(&mut self, clock: &Clock) {
         let need_epoch = self.scanout_clock.is_none();
-        let bridge_due = self.host_bridge.is_some() && self.bridge_sample_due();
+        let bridge_due = self.host_bridge.is_some() && self.bridge_sample_due(clock);
         if !need_epoch && !bridge_due {
             return;
         }
@@ -323,7 +427,7 @@ impl VSEState {
                 self.scanout_clock = Some(ScanoutClock::new(sample.stage_ns));
             }
             if bridge_due {
-                self.last_bridge_sample_ts = Some(self.clock.now());
+                self.last_bridge_sample_ts = Some(clock.now());
                 if let Some(bridge) = &mut self.host_bridge {
                     bridge.push(sample);
                 }
@@ -333,9 +437,9 @@ impl VSEState {
 
     /// Whether enough time has elapsed to take another bridge sample (~10 Hz), keeping the
     /// calibrated-timestamp read off the presentation hot path.
-    pub(super) fn bridge_sample_due(&self) -> bool {
+    pub(super) fn bridge_sample_due(&self, clock: &Clock) -> bool {
         const RESAMPLE_US: u64 = 100_000; // 100 ms
-        let now = self.clock.now().as_micros();
+        let now = clock.now().as_micros();
         self.last_bridge_sample_ts
             .map_or(true, |t| now.saturating_sub(t.as_micros()) >= RESAMPLE_US)
     }
@@ -488,37 +592,6 @@ impl VSEState {
         }
     }
 
-    pub(super) fn handle_winit_input(&mut self, event: &WindowEvent) {
-        match event {
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(key_code) = event.physical_key {
-                    self.input.handle_key(
-                        key_code,
-                        event.logical_key.clone(),
-                        event.state,
-                        self.clock.now(),
-                    );
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.input
-                    .handle_cursor_moved(position.x, position.y, self.clock.now());
-            }
-            WindowEvent::MouseInput { state, button, .. } => {
-                self.input
-                    .handle_mouse_button((*button).into(), *state, self.clock.now());
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let (dx, dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (*x as f64, *y as f64),
-                    MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
-                };
-                self.input.handle_mouse_wheel(dx, dy, self.clock.now());
-            }
-            _ => {}
-        }
-    }
-
     /// One-time guardrail note (per session) that scheduled presents are being software-paced,
     /// since hardware `targetTime` enforcement is driver-dependent and unverified at runtime.
     pub(super) fn note_scheduling_once(&mut self) {
@@ -565,7 +638,7 @@ impl VSEState {
     /// normally has), `present_time` is the real hardware scanout time (rebased to the scanout
     /// epoch) and missed detection uses the scanout delta; otherwise it falls back to CPU fence
     /// time. `timing_source` records which domain the value is in.
-    pub(super) fn build_confirmed_flip(&mut self, estimated: FlipInfo) -> FlipInfo {
+    pub(super) fn build_confirmed_flip(&mut self, clock: &Clock, estimated: FlipInfo) -> FlipInfo {
         // Look up this frame's confirmed scanout record by present_id, pruning consumed/past
         // entries (present ids are monotonic, so anything ≤ this id is no longer needed).
         let scanout = self.take_scanout_for(estimated.present_id);
@@ -589,7 +662,7 @@ impl VSEState {
         // guard; there is no separate field (see the B3 schema decision).
         let confirmed_present = scanout_ns
             .and_then(|ns| self.scanout_present_time(ns))
-            .unwrap_or_else(|| self.timing_provider.record_present_time(&self.clock));
+            .unwrap_or_else(|| self.timing_provider.record_present_time(clock));
 
         let cpu_frame_duration = self
             .last_present_time

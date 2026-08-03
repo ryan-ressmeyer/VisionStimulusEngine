@@ -158,6 +158,23 @@ pub fn capture_display_info(window: Option<&Window>) -> DisplayInfo {
     }
 }
 
+/// Describe a headless session's offscreen render target in the same slot a
+/// swapchain would occupy.
+///
+/// The color-space and present-mode strings say `n/a (headless)` rather than
+/// inventing values: there is no surface to negotiate a color space with and no
+/// presentation engine to have a mode. The format and extent are real, and they
+/// are what a regeneration must match.
+pub fn capture_offscreen_info(format: vulkano::format::Format, extent: [u32; 2]) -> SwapchainInfo {
+    SwapchainInfo {
+        image_format: format!("{format:?}"),
+        color_space: "n/a (headless)".to_string(),
+        present_mode: "n/a (headless)".to_string(),
+        image_count: 1,
+        extent,
+    }
+}
+
 /// Capture negotiated swapchain state
 pub fn capture_swapchain_info(swapchain_manager: &SwapchainManager) -> SwapchainInfo {
     let swapchain = swapchain_manager.swapchain();
@@ -318,7 +335,7 @@ pub fn capture_host_info(
     physical_device: &Arc<PhysicalDevice>,
     device: &Arc<Device>,
     window: Option<&Window>,
-    swapchain_manager: &SwapchainManager,
+    render_target: SwapchainInfo,
     config: &VSEConfig,
     observed: ObservedPresentTiming,
 ) -> HostInfo {
@@ -352,7 +369,7 @@ pub fn capture_host_info(
         gpu: capture_gpu_info(physical_device),
         timing,
         display: capture_display_info(window),
-        swapchain: capture_swapchain_info(swapchain_manager),
+        swapchain: render_target,
         pipeline: capture_pipeline_config(config),
         build: BuildInfo::from_compile_time(),
         runtime: capture_runtime_env(),

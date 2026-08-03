@@ -1099,6 +1099,32 @@ impl Renderer {
             clear_color,
             viewport_extent,
             None,
+            None,
+        )
+    }
+
+    /// Like [`render`](Self::render), but appends a copy of the finished image
+    /// into `readback` — the headless (offscreen) path.
+    ///
+    /// The copy is recorded *after* every draw, in the same command buffer, so
+    /// it cannot perturb what was rendered: the drawing commands recorded here
+    /// are the same ones a windowed session records. That identity is the whole
+    /// point of reusing this function rather than writing a parallel one.
+    pub fn render_to_offscreen(
+        &mut self,
+        target_image: Arc<Image>,
+        image_index: usize,
+        clear_color: [f32; 4],
+        viewport_extent: [u32; 2],
+        readback: &Subbuffer<[u8]>,
+    ) -> Result<Arc<PrimaryAutoCommandBuffer>, RendererError> {
+        self.render_with_underlay(
+            target_image,
+            image_index,
+            clear_color,
+            viewport_extent,
+            None,
+            Some(readback),
         )
     }
 
@@ -1121,6 +1147,7 @@ impl Renderer {
         clear_color: [f32; 4],
         viewport_extent: [u32; 2],
         underlay: Option<&ExternalUnderlay>,
+        readback: Option<&Subbuffer<[u8]>>,
     ) -> Result<Arc<PrimaryAutoCommandBuffer>, RendererError> {
         let image_view = ImageView::new_default(target_image.clone())
             .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
@@ -1708,6 +1735,17 @@ impl Renderer {
         builder
             .end_rendering()
             .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+
+        // Headless readback: every draw is already recorded, so this copy sees
+        // the finished frame and cannot alter it.
+        if let Some(readback) = readback {
+            builder
+                .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+                    target_image.clone(),
+                    readback.clone(),
+                ))
+                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+        }
 
         let command_buffer = builder
             .build()

@@ -497,12 +497,27 @@ impl DeviceSelector {
             info!("VK_EXT_present_timing not available; using CPU-estimate timing");
         }
 
-        // Standard vulkano device (CPU-estimate timing path).
+        let (device, queue) = self.create_standard_device()?;
+        Ok((device, queue, None))
+    }
+
+    /// Create a plain logical device with no present-timing extensions.
+    ///
+    /// This is the fallback for [`create_device`](Self::create_device) and the
+    /// only path headless rendering takes: with no swapchain there is nothing
+    /// for `VK_EXT_present_timing` to time, so requesting it would add a
+    /// failure mode for no benefit.
+    ///
+    /// `khr_swapchain` is enabled only when the instance was created with
+    /// surface support: it is meaningless without a surface, and requesting it
+    /// on a surfaceless instance is a validation error, which is exactly the
+    /// headless case.
+    pub fn create_standard_device(&self) -> Result<(Arc<Device>, Arc<Queue>), DeviceError> {
         // Enable calibrated timestamps when available so the timing-capabilities probe can
         // measure CPU<->GPU clock correlation even without present-timing.
         let supported = self.physical_device.supported_extensions();
         let device_extensions = DeviceExtensions {
-            khr_swapchain: true,
+            khr_swapchain: self.instance.enabled_extensions().khr_surface,
             khr_dynamic_rendering: true,
             ext_calibrated_timestamps: supported.ext_calibrated_timestamps,
             ..DeviceExtensions::empty()
@@ -531,7 +546,7 @@ impl DeviceSelector {
 
         info!("Logical device created successfully");
 
-        Ok((device, queue, None))
+        Ok((device, queue))
     }
 }
 
