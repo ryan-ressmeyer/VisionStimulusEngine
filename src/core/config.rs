@@ -336,6 +336,15 @@ impl VSEContextBuilder {
     ///
     /// Returns `VSEError` if initialization fails.
     pub fn build(self) -> Result<VSEContext, VSEError> {
+        // Reject an unrenderable pipeline suite here, at the earliest point it
+        // is knowable. `Renderer::new` validates too, but it does not run until
+        // the event loop starts — and a suite that renders a stimulus wrongly
+        // must never get as far as a session that could record data.
+        self.config
+            .pipeline_suite
+            .validate()
+            .map_err(RendererError::from)?;
+
         // Skip winit EventLoop creation in DirectDisplay mode — no compositor is present
         // (e.g. bare TTY), so EventLoop::new() would fail immediately.
         let event_loop = if self.config.window_mode == WindowMode::DirectDisplay {
@@ -360,5 +369,47 @@ impl VSEContextBuilder {
 impl Default for VSEContextBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drawing::{BuiltinPipeline, SuiteError};
+
+    // These build in DirectDisplay mode, which skips winit `EventLoop`
+    // creation, so they run without a display server.
+
+    #[test]
+    fn building_with_a_half_configured_additive_gabor_suite_fails_immediately() {
+        // The suite must be rejected at construction. Deferring to the first
+        // draw would mean a session that records data while presenting a
+        // stimulus at half its signed modulation.
+        let result = VSEContext::builder()
+            .with_window_mode(WindowMode::DirectDisplay)
+            .with_pipelines(PipelineSuite::default().without(BuiltinPipeline::SubtractiveGabor))
+            .build();
+
+        // `VSEContext` is not `Debug`, so match rather than `expect_err`.
+        let Err(err) = result else {
+            panic!("an unpaired additive-Gabor pass must not reach a running session");
+        };
+        assert!(matches!(
+            err,
+            VSEError::Renderer(RendererError::Suite(SuiteError::UnpairedGaborPass))
+        ));
+    }
+
+    #[test]
+    fn building_with_a_valid_suite_succeeds() {
+        let result = VSEContext::builder()
+            .with_window_mode(WindowMode::DirectDisplay)
+            .with_pipelines(PipelineSuite::minimal().with(BuiltinPipeline::Dot))
+            .build();
+
+        assert!(
+            result.is_ok(),
+            "a suite with neither additive-Gabor pass is valid"
+        );
     }
 }

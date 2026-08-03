@@ -5,6 +5,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use vulkano::{
+    buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
+    buffer::BufferContents,
     buffer::Subbuffer,
     buffer::{Buffer, BufferCreateInfo, BufferUsage},
     command_buffer::{
@@ -49,7 +51,8 @@ use vulkano::{
 };
 
 use super::pipeline::{
-    ErasedStimulusPipeline, PipelineBuildCtx, PipelineError, RecordCtx, StimulusPipeline,
+    ErasedStimulusPipeline, PipelineBuildCtx, PipelineError, RecordCtx, RegisteredEntry,
+    RegisteredPipeline, RegistryId, StimulusPipeline,
 };
 use super::primitives::{
     arc_vertices, circle_vertices, dot_unit_quad_vertices, line_vertices, rect_vertices,
@@ -72,73 +75,118 @@ use super::vertex::{DotInstance, TexturedVertex, Vertex2D, Vertex3D};
 
 const MESH_FRONT_FACE: FrontFace = FrontFace::CounterClockwise;
 
-/// Whether a queued 2D draw uses the coalescing flat-color pipeline
-/// (`Rect`/`Circle`/`Line`/`Arc`) or records on its own like every other
-/// primitive. Used to plan call-order compositing without a Vulkan device.
+/// What a queued 2D draw coalesces with, if anything.
+///
+/// Two draws merge into one segment only when their kinds are equal AND
+/// adjacent, which is what keeps call-order compositing intact: anything drawn
+/// between them splits the run. Used to plan without a Vulkan device.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum DrawKind {
+    /// `Rect`/`Circle`/`Line`/`Arc` — share the flat-color pipeline, so a run
+    /// of them becomes one vertex buffer and one draw.
     Flat,
-    NonFlat,
+    /// A Tier 1 registered draw, tagged with its pipeline id. Consecutive draws
+    /// to the same pipeline reach `record` as one command slice.
+    Registered(u64),
+    /// Everything else records on its own: each carries per-draw push constants
+    /// or descriptor sets that cannot merge into a neighbor's draw call.
+    Other,
 }
 
 /// One unit of the ordered 2D render plan produced by [`plan_render_segments`].
 ///
-/// Either a run of consecutive flat-color commands coalesced into a single flat
-/// draw, or a single non-flat command recorded on its own. In both cases the
-/// indices refer to positions in the ordered `draw_commands` queue.
+/// Indices refer to positions in the ordered `draw_commands` queue, and the
+/// segments partition those indices exactly — every command is recorded once.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum RenderSegment {
     /// Consecutive flat-color commands `[start, end)`, coalesced into one draw.
     FlatRun { start: usize, end: usize },
-    /// A single non-flat command at this index.
+    /// Consecutive registered draws `[start, end)` for pipeline `id`, handed to
+    /// its `record` as a single command slice.
+    RegisteredRun { id: u64, start: usize, end: usize },
+    /// A command that records on its own.
     Single(usize),
 }
 
-/// Classify a draw command as flat-color (coalescing) or not.
+/// Classify a draw command by what it can coalesce with.
 fn draw_kind(cmd: &DrawCommand) -> DrawKind {
     match cmd {
         DrawCommand::Rect { .. }
         | DrawCommand::Circle { .. }
         | DrawCommand::Line { .. }
         | DrawCommand::Arc { .. } => DrawKind::Flat,
+        DrawCommand::Registered { id, .. } => DrawKind::Registered(*id),
         DrawCommand::Texture { .. }
         | DrawCommand::Noise { .. }
         | DrawCommand::Grating { .. }
         | DrawCommand::Gabor { .. }
         | DrawCommand::Dots { .. }
-        | DrawCommand::Custom(_)
-        | DrawCommand::Registered { .. } => DrawKind::NonFlat,
+        | DrawCommand::Custom(_) => DrawKind::Other,
     }
 }
 
-/// Partition ordered draw kinds into the call-order render plan: each maximal
-/// run of consecutive `Flat` commands becomes one [`RenderSegment::FlatRun`],
-/// and every `NonFlat` command becomes its own [`RenderSegment::Single`], with
-/// call order preserved. Pure and device-free — the regression net for
-/// call-order compositing (see `docs/design/pipeline-flexibility.md` §4-5).
+/// Partition ordered draw kinds into the call-order render plan.
+///
+/// Each maximal run of consecutive equal coalescing kinds becomes one segment —
+/// a [`FlatRun`](RenderSegment::FlatRun) for flat-color commands, a
+/// [`RegisteredRun`](RenderSegment::RegisteredRun) for draws sharing one user
+/// pipeline — and every other command becomes its own
+/// [`Single`](RenderSegment::Single). Call order is preserved throughout, so a
+/// draw issued between two coalescable ones splits them rather than being
+/// reordered around: layering outranks batching.
+///
+/// Pure and device-free: this is the regression net for call-order compositing
+/// (see `docs/design/pipeline-flexibility.md` §4-5).
 fn plan_render_segments(kinds: &[DrawKind]) -> Vec<RenderSegment> {
-    let mut segments = Vec::new();
-    let mut run_start: Option<usize> = None;
-    for (i, kind) in kinds.iter().enumerate() {
+    /// Close an open run of `kind` spanning `[start, end)`.
+    fn flush(segments: &mut Vec<RenderSegment>, kind: DrawKind, start: usize, end: usize) {
         match kind {
-            DrawKind::Flat => {
-                run_start.get_or_insert(i);
+            DrawKind::Flat => segments.push(RenderSegment::FlatRun { start, end }),
+            DrawKind::Registered(id) => {
+                segments.push(RenderSegment::RegisteredRun { id, start, end })
             }
-            DrawKind::NonFlat => {
-                if let Some(start) = run_start.take() {
-                    segments.push(RenderSegment::FlatRun { start, end: i });
-                }
-                segments.push(RenderSegment::Single(i));
+            // `Other` is emitted as a `Single` directly and never opens a run.
+            DrawKind::Other => unreachable!("non-coalescing draws never open a run"),
+        }
+    }
+
+    let mut segments = Vec::new();
+    let mut open: Option<(DrawKind, usize)> = None;
+
+    for (i, &kind) in kinds.iter().enumerate() {
+        // An open run continues only while the kind is unchanged.
+        if let Some((open_kind, start)) = open {
+            if open_kind != kind {
+                flush(&mut segments, open_kind, start, i);
+                open = None;
+            }
+        }
+        match kind {
+            DrawKind::Other => segments.push(RenderSegment::Single(i)),
+            _ => {
+                open.get_or_insert((kind, i));
             }
         }
     }
-    if let Some(start) = run_start.take() {
-        segments.push(RenderSegment::FlatRun {
-            start,
-            end: kinds.len(),
-        });
+
+    if let Some((kind, start)) = open {
+        flush(&mut segments, kind, start, kinds.len());
     }
     segments
+}
+
+/// Move a frame's queued draws into the reusable recording scratch.
+///
+/// Both allocations survive: `queue` is drained (not replaced), and `scratch` is
+/// cleared and refilled in place. This runs once per frame on the presentation
+/// path, so handing either allocation back to the allocator would mean growing
+/// it again from zero on the very next frame.
+///
+/// The scratch holds `Option<DrawCommand>` because recording moves commands out
+/// — a `Custom` hook is `FnOnce` and must be owned to be called.
+fn take_queue_into(scratch: &mut Vec<Option<DrawCommand>>, queue: &mut Vec<DrawCommand>) {
+    scratch.clear();
+    scratch.extend(queue.drain(..).map(Some));
 }
 
 fn additive_gabor_blend() -> AttachmentBlend {
@@ -247,7 +295,11 @@ mod mesh_normals_fs {
 /// each pipeline by identity rather than by a named `Renderer` field, which is
 /// the prerequisite for later suite-subselection and user-registered pipelines
 /// (see `docs/design/pipeline-flexibility.md`).
+///
+/// Marked `#[non_exhaustive]`: VSE may ship further built-ins, and adding one
+/// must not break user code that matches on this enum.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
 pub enum BuiltinPipeline {
     FlatColor,
     Textured,
@@ -257,6 +309,45 @@ pub enum BuiltinPipeline {
     SubtractiveGabor,
     Dot,
     MeshNormals,
+}
+
+impl BuiltinPipeline {
+    /// Stable name for this key, used for logging and for the pipeline set
+    /// recorded into [`HostInfo`](crate::host::HostInfo).
+    ///
+    /// These strings are part of the recorded experiment metadata that
+    /// post-hoc stimulus regeneration reads back, so they must stay stable
+    /// across VSE versions even if the enum variants are renamed.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::FlatColor => "FlatColor",
+            Self::Textured => "Textured",
+            Self::Grating => "Grating",
+            Self::Gabor => "Gabor",
+            Self::AdditiveGabor => "AdditiveGabor",
+            Self::SubtractiveGabor => "SubtractiveGabor",
+            Self::Dot => "Dot",
+            Self::MeshNormals => "MeshNormals",
+        }
+    }
+}
+
+/// A [`PipelineSuite`] that cannot render correctly as configured.
+///
+/// Surfaced at context construction, before any stimulus is presented — a
+/// misconfigured suite must never reach the point of recording data.
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum SuiteError {
+    /// [`BuiltinPipeline::AdditiveGabor`] and
+    /// [`BuiltinPipeline::SubtractiveGabor`] are the two halves of one
+    /// stimulus and must be selected together.
+    #[error(
+        "PipelineSuite selects only one half of the additive-Gabor stimulus: \
+         AdditiveGabor and SubtractiveGabor are the positive-add and \
+         negative-subtract passes of a single draw, and building one without \
+         the other renders half the signed modulation. Select both, or neither"
+    )]
+    UnpairedGaborPass,
 }
 
 /// The set of built-in pipelines to build for a session.
@@ -312,6 +403,51 @@ impl PipelineSuite {
     /// Whether the suite is empty.
     pub fn is_empty(&self) -> bool {
         self.enabled.is_empty()
+    }
+
+    /// Check that the suite can render every stimulus it claims to support.
+    ///
+    /// Called during context construction, so a misconfigured suite fails
+    /// before the first frame rather than degrading a stimulus mid-session.
+    ///
+    /// # Errors
+    ///
+    /// [`SuiteError::UnpairedGaborPass`] if exactly one of
+    /// [`BuiltinPipeline::AdditiveGabor`] / [`BuiltinPipeline::SubtractiveGabor`]
+    /// is selected. Signed modulation cannot survive a normalized swapchain
+    /// format in one pass, so `draw_gabor_additive` splits into a positive-add
+    /// and a negative-magnitude-subtract pass. With only one of them built, the
+    /// stimulus renders at half its signed modulation — wrong, but plausible
+    /// enough to go unnoticed.
+    pub fn validate(&self) -> Result<(), SuiteError> {
+        if self.contains(BuiltinPipeline::AdditiveGabor)
+            != self.contains(BuiltinPipeline::SubtractiveGabor)
+        {
+            return Err(SuiteError::UnpairedGaborPass);
+        }
+        Ok(())
+    }
+
+    /// Whether this suite needs depth attachments.
+    ///
+    /// Only [`BuiltinPipeline::MeshNormals`] renders with depth. Without it,
+    /// the renderer skips selecting a depth format and allocating one
+    /// full-resolution depth image per swapchain image.
+    pub fn needs_depth(&self) -> bool {
+        self.contains(BuiltinPipeline::MeshNormals)
+    }
+
+    /// The suite's keys as stable, sorted names.
+    ///
+    /// Sorted because the backing [`HashSet`] iterates in a nondeterministic
+    /// order, and this list is recorded into
+    /// [`HostInfo`](crate::host::HostInfo) as part of the metadata that
+    /// post-hoc stimulus regeneration reads back. It must be identical across
+    /// runs of the same configuration.
+    pub fn key_names(&self) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = self.enabled.iter().map(|key| key.name()).collect();
+        names.sort_unstable();
+        names
     }
 }
 
@@ -386,6 +522,51 @@ fn builtin_pipeline_descriptors() -> [BuiltinPipelineDescriptor; 8] {
     ]
 }
 
+/// Tally of draws that rendered nothing because their pipeline was absent.
+///
+/// Two jobs in one place. It decides when to log — the first skip of a kind
+/// warns, later ones stay quiet so a 60 Hz loop cannot flood the log — and it
+/// keeps counting after it stops warning, so an experimenter can ask after the
+/// session whether any frame was missing a stimulus. Silence in the log must
+/// not be mistaken for nothing having gone wrong.
+#[derive(Default, Debug)]
+pub(crate) struct SkippedDraws {
+    builtin: HashMap<BuiltinPipeline, u64>,
+    registered: HashMap<u64, u64>,
+}
+
+impl SkippedDraws {
+    /// Tally a skipped built-in draw. Returns `true` only on the first skip of
+    /// this kind, which the caller uses to warn once.
+    fn record_builtin(&mut self, key: BuiltinPipeline) -> bool {
+        let count = self.builtin.entry(key).or_insert(0);
+        *count += 1;
+        *count == 1
+    }
+
+    /// Tally a skipped Tier 1 registered draw. Returns `true` only on the first
+    /// skip for this pipeline id.
+    fn record_registered(&mut self, id: u64) -> bool {
+        let count = self.registered.entry(id).or_insert(0);
+        *count += 1;
+        *count == 1
+    }
+
+    /// Total draws skipped this session, built-in and registered.
+    pub(crate) fn total(&self) -> u64 {
+        self.builtin.values().chain(self.registered.values()).sum()
+    }
+
+    /// Per-kind built-in skip counts, sorted by key name so the report is
+    /// reproducible across runs (the backing map iterates nondeterministically).
+    pub(crate) fn builtin_counts(&self) -> Vec<(BuiltinPipeline, u64)> {
+        let mut counts: Vec<(BuiltinPipeline, u64)> =
+            self.builtin.iter().map(|(k, v)| (*k, *v)).collect();
+        counts.sort_unstable_by_key(|(key, _)| key.name());
+        counts
+    }
+}
+
 /// The built graphics pipelines, keyed by [`BuiltinPipeline`].
 ///
 /// Owns the `Arc<GraphicsPipeline>`s that used to live in named `Renderer`
@@ -455,6 +636,9 @@ pub enum RendererError {
 
     #[error("Failed to create depth attachments: {0}")]
     DepthCreationFailed(String),
+
+    #[error(transparent)]
+    Suite(#[from] SuiteError),
 }
 
 /// GPU resources for a loaded texture.
@@ -501,22 +685,6 @@ struct TextureResources {
 /// [`swapchain()`]: crate::prelude::RenderContext::swapchain
 pub type FrameRecorder = AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>;
 
-/// Per-frame context handed to a [`RenderContext::draw_custom`] closure
-/// alongside the [`FrameRecorder`].
-///
-/// A struct (not a bare tuple) so fields can be added later without breaking
-/// existing custom-draw closures.
-///
-/// [`RenderContext::draw_custom`]: crate::prelude::RenderContext::draw_custom
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct CustomFrameContext {
-    /// The framebuffer extent (in pixels) VSE used for this frame's built-in
-    /// passes. The dynamic viewport is already set to cover this extent when
-    /// the closure runs, so custom pipelines using dynamic viewport state need
-    /// not set it themselves.
-    pub viewport_extent: [u32; 2],
-}
-
 /// The Renderer manages graphics pipelines and converts draw commands
 /// into GPU command buffers.
 pub(crate) struct Renderer {
@@ -527,8 +695,28 @@ pub(crate) struct Renderer {
     descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
 
     pipelines: Pipelines,
+    /// Arena allocator for per-frame streaming vertex data.
+    ///
+    /// Every 2D draw uploads a small vertex or instance buffer that lives for
+    /// exactly one frame. Creating a fresh `Buffer` for each meant a
+    /// `vkCreateBuffer` + `vkBindBufferMemory` + deferred destroy per draw, per
+    /// frame, on the presentation path. This suballocates them all from a
+    /// pooled arena instead: in steady state no Vulkan buffer is created at all.
+    ///
+    /// Arenas return to the pool once every subbuffer cut from them is dropped,
+    /// and the command buffer holds its subbuffers until the GPU is done — so
+    /// reuse is already gated on frame completion, with no manual
+    /// frames-in-flight bookkeeping.
+    ///
+    /// Streaming only. Data that outlives a frame (the dot unit quad, mesh
+    /// vertex/index buffers) stays in its own device-local `Buffer`.
+    vertex_allocator: SubbufferAllocator,
     dot_quad_buffer: Subbuffer<[DotInstance]>,
     depth_format: Format,
+    /// Whether the active suite includes a depth-using pipeline. When false,
+    /// `depth_views` stays empty and no depth images are allocated (one
+    /// full-resolution image per swapchain image is not free).
+    needs_depth: bool,
     depth_views: Vec<Arc<ImageView>>,
 
     textures: HashMap<u64, TextureResources>,
@@ -540,12 +728,18 @@ pub(crate) struct Renderer {
     draw_commands_3d: Vec<DrawCommand3D>,
     flat_vertex_scratch: Vec<Vertex2D>,
     dot_instance_scratch: Vec<DotInstance>,
+    /// Reusable per-frame recording buffers. Held on `self` so their
+    /// allocations survive between frames instead of being rebuilt on the
+    /// presentation path; swapped out for the duration of `render` so the
+    /// built-in draw arms can still borrow `self` mutably.
+    command_scratch: Vec<Option<DrawCommand>>,
+    kind_scratch: Vec<DrawKind>,
 
-    /// Built-in pipeline kinds already warned about as absent from the suite.
-    /// Interior-mutable so the warn-once check works inside the render loops,
-    /// which borrow `self` immutably. Ensures we warn once per kind, not once
-    /// per frame.
-    warned_absent_pipelines: RefCell<HashSet<BuiltinPipeline>>,
+    /// Draws that rendered nothing because their pipeline was absent. Warns
+    /// once per kind and keeps counting thereafter, so a quiet log is not
+    /// mistaken for a clean session. Interior-mutable because the render loops
+    /// reach it while holding `self` immutably.
+    skipped_draws: RefCell<SkippedDraws>,
 
     /// User-registered Tier 1 pipelines, keyed by the id handed back in a
     /// [`RegisteredPipeline`](super::pipeline::RegisteredPipeline). Type-erased
@@ -554,10 +748,11 @@ pub(crate) struct Renderer {
     registered: HashMap<u64, Box<dyn ErasedStimulusPipeline>>,
     /// Next id to assign on [`register`](Self::register).
     next_registered_id: u64,
-    /// Registered pipeline ids already warned about as absent (a handle whose
-    /// pipeline is missing — should not happen for a valid handle). Warn-once,
-    /// like `warned_absent_pipelines`.
-    warned_absent_registered: RefCell<HashSet<u64>>,
+    /// Identifies this registry, so a [`RegisteredPipeline`] handle issued
+    /// elsewhere is rejected instead of resolving to an unrelated pipeline.
+    ///
+    /// [`RegisteredPipeline`]: super::pipeline::RegisteredPipeline
+    registry_id: RegistryId,
 }
 
 impl Renderer {
@@ -578,11 +773,34 @@ impl Renderer {
             StandardDescriptorSetAllocator::new(device.clone(), Default::default()),
         );
 
+        // Reject a suite that cannot render a stimulus correctly BEFORE any
+        // GPU resources are built, so a misconfiguration fails at startup
+        // rather than degrading a stimulus once data collection is underway.
+        suite.validate()?;
+
+        let vertex_allocator = SubbufferAllocator::new(
+            memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: BufferUsage::VERTEX_BUFFER,
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+        );
+
         let dot_quad_buffer = Self::create_dot_quad_buffer(memory_allocator.clone())?;
+        // The format query is a cheap `format_properties` call with no
+        // allocation, so it stays unconditional — `PipelineBuildCtx` exposes it
+        // to user pipelines that opt into a depth attachment of their own. Only
+        // the depth *images* are gated on the suite.
         let depth_format = Self::select_depth_format(&device)?;
         let pipelines = Pipelines::new(&device, swapchain_format, depth_format, suite)?;
-        let depth_views =
-            Self::create_depth_views(memory_allocator.clone(), depth_format, image_count, extent)?;
+        let needs_depth = suite.needs_depth();
+        let depth_views = if needs_depth {
+            Self::create_depth_views(memory_allocator.clone(), depth_format, image_count, extent)?
+        } else {
+            Vec::new()
+        };
 
         Ok(Self {
             device,
@@ -591,8 +809,10 @@ impl Renderer {
             memory_allocator,
             descriptor_set_allocator,
             pipelines,
+            vertex_allocator,
             dot_quad_buffer,
             depth_format,
+            needs_depth,
             depth_views,
             textures: HashMap::new(),
             models: HashMap::new(),
@@ -602,10 +822,12 @@ impl Renderer {
             draw_commands_3d: Vec::with_capacity(16),
             flat_vertex_scratch: Vec::new(),
             dot_instance_scratch: Vec::new(),
-            warned_absent_pipelines: RefCell::new(HashSet::new()),
+            command_scratch: Vec::new(),
+            kind_scratch: Vec::new(),
+            skipped_draws: RefCell::new(SkippedDraws::default()),
             registered: HashMap::new(),
             next_registered_id: 0,
-            warned_absent_registered: RefCell::new(HashSet::new()),
+            registry_id: RegistryId::next(),
         })
     }
 
@@ -617,53 +839,106 @@ impl Renderer {
     /// `color_format` is the swapchain color format (the renderer does not store
     /// it); it and `self.depth_format` are handed to the pipeline's
     /// [`PipelineBuildCtx`] so it can create pipelines matching VSE's passes.
-    pub fn register(
+    pub fn register<P: StimulusPipeline>(
         &mut self,
-        mut pipeline: impl StimulusPipeline,
+        pipeline: P,
         color_format: Format,
-    ) -> Result<u64, PipelineError> {
+    ) -> Result<RegisteredPipeline<P::Command>, PipelineError> {
         let cx = PipelineBuildCtx {
             device: &self.device,
             color_format,
             depth_format: self.depth_format,
             memory_allocator: &self.memory_allocator,
         };
-        pipeline.build(&cx)?;
+        let resources = pipeline.build(&cx)?;
         let id = self.next_registered_id;
         self.next_registered_id = self.next_registered_id.wrapping_add(1);
-        self.registered.insert(id, Box::new(pipeline));
-        Ok(id)
+        self.registered.insert(
+            id,
+            Box::new(RegisteredEntry {
+                pipeline,
+                resources,
+            }),
+        );
+        Ok(RegisteredPipeline::new(self.registry_id, id))
+    }
+
+    /// Drop a registered pipeline and its GPU resources.
+    ///
+    /// Registering per trial without this leaks a `GraphicsPipeline` per
+    /// registration for the life of the session. Returns whether a pipeline was
+    /// actually removed.
+    pub fn unregister<C: 'static>(&mut self, handle: RegisteredPipeline<C>) -> bool {
+        if !handle.belongs_to(self.registry_id) {
+            return false;
+        }
+        self.registered.remove(&handle.id()).is_some()
     }
 
     /// Enqueue a Tier 1 registered draw: pushes a [`DrawCommand::Registered`]
     /// carrying the type-erased `Command` payload, so it composites in call
     /// order interleaved with the built-in draws queued around it.
-    pub fn push_registered(&mut self, id: u64, payload: Box<dyn std::any::Any>) {
-        self.draw_commands
-            .push(DrawCommand::Registered { id, payload });
+    ///
+    /// # Errors
+    ///
+    /// [`PipelineError::ForeignHandle`] if the handle came from another VSE
+    /// context, whose ids mean nothing here.
+    pub fn push_registered<C: 'static>(
+        &mut self,
+        handle: RegisteredPipeline<C>,
+        command: C,
+    ) -> Result<(), PipelineError> {
+        if !handle.belongs_to(self.registry_id) {
+            return Err(PipelineError::ForeignHandle);
+        }
+        self.draw_commands.push(DrawCommand::Registered {
+            id: handle.id(),
+            payload: Box::new(command),
+        });
+        Ok(())
     }
 
-    /// Warn once (per id) that a registered draw was skipped because no pipeline
-    /// is registered under its id. Defensive: a valid handle always resolves.
+    /// Tally a registered draw skipped because no pipeline is registered under
+    /// its id, logging on the first occurrence. Defensive: a valid handle
+    /// always resolves.
     fn warn_absent_registered(&self, id: u64) {
-        if self.warned_absent_registered.borrow_mut().insert(id) {
-            tracing::warn!(
+        if self.skipped_draws.borrow_mut().record_registered(id) {
+            tracing::error!(
                 "skipping registered draw: no pipeline registered under id {id} \
-                 (was register_pipeline called on this VSE context?)"
+                 (was register_pipeline called on this VSE context?). \
+                 This and any further skips are counted in skipped_draws()"
             );
         }
     }
 
-    /// Warn once (per pipeline kind) that a queued draw was skipped because its
-    /// built-in pipeline is not in the active [`PipelineSuite`].
+    /// Tally a draw skipped because its built-in pipeline is not in the active
+    /// [`PipelineSuite`], logging on the first occurrence per kind.
+    ///
+    /// Logged at ERROR, not WARN: the frame presented without a stimulus the
+    /// experiment asked for. Subsequent skips are silent but still counted —
+    /// see [`skipped_draws`](Self::skipped_draws).
     fn warn_absent_pipeline(&self, key: BuiltinPipeline) {
-        if self.warned_absent_pipelines.borrow_mut().insert(key) {
-            tracing::warn!(
-                "skipping draw: built-in pipeline {key:?} is not in the active PipelineSuite; \
-                 add it with `.with_pipelines(PipelineSuite::default())` or \
-                 `PipelineSuite::...with(BuiltinPipeline::{key:?})`"
+        if self.skipped_draws.borrow_mut().record_builtin(key) {
+            tracing::error!(
+                "skipping draw: built-in pipeline {key:?} is not in the active PipelineSuite, \
+                 so this stimulus rendered NOTHING; add it with \
+                 `.with_pipelines(PipelineSuite::default())` or \
+                 `PipelineSuite::...with(BuiltinPipeline::{key:?})`. \
+                 Further skips of this kind are silent but counted in skipped_draws()"
             );
         }
+    }
+
+    /// Per-kind counts of draws that rendered nothing because their built-in
+    /// pipeline was absent, sorted by key name. Empty when every queued draw
+    /// found its pipeline.
+    pub(crate) fn skipped_builtin_counts(&self) -> Vec<(BuiltinPipeline, u64)> {
+        self.skipped_draws.borrow().builtin_counts()
+    }
+
+    /// Total draws skipped this session, built-in and registered.
+    pub(crate) fn skipped_draw_total(&self) -> u64 {
+        self.skipped_draws.borrow().total()
     }
 
     /// Push a draw command onto the queue.
@@ -750,6 +1025,9 @@ impl Renderer {
         image_count: usize,
         extent: [u32; 2],
     ) -> Result<(), RendererError> {
+        if !self.needs_depth {
+            return Ok(());
+        }
         self.depth_views = Self::create_depth_views(
             self.memory_allocator.clone(),
             self.depth_format,
@@ -757,6 +1035,29 @@ impl Renderer {
             extent,
         )?;
         Ok(())
+    }
+
+    /// Suballocate a per-frame vertex/instance buffer from the arena and fill
+    /// it with `data`.
+    ///
+    /// Replaces a per-draw `Buffer::from_iter`. Generic over the vertex type,
+    /// so one arena serves flat vertices, textured quads, and dot instances
+    /// alike. `data` must be non-empty — a zero-length draw is skipped by its
+    /// caller's degenerate-input guard before reaching here.
+    fn upload_vertices<T>(&self, data: &[T]) -> Result<Subbuffer<[T]>, RendererError>
+    where
+        T: BufferContents + Copy,
+    {
+        debug_assert!(!data.is_empty(), "callers guard against empty vertex data");
+        let buffer = self
+            .vertex_allocator
+            .allocate_slice::<T>(data.len() as u64)
+            .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
+        buffer
+            .write()
+            .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?
+            .copy_from_slice(data);
+        Ok(buffer)
     }
 
     /// The renderer's device memory allocator (for callers that need to create
@@ -839,7 +1140,21 @@ impl Renderer {
             depth_range: 0.0..=1.0,
         };
 
-        if !self.draw_commands_3d.is_empty() {
+        // Resolve the mesh pipeline ONCE, before opening the 3D pass. Checking
+        // it per instance (as this used to) both re-warned on every mesh and
+        // forced the depth attachment to exist even when the pipeline was
+        // absent from the suite. Cloned out of `self.pipelines` so the borrow
+        // ends before the `&mut builder` recording below.
+        let mesh_normals_pipeline = self
+            .pipelines
+            .get_opt(BuiltinPipeline::MeshNormals)
+            .cloned();
+        if !self.draw_commands_3d.is_empty() && mesh_normals_pipeline.is_none() {
+            self.warn_absent_pipeline(BuiltinPipeline::MeshNormals);
+        }
+        if let (false, Some(mesh_normals_pipeline)) =
+            (self.draw_commands_3d.is_empty(), mesh_normals_pipeline)
+        {
             let depth_view = self.depth_views.get(image_index).cloned().ok_or_else(|| {
                 RendererError::DepthCreationFailed(format!(
                     "no depth attachment for swapchain image {image_index}"
@@ -887,12 +1202,6 @@ impl Renderer {
                 for instance in &model.instances {
                     let primitive = &model.primitives[instance.primitive_index];
                     let world = *model_transform * instance.local_transform;
-                    let Some(mesh_normals_pipeline) =
-                        self.pipelines.get_opt(BuiltinPipeline::MeshNormals)
-                    else {
-                        self.warn_absent_pipeline(BuiltinPipeline::MeshNormals);
-                        continue;
-                    };
                     builder
                         .bind_pipeline_graphics(mesh_normals_pipeline.clone())
                         .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
@@ -967,27 +1276,32 @@ impl Renderer {
         // flat-coalescing scope differ.
         //
         // Ownership: a `Custom` command holds a `FnOnce` that must be MOVED to be
-        // called, so the queue is taken as `Vec<Option<DrawCommand>>` and each
-        // `Single` command is `.take()`n out. Every index belongs to exactly one
-        // segment, so each is taken at most once. `mem::take` also drains the
-        // queue for the frame (replacing the old `self.draw_commands.clear()`);
-        // an empty queue yields an empty plan and records nothing — a perfect
-        // no-op, identical to before.
-        let mut commands: Vec<Option<DrawCommand>> = std::mem::take(&mut self.draw_commands)
-            .into_iter()
-            .map(Some)
-            .collect();
-        let kinds: Vec<DrawKind> = commands
-            .iter()
-            .map(|c| draw_kind(c.as_ref().unwrap()))
-            .collect();
-        let frame = CustomFrameContext { viewport_extent };
-        // Built once for the frame and handed to every Tier 1 registered draw.
-        // Holds a cloned allocator `Arc` (not a `self` borrow), so it does not
-        // conflict with the mutable `self` uses in the built-in arms below.
+        // called, so the queue is drained into `Vec<Option<DrawCommand>>` and
+        // each recorded command is `.take()`n out. Every index belongs to
+        // exactly one segment, so each is taken at most once. An empty queue
+        // yields an empty plan and records nothing — a perfect no-op.
+        //
+        // The scratch buffers are owned by `self` and swapped out for the
+        // duration of the frame: taking them here releases the `self` borrow so
+        // the built-in arms below can use `&mut self`, and returning them at the
+        // end preserves their capacity for the next frame.
+        let mut commands = std::mem::take(&mut self.command_scratch);
+        take_queue_into(&mut commands, &mut self.draw_commands);
+        let mut kinds = std::mem::take(&mut self.kind_scratch);
+        kinds.clear();
+        kinds.extend(
+            commands
+                .iter()
+                .map(|c| draw_kind(c.as_ref().expect("the queue was just filled"))),
+        );
+        // Built once for the frame and handed to every Tier 1 registered draw
+        // and every Tier 2 custom hook. Holds cloned `Arc`s (not `self`
+        // borrows), so it does not conflict with the mutable `self` uses in the
+        // built-in arms below.
         let record_ctx = RecordCtx {
             viewport_extent,
             memory_allocator: self.memory_allocator.clone(),
+            device: self.device.clone(),
         };
         for segment in plan_render_segments(&kinds) {
             match segment {
@@ -1002,20 +1316,7 @@ impl Renderer {
                         self.warn_absent_pipeline(BuiltinPipeline::FlatColor);
                         continue;
                     };
-                    let vertex_buffer = Buffer::from_iter(
-                        self.memory_allocator.clone(),
-                        BufferCreateInfo {
-                            usage: BufferUsage::VERTEX_BUFFER,
-                            ..Default::default()
-                        },
-                        AllocationCreateInfo {
-                            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                            ..Default::default()
-                        },
-                        self.flat_vertex_scratch.iter().copied(),
-                    )
-                    .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
+                    let vertex_buffer = self.upload_vertices(&self.flat_vertex_scratch)?;
 
                     let vertex_count = vertex_buffer.len() as u32;
                     builder
@@ -1041,6 +1342,36 @@ impl Renderer {
                             .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
                     }
                 }
+                RenderSegment::RegisteredRun { id, start, end } => {
+                    // Move the run's payloads out (each belongs to exactly one
+                    // segment) and hand the whole run to the pipeline, so N
+                    // consecutive `draw_with` calls become one `record` — and
+                    // can become one instanced draw.
+                    let payloads: Vec<Box<dyn std::any::Any>> = commands[start..end]
+                        .iter_mut()
+                        .map(|slot| {
+                            let cmd = slot.take().expect("each command is recorded exactly once");
+                            match cmd {
+                                DrawCommand::Registered { payload, .. } => payload,
+                                _ => unreachable!("a RegisteredRun holds only registered draws"),
+                            }
+                        })
+                        .collect();
+
+                    // `self.registered` is a distinct field and `record_ctx`
+                    // owns cloned `Arc`s rather than borrowing `self`, so the
+                    // mutable pipeline borrow coexists with `builder`.
+                    match self.registered.get_mut(&id) {
+                        Some(pipeline) => {
+                            pipeline
+                                .record_erased(&mut builder, &record_ctx, payloads)
+                                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+                        }
+                        // Warn-once needs `&self` while `registered` is
+                        // mutably borrowed above, so it happens after.
+                        None => self.warn_absent_registered(id),
+                    }
+                }
                 RenderSegment::Single(i) => {
                     // Take ownership so a Custom closure (FnOnce) can be moved
                     // out and invoked; each index belongs to exactly one segment.
@@ -1051,20 +1382,7 @@ impl Renderer {
                     // registered (Tier 1) draws dispatch to their user pipeline;
                     // every built-in records by reference exactly as before.
                     if let DrawCommand::Custom(record) = cmd {
-                        record(&mut builder, &frame);
-                    } else if let DrawCommand::Registered { id, payload } = cmd {
-                        // `self.registered` is a distinct field; `builder` and
-                        // `record_ctx` are locals (record_ctx owns a cloned Arc,
-                        // not a `self` borrow), so this borrow-checks alongside
-                        // the warn-once path in the absent branch.
-                        match self.registered.get(&id) {
-                            Some(pipeline) => {
-                                pipeline
-                                    .record_erased(&mut builder, &record_ctx, &*payload)
-                                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
-                            }
-                            None => self.warn_absent_registered(id),
-                        }
+                        record(&mut builder, &record_ctx);
                     } else {
                         match &cmd {
                             // Textured draws (Texture and Noise both use the textured pipeline)
@@ -1098,22 +1416,7 @@ impl Renderer {
                                     .ok_or(RendererError::TextureNotFound(texture_id))?;
 
                                 let tex_vertices = textured_quad_vertices(left, top, right, bottom);
-                                let vertex_buffer = Buffer::from_iter(
-                                    self.memory_allocator.clone(),
-                                    BufferCreateInfo {
-                                        usage: BufferUsage::VERTEX_BUFFER,
-                                        ..Default::default()
-                                    },
-                                    AllocationCreateInfo {
-                                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                                        ..Default::default()
-                                    },
-                                    tex_vertices,
-                                )
-                                .map_err(|e| {
-                                    RendererError::BufferAllocationFailed(e.to_string())
-                                })?;
+                                let vertex_buffer = self.upload_vertices(&tex_vertices)?;
 
                                 builder
                                     .bind_pipeline_graphics(textured_pipeline.clone())
@@ -1214,22 +1517,7 @@ impl Renderer {
                                     _ => unreachable!("outer match guarantees Grating or Gabor"),
                                 };
                                 let quad = textured_quad_vertices(left, top, right, bottom);
-                                let vertex_buffer = Buffer::from_iter(
-                                    self.memory_allocator.clone(),
-                                    BufferCreateInfo {
-                                        usage: BufferUsage::VERTEX_BUFFER,
-                                        ..Default::default()
-                                    },
-                                    AllocationCreateInfo {
-                                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                                        ..Default::default()
-                                    },
-                                    quad,
-                                )
-                                .map_err(|e| {
-                                    RendererError::BufferAllocationFailed(e.to_string())
-                                })?;
+                                let vertex_buffer = self.upload_vertices(&quad)?;
 
                                 let first_pass = if is_grating {
                                     let Some(pipeline) =
@@ -1334,22 +1622,8 @@ impl Renderer {
                                 );
                                 let instance_count = self.dot_instance_scratch.len() as u32;
 
-                                let instance_buffer = Buffer::from_iter(
-                                    self.memory_allocator.clone(),
-                                    BufferCreateInfo {
-                                        usage: BufferUsage::VERTEX_BUFFER,
-                                        ..Default::default()
-                                    },
-                                    AllocationCreateInfo {
-                                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                                        ..Default::default()
-                                    },
-                                    self.dot_instance_scratch.iter().copied(),
-                                )
-                                .map_err(|e| {
-                                    RendererError::BufferAllocationFailed(e.to_string())
-                                })?;
+                                let instance_buffer =
+                                    self.upload_vertices(&self.dot_instance_scratch)?;
 
                                 let Some(dot_pipeline) =
                                     self.pipelines.get_opt(BuiltinPipeline::Dot)
@@ -1401,9 +1675,10 @@ impl Renderer {
                             DrawCommand::Custom(_) => {
                                 unreachable!("custom draws are moved out and run above")
                             }
-                            // Registered draws are handled by the `else if let` above.
+                            // Registered draws are recorded via RegisteredRun
+                            // segments; the planner never emits them as Single.
                             DrawCommand::Registered { .. } => {
-                                unreachable!("registered draws are dispatched above")
+                                unreachable!("registered draws are recorded via RegisteredRun")
                             }
                         }
                     }
@@ -1419,7 +1694,13 @@ impl Renderer {
             .build()
             .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
 
-        // `self.draw_commands` was already drained by `mem::take` above.
+        // Hand the scratch allocations back for the next frame. Every command
+        // has been recorded, so the slots hold only `None`.
+        commands.clear();
+        self.command_scratch = commands;
+        self.kind_scratch = kinds;
+
+        // `self.draw_commands` was drained into the scratch above.
         self.draw_commands_3d.clear();
 
         Ok(command_buffer)
@@ -1579,12 +1860,27 @@ impl Renderer {
     /// so each run flushes independently. Flats are only read, never moved, so
     /// each slot in the run is still `Some`.
     fn fill_flat_run(&mut self, commands: &[Option<DrawCommand>], start: usize, end: usize) {
-        self.flat_vertex_scratch.clear();
+        // Split out so the coalescing logic can be exercised without a device.
+        let mut scratch = std::mem::take(&mut self.flat_vertex_scratch);
+        Self::fill_flat_run_into(&mut scratch, commands, start, end);
+        self.flat_vertex_scratch = scratch;
+    }
+
+    /// Device-free core of [`fill_flat_run`](Self::fill_flat_run): coalesce
+    /// `commands[start..end]` into `scratch`, which is cleared first so each run
+    /// flushes independently of the last.
+    fn fill_flat_run_into(
+        scratch: &mut Vec<Vertex2D>,
+        commands: &[Option<DrawCommand>],
+        start: usize,
+        end: usize,
+    ) {
+        scratch.clear();
         for cmd in &commands[start..end] {
             let cmd = cmd
                 .as_ref()
                 .expect("flat commands are read in place, never taken");
-            Self::append_flat_command_vertices(&mut self.flat_vertex_scratch, cmd);
+            Self::append_flat_command_vertices(scratch, cmd);
         }
     }
 
@@ -2074,16 +2370,24 @@ mod tests {
 
     #[test]
     fn pipeline_suite_default_contains_all_eight_builtins() {
+        // Spelled out rather than derived from `builtin_pipeline_descriptors()`.
+        // Deriving the expectation from the code under test would let a
+        // pipeline silently disappear from BOTH the descriptor list and the
+        // default suite without failing anything.
         let suite = PipelineSuite::default();
-        for descriptor in builtin_pipeline_descriptors() {
-            assert!(
-                suite.contains(descriptor.key),
-                "default suite must contain {:?}",
-                descriptor.key
-            );
+        for key in [
+            BuiltinPipeline::FlatColor,
+            BuiltinPipeline::Textured,
+            BuiltinPipeline::Grating,
+            BuiltinPipeline::Gabor,
+            BuiltinPipeline::AdditiveGabor,
+            BuiltinPipeline::SubtractiveGabor,
+            BuiltinPipeline::Dot,
+            BuiltinPipeline::MeshNormals,
+        ] {
+            assert!(suite.contains(key), "default suite must contain {key:?}");
         }
-        // And exactly eight, no more.
-        assert_eq!(suite.len(), 8);
+        assert_eq!(suite.len(), 8, "and nothing beyond the eight built-ins");
     }
 
     #[test]
@@ -2117,19 +2421,334 @@ mod tests {
         assert!(suite.contains(BuiltinPipeline::Gabor));
     }
 
+    // --- Suite validation ---
+    //
+    // The additive-Gabor stimulus is TWO passes: a positive-add pass
+    // (`AdditiveGabor`) and a negative-magnitude subtract pass
+    // (`SubtractiveGabor`). Building one without the other renders half the
+    // signed modulation — a plausible-looking but scientifically WRONG
+    // stimulus. That must fail at construction, not warn at render time.
+
     #[test]
-    fn custom_frame_context_carries_viewport_extent() {
-        // Device-free: the context is a plain value struct built from the
-        // frame's viewport extent. The pixel behavior of `draw_custom` needs a
-        // Vulkan device + display and is verified visually via
-        // `examples/22_custom_pipeline.rs`.
-        let frame = CustomFrameContext {
-            viewport_extent: [1920, 1080],
-        };
-        assert_eq!(frame.viewport_extent, [1920, 1080]);
-        // Copy semantics: the struct is cheap to hand to each closure.
-        let copy = frame;
-        assert_eq!(copy, frame);
+    fn suite_with_additive_gabor_but_no_subtractive_is_rejected() {
+        let suite = PipelineSuite::default().without(BuiltinPipeline::SubtractiveGabor);
+        let err = suite
+            .validate()
+            .expect_err("additive without subtractive renders half the modulation");
+        assert!(matches!(err, SuiteError::UnpairedGaborPass));
+    }
+
+    #[test]
+    fn suite_with_subtractive_gabor_but_no_additive_is_rejected() {
+        // The orphaned direction is not wrong on screen, but the two keys are a
+        // unit; rejecting it tells the user they belong together rather than
+        // silently compiling a pipeline nothing can reach.
+        let suite = PipelineSuite::default().without(BuiltinPipeline::AdditiveGabor);
+        let err = suite
+            .validate()
+            .expect_err("the two additive-Gabor passes are a unit");
+        assert!(matches!(err, SuiteError::UnpairedGaborPass));
+    }
+
+    #[test]
+    fn suite_validates_when_both_or_neither_gabor_pass_is_present() {
+        PipelineSuite::default()
+            .validate()
+            .expect("the full suite has both passes");
+
+        PipelineSuite::default()
+            .without(BuiltinPipeline::AdditiveGabor)
+            .without(BuiltinPipeline::SubtractiveGabor)
+            .validate()
+            .expect("neither pass is a valid suite — draw_gabor_additive is simply unavailable");
+
+        PipelineSuite::minimal()
+            .validate()
+            .expect("minimal has neither pass");
+
+        PipelineSuite::empty()
+            .validate()
+            .expect("an empty suite builds nothing and is valid");
+    }
+
+    // --- Depth attachments follow the suite ---
+
+    #[test]
+    fn depth_attachments_are_needed_only_for_the_mesh_normals_pipeline() {
+        // MeshNormals is the only built-in with a depth attachment. Without it
+        // in the suite, allocating one full-resolution depth image per
+        // swapchain image is pure waste.
+        assert!(PipelineSuite::default().needs_depth());
+        assert!(PipelineSuite::empty()
+            .with(BuiltinPipeline::MeshNormals)
+            .needs_depth());
+        assert!(!PipelineSuite::minimal().needs_depth());
+        assert!(!PipelineSuite::default()
+            .without(BuiltinPipeline::MeshNormals)
+            .needs_depth());
+    }
+
+    // --- Degenerate flat-color inputs ---
+    //
+    // A stimulus parameter can legitimately sweep to zero (a contracting
+    // aperture, a staircase converging on nothing). Those must emit no
+    // geometry rather than NaN-filled or back-facing triangles.
+
+    #[test]
+    fn degenerate_flat_shapes_emit_no_geometry() {
+        let degenerate = [
+            // Inverted and empty rectangles.
+            DrawCommand::Rect {
+                left: 10.0,
+                top: 0.0,
+                right: 10.0,
+                bottom: 5.0,
+                color: Color::WHITE,
+            },
+            DrawCommand::Rect {
+                left: 20.0,
+                top: 5.0,
+                right: 10.0,
+                bottom: 0.0,
+                color: Color::WHITE,
+            },
+            // Zero and negative radius.
+            DrawCommand::Circle {
+                cx: 0.0,
+                cy: 0.0,
+                radius: 0.0,
+                color: Color::WHITE,
+                segments: 32,
+            },
+            DrawCommand::Circle {
+                cx: 0.0,
+                cy: 0.0,
+                radius: -3.0,
+                color: Color::WHITE,
+                segments: 32,
+            },
+            // Zero width, and zero length.
+            DrawCommand::Line {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 10.0,
+                y2: 10.0,
+                width: 0.0,
+                color: Color::WHITE,
+            },
+            DrawCommand::Line {
+                x1: 4.0,
+                y1: 4.0,
+                x2: 4.0,
+                y2: 4.0,
+                width: 2.0,
+                color: Color::WHITE,
+            },
+            // Zero thickness, and a vanishing angular span.
+            DrawCommand::Arc {
+                cx: 0.0,
+                cy: 0.0,
+                radius: 5.0,
+                start_angle: 0.0,
+                end_angle: 1.0,
+                thickness: 0.0,
+                color: Color::WHITE,
+                segments: 32,
+            },
+            DrawCommand::Arc {
+                cx: 0.0,
+                cy: 0.0,
+                radius: 5.0,
+                start_angle: 1.0,
+                end_angle: 1.0,
+                thickness: 2.0,
+                color: Color::WHITE,
+                segments: 32,
+            },
+        ];
+
+        for cmd in &degenerate {
+            let mut scratch = Vec::new();
+            Renderer::append_flat_command_vertices(&mut scratch, cmd);
+            assert!(
+                scratch.is_empty(),
+                "a degenerate shape must contribute no vertices"
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_flat_shape_still_emits_geometry() {
+        // Guards the guards: if the degenerate test above passed because
+        // nothing ever emits vertices, this fails.
+        let mut scratch = Vec::new();
+        Renderer::append_flat_command_vertices(&mut scratch, &a_rect());
+        assert_eq!(scratch.len(), 6, "a rectangle is two triangles");
+    }
+
+    #[test]
+    fn each_flat_run_starts_from_an_empty_scratch() {
+        // Runs flush independently. If the scratch leaked between them, the
+        // second run would redraw the first run's geometry on top of whatever
+        // was composited in between.
+        let commands: Vec<Option<DrawCommand>> = (0..4).map(|_| Some(a_rect())).collect::<Vec<_>>();
+
+        let mut scratch = Vec::new();
+        Renderer::fill_flat_run_into(&mut scratch, &commands, 0, 3);
+        assert_eq!(scratch.len(), 18, "three rectangles");
+
+        Renderer::fill_flat_run_into(&mut scratch, &commands, 3, 4);
+        assert_eq!(
+            scratch.len(),
+            6,
+            "the second run holds only its own geometry"
+        );
+    }
+
+    // --- Per-frame queue recycling ---
+    //
+    // The draw queue is rebuilt every frame on the presentation path. Handing
+    // its allocation back to the allocator each frame means re-growing it from
+    // zero on the next one, so both the queue and the scratch it drains into
+    // must keep their capacity.
+
+    #[test]
+    fn draining_the_queue_empties_it_without_surrendering_its_capacity() {
+        let mut queue: Vec<DrawCommand> = (0..64).map(|_| a_rect()).collect();
+        let capacity_before = queue.capacity();
+        let mut scratch: Vec<Option<DrawCommand>> = Vec::new();
+
+        take_queue_into(&mut scratch, &mut queue);
+
+        assert!(queue.is_empty(), "the frame's queue is consumed");
+        assert_eq!(
+            queue.capacity(),
+            capacity_before,
+            "the queue keeps its allocation for the next frame"
+        );
+        assert_eq!(scratch.len(), 64);
+    }
+
+    #[test]
+    fn the_scratch_is_reused_across_frames_rather_than_reallocated() {
+        let mut scratch: Vec<Option<DrawCommand>> = Vec::new();
+
+        let mut frame_one: Vec<DrawCommand> = (0..64).map(|_| a_rect()).collect();
+        take_queue_into(&mut scratch, &mut frame_one);
+        let capacity_after_first_frame = scratch.capacity();
+
+        // A later, smaller frame must reuse the existing allocation.
+        let mut frame_two: Vec<DrawCommand> = (0..8).map(|_| a_rect()).collect();
+        take_queue_into(&mut scratch, &mut frame_two);
+
+        assert_eq!(
+            scratch.len(),
+            8,
+            "stale commands from the last frame are gone"
+        );
+        assert_eq!(
+            scratch.capacity(),
+            capacity_after_first_frame,
+            "the scratch keeps its allocation instead of reallocating each frame"
+        );
+    }
+
+    fn a_rect() -> DrawCommand {
+        DrawCommand::Rect {
+            left: 0.0,
+            top: 0.0,
+            right: 1.0,
+            bottom: 1.0,
+            color: Color::WHITE,
+        }
+    }
+
+    // --- Skipped-draw accounting ---
+    //
+    // A draw whose pipeline is absent renders nothing. Warning once per kind
+    // keeps the log readable, but "once" must not mean the remaining
+    // occurrences vanish: an experimenter needs to know after the fact that
+    // frames were missing stimuli, and how many.
+
+    #[test]
+    fn skipped_draws_signals_warn_only_on_the_first_occurrence_of_a_kind() {
+        let mut skipped = SkippedDraws::default();
+
+        assert!(
+            skipped.record_builtin(BuiltinPipeline::Textured),
+            "first skip of a kind warns"
+        );
+        assert!(
+            !skipped.record_builtin(BuiltinPipeline::Textured),
+            "later skips of the same kind stay quiet"
+        );
+        assert!(
+            skipped.record_builtin(BuiltinPipeline::Dot),
+            "a different kind warns on its own first occurrence"
+        );
+    }
+
+    #[test]
+    fn skipped_draws_keeps_counting_after_it_stops_warning() {
+        let mut skipped = SkippedDraws::default();
+        for _ in 0..2000 {
+            skipped.record_builtin(BuiltinPipeline::Grating);
+        }
+        skipped.record_builtin(BuiltinPipeline::Dot);
+
+        assert_eq!(skipped.total(), 2001);
+        assert_eq!(
+            skipped.builtin_counts(),
+            vec![(BuiltinPipeline::Dot, 1), (BuiltinPipeline::Grating, 2000)],
+            "counts report sorted by key name, so the report is reproducible"
+        );
+    }
+
+    #[test]
+    fn skipped_draws_tracks_registered_pipelines_separately_from_builtins() {
+        let mut skipped = SkippedDraws::default();
+
+        assert!(skipped.record_registered(7));
+        assert!(!skipped.record_registered(7));
+        assert!(skipped.record_registered(9));
+        skipped.record_builtin(BuiltinPipeline::Dot);
+
+        assert_eq!(skipped.total(), 4);
+        assert_eq!(
+            skipped.builtin_counts(),
+            vec![(BuiltinPipeline::Dot, 1)],
+            "registered-pipeline skips do not masquerade as built-in skips"
+        );
+    }
+
+    #[test]
+    fn a_session_that_skipped_nothing_reports_zero() {
+        // The healthy case has to be unambiguous: this is what an experimenter
+        // checks to confirm no frame was presented missing a stimulus.
+        let skipped = SkippedDraws::default();
+        assert_eq!(skipped.total(), 0);
+        assert!(skipped.builtin_counts().is_empty());
+    }
+
+    // --- Deterministic reporting (feeds HostInfo, and headless regeneration) ---
+
+    #[test]
+    fn suite_key_names_are_sorted_so_host_info_is_reproducible() {
+        // `PipelineSuite` is backed by a HashSet, whose iteration order varies
+        // run to run. The recorded key list is an input to byte-identical
+        // stimulus regeneration, so it must be stable across runs.
+        let suite = PipelineSuite::empty()
+            .with(BuiltinPipeline::MeshNormals)
+            .with(BuiltinPipeline::Dot)
+            .with(BuiltinPipeline::FlatColor);
+
+        assert_eq!(suite.key_names(), vec!["Dot", "FlatColor", "MeshNormals"]);
+        // Same set built in a different order reports identically.
+        let reordered = PipelineSuite::empty()
+            .with(BuiltinPipeline::FlatColor)
+            .with(BuiltinPipeline::MeshNormals)
+            .with(BuiltinPipeline::Dot);
+        assert_eq!(suite.key_names(), reordered.key_names());
     }
 
     #[test]
@@ -2180,7 +2799,7 @@ mod tests {
 
     #[test]
     fn plan_all_non_flat_yields_single_segments_in_order() {
-        let kinds = [DrawKind::NonFlat, DrawKind::NonFlat, DrawKind::NonFlat];
+        let kinds = [DrawKind::Other, DrawKind::Other, DrawKind::Other];
         assert_eq!(
             plan_render_segments(&kinds),
             vec![
@@ -2195,7 +2814,7 @@ mod tests {
     fn plan_flat_then_texture_then_flat_yields_three_ordered_segments() {
         // The load-bearing behavior change: a flat, a non-flat, then a flat
         // must produce three segments in call order (not "all flats first").
-        let kinds = [DrawKind::Flat, DrawKind::NonFlat, DrawKind::Flat];
+        let kinds = [DrawKind::Flat, DrawKind::Other, DrawKind::Flat];
         assert_eq!(
             plan_render_segments(&kinds),
             vec![
@@ -2212,10 +2831,10 @@ mod tests {
         let kinds = [
             DrawKind::Flat,
             DrawKind::Flat,
-            DrawKind::NonFlat,
+            DrawKind::Other,
             DrawKind::Flat,
             DrawKind::Flat,
-            DrawKind::NonFlat,
+            DrawKind::Other,
             DrawKind::Flat,
         ];
         assert_eq!(
@@ -2232,7 +2851,7 @@ mod tests {
 
     #[test]
     fn plan_leading_nonflat_and_trailing_flat_run_are_kept() {
-        let kinds = [DrawKind::NonFlat, DrawKind::Flat, DrawKind::Flat];
+        let kinds = [DrawKind::Other, DrawKind::Flat, DrawKind::Flat];
         assert_eq!(
             plan_render_segments(&kinds),
             vec![
@@ -2306,7 +2925,7 @@ mod tests {
             },
         ];
         for cmd in &non_flats {
-            assert_eq!(draw_kind(cmd), DrawKind::NonFlat);
+            assert_eq!(draw_kind(cmd), DrawKind::Other);
         }
     }
 
@@ -2315,18 +2934,154 @@ mod tests {
         // A Tier 2 custom draw records on its own, so it must never coalesce
         // into a flat run — it is NonFlat like every other self-recording draw.
         let cmd = DrawCommand::Custom(Box::new(|_, _| {}));
-        assert_eq!(draw_kind(&cmd), DrawKind::NonFlat);
+        assert_eq!(draw_kind(&cmd), DrawKind::Other);
     }
 
     #[test]
-    fn draw_kind_classifies_registered_as_non_flat() {
-        // A Tier 1 registered draw records via its own user pipeline, so it must
-        // never coalesce into a flat run — it is NonFlat like every other
-        // self-recording draw.
+    fn draw_kind_tags_a_registered_draw_with_its_pipeline_id() {
+        // A registered draw carries its pipeline identity so consecutive draws
+        // to the SAME pipeline can coalesce, while draws to different pipelines
+        // stay separate.
         let cmd = DrawCommand::Registered {
-            id: 0,
+            id: 3,
             payload: Box::new(7u32),
         };
-        assert_eq!(draw_kind(&cmd), DrawKind::NonFlat);
+        assert_eq!(draw_kind(&cmd), DrawKind::Registered(3));
+    }
+
+    // --- Registered-run coalescing ---
+    //
+    // `StimulusPipeline::record` takes a SLICE of commands. That slice is only
+    // honest if consecutive draws to one pipeline actually arrive together, so
+    // a pipeline can answer a run of N draws with one instanced draw.
+
+    #[test]
+    fn consecutive_draws_to_one_pipeline_coalesce_into_a_single_run() {
+        let kinds = [
+            DrawKind::Registered(1),
+            DrawKind::Registered(1),
+            DrawKind::Registered(1),
+        ];
+        assert_eq!(
+            plan_render_segments(&kinds),
+            vec![RenderSegment::RegisteredRun {
+                id: 1,
+                start: 0,
+                end: 3
+            }]
+        );
+    }
+
+    #[test]
+    fn adjacent_draws_to_different_pipelines_do_not_coalesce() {
+        // Two pipelines back to back are still two records — merging them would
+        // hand one pipeline another's commands.
+        let kinds = [DrawKind::Registered(1), DrawKind::Registered(2)];
+        assert_eq!(
+            plan_render_segments(&kinds),
+            vec![
+                RenderSegment::RegisteredRun {
+                    id: 1,
+                    start: 0,
+                    end: 1
+                },
+                RenderSegment::RegisteredRun {
+                    id: 2,
+                    start: 1,
+                    end: 2
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_builtin_draw_between_registered_draws_splits_the_run() {
+        // Call-order compositing is the invariant that outranks batching: a
+        // built-in drawn between two registered draws must land between them on
+        // screen, so the run has to split.
+        let kinds = [
+            DrawKind::Registered(1),
+            DrawKind::Flat,
+            DrawKind::Registered(1),
+        ];
+        assert_eq!(
+            plan_render_segments(&kinds),
+            vec![
+                RenderSegment::RegisteredRun {
+                    id: 1,
+                    start: 0,
+                    end: 1
+                },
+                RenderSegment::FlatRun { start: 1, end: 2 },
+                RenderSegment::RegisteredRun {
+                    id: 1,
+                    start: 2,
+                    end: 3
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn registered_runs_interleave_with_flat_runs_and_singles_in_call_order() {
+        // R1 R1 F F T R2 R2 F  ->  run(R1,0..2) run(F,2..4) single(4) run(R2,5..7) run(F,7..8)
+        let kinds = [
+            DrawKind::Registered(1),
+            DrawKind::Registered(1),
+            DrawKind::Flat,
+            DrawKind::Flat,
+            DrawKind::Other,
+            DrawKind::Registered(2),
+            DrawKind::Registered(2),
+            DrawKind::Flat,
+        ];
+        assert_eq!(
+            plan_render_segments(&kinds),
+            vec![
+                RenderSegment::RegisteredRun {
+                    id: 1,
+                    start: 0,
+                    end: 2
+                },
+                RenderSegment::FlatRun { start: 2, end: 4 },
+                RenderSegment::Single(4),
+                RenderSegment::RegisteredRun {
+                    id: 2,
+                    start: 5,
+                    end: 7
+                },
+                RenderSegment::FlatRun { start: 7, end: 8 },
+            ]
+        );
+    }
+
+    #[test]
+    fn every_index_belongs_to_exactly_one_segment() {
+        // The render loop moves each command out of the queue exactly once
+        // (a Custom hook is FnOnce), so the plan must partition the indices.
+        let kinds = [
+            DrawKind::Flat,
+            DrawKind::Registered(1),
+            DrawKind::Registered(1),
+            DrawKind::Other,
+            DrawKind::Flat,
+            DrawKind::Flat,
+            DrawKind::Registered(2),
+        ];
+
+        let mut covered: Vec<usize> = Vec::new();
+        for segment in plan_render_segments(&kinds) {
+            match segment {
+                RenderSegment::FlatRun { start, end }
+                | RenderSegment::RegisteredRun { start, end, .. } => covered.extend(start..end),
+                RenderSegment::Single(i) => covered.push(i),
+            }
+        }
+
+        assert_eq!(
+            covered,
+            (0..kinds.len()).collect::<Vec<_>>(),
+            "the plan must cover every index exactly once, in order"
+        );
     }
 }

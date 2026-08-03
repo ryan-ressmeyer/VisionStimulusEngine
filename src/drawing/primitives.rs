@@ -1,7 +1,8 @@
 use super::color::Color;
 use super::stimuli::GratingParams;
 use super::vertex::{DotInstance, TexturedVertex, Vertex2D};
-use crate::drawing::renderer::{CustomFrameContext, FrameRecorder};
+use crate::drawing::pipeline::RecordCtx;
+use crate::drawing::renderer::FrameRecorder;
 use crate::drawing::GaborParams;
 use glam::Mat4;
 
@@ -9,7 +10,7 @@ use glam::Mat4;
 /// frame inside the active 2D render pass. No `Send` bound: custom draws are
 /// invoked single-threaded within `render`. Carried by [`DrawCommand::Custom`]
 /// so it composites in call order alongside built-in draws.
-pub(crate) type CustomDrawFn = Box<dyn FnOnce(&mut FrameRecorder, &CustomFrameContext)>;
+pub(crate) type CustomDrawFn = Box<dyn FnOnce(&mut FrameRecorder, &RecordCtx)>;
 
 /// A queued native 3D draw. Model resources are resident before this command is created.
 pub(crate) enum DrawCommand3D {

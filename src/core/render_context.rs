@@ -17,8 +17,8 @@ use crate::drawing::primitives::{
     default_arc_segments, default_circle_segments, DrawCommand, DrawCommand3D,
 };
 use crate::drawing::{
-    Bounds3D, Color, CustomFrameContext, FrameRecorder, GaborParams, GratingParams, ModelHandle,
-    ModelInfo, NoiseParams, PerspectiveCamera, RegisteredPipeline, StimulusPipeline, TextureHandle,
+    Bounds3D, Color, FrameRecorder, GaborParams, GratingParams, ModelHandle, ModelInfo,
+    NoiseParams, PerspectiveCamera, RecordCtx, RegisteredPipeline, StimulusPipeline, TextureHandle,
 };
 use crate::timing::{Clock, ScanoutTimestamp, Timestamp, TimingSource};
 
@@ -342,6 +342,28 @@ impl<'a> RenderContext<'a> {
 
     pub fn frame_number(&self) -> u64 {
         self.state.frame_number
+    }
+
+    /// Total draws this session that rendered nothing because their pipeline
+    /// was absent from the active [`PipelineSuite`] (or, for a Tier 1 draw, was
+    /// never registered). `0` for a healthy session.
+    ///
+    /// Absent pipelines are logged once per kind to keep a 60 Hz loop from
+    /// flooding the log, so the log alone understates the problem. Check this
+    /// at the end of a session — a non-zero count means frames were presented
+    /// without a stimulus the experiment asked for, and the affected data
+    /// should not be trusted.
+    ///
+    /// [`PipelineSuite`]: crate::drawing::PipelineSuite
+    pub fn skipped_draw_count(&self) -> u64 {
+        self.state.renderer.skipped_draw_total()
+    }
+
+    /// Per-kind breakdown of skipped built-in draws, sorted by pipeline name
+    /// so the report is identical across runs. Empty when
+    /// [`skipped_draw_count`](Self::skipped_draw_count) is `0`.
+    pub fn skipped_draws(&self) -> Vec<(crate::drawing::BuiltinPipeline, u64)> {
+        self.state.renderer.skipped_builtin_counts()
     }
 
     /// Display refresh interval reported by the timing backend or detected from flips.
@@ -739,21 +761,21 @@ impl<'a> RenderContext<'a> {
     /// The closure is invoked once, during this frame's [`flip`](Self::flip),
     /// with a `&mut` [`FrameRecorder`] (the exact vulkano
     /// `AutoCommandBufferBuilder` VSE records into) and a
-    /// [`CustomFrameContext`]. Queue as many as you like; each runs in the order
+    /// [`RecordCtx`]. Queue as many as you like; each runs in the order
     /// it was queued. The queue is drained every frame, so a frame with no
     /// `draw_custom` call behaves exactly as before.
     ///
     /// # Where and how the closure runs — the contract
     ///
-    /// - It executes **inside an already-active dynamic-rendering pass**, after
-    ///   all of VSE's built-in 2D draws (flat shapes, textures, gratings/Gabors,
-    ///   dots). Custom draws therefore composite **on top of** the built-ins.
-    ///   (Call-order interleaving with built-ins is a later phase.)
+    /// - It executes **inside an already-active dynamic-rendering pass**, at
+    ///   the point in call order where you queued it. A custom draw composites
+    ///   over whatever was drawn before it and under whatever is drawn after —
+    ///   the same rule as every built-in `draw_*`.
     /// - The color attachment is the swapchain image
     ///   (format = [`swapchain().format()`](SwapchainManager::format)); there is
     ///   **no depth attachment** in this 2D pass.
     /// - The **viewport is already set** to the full framebuffer
-    ///   ([`CustomFrameContext::viewport_extent`]); a pipeline built with dynamic
+    ///   ([`RecordCtx::viewport_extent`]); a pipeline built with dynamic
     ///   viewport state needs no `set_viewport` of its own.
     ///
     /// The closure **must not** call `begin_rendering` / `end_rendering`, end the
@@ -769,10 +791,7 @@ impl<'a> RenderContext<'a> {
     ///
     /// Recording errors from the builder are the caller's to handle (the vulkano
     /// calls return `Result`); this hook does not surface them.
-    pub fn draw_custom(
-        &mut self,
-        record: impl FnOnce(&mut FrameRecorder, &CustomFrameContext) + 'static,
-    ) {
+    pub fn draw_custom(&mut self, record: impl FnOnce(&mut FrameRecorder, &RecordCtx) + 'static) {
         self.state.renderer.push_custom(Box::new(record));
     }
 
@@ -796,11 +815,17 @@ impl<'a> RenderContext<'a> {
         pipeline: P,
     ) -> Result<RegisteredPipeline<P::Command>, VSEError> {
         let color_format = self.state.swapchain.format();
-        let id = self.state.renderer.register(pipeline, color_format)?;
-        Ok(RegisteredPipeline {
-            id,
-            _marker: std::marker::PhantomData,
-        })
+        Ok(self.state.renderer.register(pipeline, color_format)?)
+    }
+
+    /// Drop a registered pipeline and release its GPU resources.
+    ///
+    /// Returns whether a pipeline was removed — `false` for an already-dropped
+    /// handle, or one issued by a different VSE context. Call this when
+    /// re-registering between trials; without it each registration leaks its
+    /// `GraphicsPipeline` for the life of the session.
+    pub fn unregister_pipeline<C: 'static>(&mut self, handle: RegisteredPipeline<C>) -> bool {
+        self.state.renderer.unregister(handle)
     }
 
     /// Enqueue one draw for a registered Tier 1 pipeline.
@@ -811,10 +836,22 @@ impl<'a> RenderContext<'a> {
     /// pipeline's [`record`](StimulusPipeline::record) runs during this frame's
     /// [`flip`](Self::flip). The raw [`FrameRecorder`] is handed to `record` —
     /// the same low-level access as [`draw_custom`](Self::draw_custom).
-    pub fn draw_with<C: 'static>(&mut self, handle: RegisteredPipeline<C>, command: C) {
-        self.state
-            .renderer
-            .push_registered(handle.id, Box::new(command));
+    ///
+    /// Consecutive `draw_with` calls against the same handle reach `record` as
+    /// one command slice, so a pipeline can answer a run of draws with a single
+    /// instanced draw. Any other draw between them splits the run, preserving
+    /// call-order compositing.
+    ///
+    /// # Errors
+    ///
+    /// [`VSEError::Pipeline`] if `handle` was issued by a different VSE
+    /// context; its pipeline ids mean nothing here.
+    pub fn draw_with<C: 'static>(
+        &mut self,
+        handle: RegisteredPipeline<C>,
+        command: C,
+    ) -> Result<(), VSEError> {
+        Ok(self.state.renderer.push_registered(handle, command)?)
     }
 
     /// Capture a snapshot of the full host machine state.
