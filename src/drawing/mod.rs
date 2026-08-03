@@ -17,6 +17,7 @@ mod vertex;
 pub use color::Color;
 pub use gabor::GaborParams;
 pub use model::{Bounds3D, ModelError, ModelHandle, ModelInfo, PerspectiveCamera};
+pub use renderer::{BuiltinPipeline, PipelineSuite};
 pub use stimuli::{GratingParams, NoiseParams, NoiseType, WaveType};
 pub use texture::TextureHandle;
 

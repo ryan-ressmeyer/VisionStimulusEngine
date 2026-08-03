@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
@@ -175,7 +176,7 @@ mod mesh_normals_fs {
 /// the prerequisite for later suite-subselection and user-registered pipelines
 /// (see `docs/design/pipeline-flexibility.md`).
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum BuiltinPipeline {
+pub enum BuiltinPipeline {
     FlatColor,
     Textured,
     Grating,
@@ -184,6 +185,74 @@ pub(crate) enum BuiltinPipeline {
     SubtractiveGabor,
     Dot,
     MeshNormals,
+}
+
+/// The set of built-in pipelines to build for a session.
+///
+/// Chosen on the builder via [`VSEContextBuilder::with_pipelines`]. Only the
+/// selected pipelines are compiled at startup; a draw whose pipeline is absent
+/// is skipped at render time (with a one-time warning) rather than panicking.
+///
+/// The default is the full suite (all eight built-ins), so existing code that
+/// never calls `with_pipelines` is unaffected.
+///
+/// [`VSEContextBuilder::with_pipelines`]: crate::prelude::VSEContextBuilder::with_pipelines
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipelineSuite {
+    enabled: HashSet<BuiltinPipeline>,
+}
+
+impl PipelineSuite {
+    /// A suite containing no built-in pipelines.
+    pub fn empty() -> Self {
+        Self {
+            enabled: HashSet::new(),
+        }
+    }
+
+    /// A minimal suite: [`BuiltinPipeline::FlatColor`] only.
+    pub fn minimal() -> Self {
+        Self::empty().with(BuiltinPipeline::FlatColor)
+    }
+
+    /// Add a built-in pipeline to the suite (chainable).
+    pub fn with(mut self, pipeline: BuiltinPipeline) -> Self {
+        self.enabled.insert(pipeline);
+        self
+    }
+
+    /// Remove a built-in pipeline from the suite (chainable).
+    pub fn without(mut self, pipeline: BuiltinPipeline) -> Self {
+        self.enabled.remove(&pipeline);
+        self
+    }
+
+    /// Whether the suite contains the given built-in pipeline.
+    pub fn contains(&self, pipeline: BuiltinPipeline) -> bool {
+        self.enabled.contains(&pipeline)
+    }
+
+    /// Number of built-in pipelines in the suite.
+    pub fn len(&self) -> usize {
+        self.enabled.len()
+    }
+
+    /// Whether the suite is empty.
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_empty()
+    }
+}
+
+impl Default for PipelineSuite {
+    /// The full built-in suite (all eight pipelines) — today's default behavior.
+    fn default() -> Self {
+        Self {
+            enabled: builtin_pipeline_descriptors()
+                .into_iter()
+                .map(|descriptor| descriptor.key)
+                .collect(),
+        }
+    }
 }
 
 /// Builds a single built-in pipeline. The uniform `(device, swapchain_format,
@@ -254,26 +323,31 @@ pub(crate) struct Pipelines {
 }
 
 impl Pipelines {
-    /// Build the full built-in suite from [`builtin_pipeline_descriptors`].
+    /// Build only the pipelines selected by `suite` from
+    /// [`builtin_pipeline_descriptors`]. Descriptors whose key is not in the
+    /// suite are skipped, so their shaders are never compiled.
     fn new(
         device: &Arc<Device>,
         swapchain_format: Format,
         depth_format: Format,
+        suite: &PipelineSuite,
     ) -> Result<Self, RendererError> {
         let mut pipelines = HashMap::new();
         for descriptor in builtin_pipeline_descriptors() {
+            if !suite.contains(descriptor.key) {
+                continue;
+            }
             let pipeline = (descriptor.build)(device, swapchain_format, depth_format)?;
             pipelines.insert(descriptor.key, pipeline);
         }
         Ok(Self { pipelines })
     }
 
-    /// Fetch a built-in pipeline by key. Panics if the key is absent, which for
-    /// the always-complete built-in suite is a programming error.
-    fn get(&self, key: BuiltinPipeline) -> &Arc<GraphicsPipeline> {
-        self.pipelines
-            .get(&key)
-            .expect("built-in pipeline missing from registry")
+    /// Fetch a built-in pipeline by key, or `None` if it is not in the active
+    /// suite. The render path uses this to skip (and warn about) absent
+    /// pipelines rather than panicking.
+    fn get_opt(&self, key: BuiltinPipeline) -> Option<&Arc<GraphicsPipeline>> {
+        self.pipelines.get(&key)
     }
 }
 
@@ -359,16 +433,23 @@ pub(crate) struct Renderer {
     draw_commands_3d: Vec<DrawCommand3D>,
     flat_vertex_scratch: Vec<Vertex2D>,
     dot_instance_scratch: Vec<DotInstance>,
+
+    /// Built-in pipeline kinds already warned about as absent from the suite.
+    /// Interior-mutable so the warn-once check works inside the render loops,
+    /// which borrow `self` immutably. Ensures we warn once per kind, not once
+    /// per frame.
+    warned_absent_pipelines: RefCell<HashSet<BuiltinPipeline>>,
 }
 
 impl Renderer {
-    /// Create a new Renderer with compiled pipelines.
+    /// Create a new Renderer, compiling only the pipelines in `suite`.
     pub fn new(
         device: Arc<Device>,
         queue: Arc<Queue>,
         swapchain_format: Format,
         image_count: usize,
         extent: [u32; 2],
+        suite: &PipelineSuite,
     ) -> Result<Self, RendererError> {
         let command_buffer_allocator: Arc<dyn CommandBufferAllocator> = Arc::new(
             StandardCommandBufferAllocator::new(device.clone(), Default::default()),
@@ -380,7 +461,7 @@ impl Renderer {
 
         let dot_quad_buffer = Self::create_dot_quad_buffer(memory_allocator.clone())?;
         let depth_format = Self::select_depth_format(&device)?;
-        let pipelines = Pipelines::new(&device, swapchain_format, depth_format)?;
+        let pipelines = Pipelines::new(&device, swapchain_format, depth_format, suite)?;
         let depth_views =
             Self::create_depth_views(memory_allocator.clone(), depth_format, image_count, extent)?;
 
@@ -402,7 +483,20 @@ impl Renderer {
             draw_commands_3d: Vec::with_capacity(16),
             flat_vertex_scratch: Vec::new(),
             dot_instance_scratch: Vec::new(),
+            warned_absent_pipelines: RefCell::new(HashSet::new()),
         })
+    }
+
+    /// Warn once (per pipeline kind) that a queued draw was skipped because its
+    /// built-in pipeline is not in the active [`PipelineSuite`].
+    fn warn_absent_pipeline(&self, key: BuiltinPipeline) {
+        if self.warned_absent_pipelines.borrow_mut().insert(key) {
+            tracing::warn!(
+                "skipping draw: built-in pipeline {key:?} is not in the active PipelineSuite; \
+                 add it with `.with_pipelines(PipelineSuite::default())` or \
+                 `PipelineSuite::...with(BuiltinPipeline::{key:?})`"
+            );
+        }
     }
 
     /// Push a draw command onto the queue.
@@ -619,7 +713,12 @@ impl Renderer {
                 for instance in &model.instances {
                     let primitive = &model.primitives[instance.primitive_index];
                     let world = *model_transform * instance.local_transform;
-                    let mesh_normals_pipeline = self.pipelines.get(BuiltinPipeline::MeshNormals);
+                    let Some(mesh_normals_pipeline) =
+                        self.pipelines.get_opt(BuiltinPipeline::MeshNormals)
+                    else {
+                        self.warn_absent_pipeline(BuiltinPipeline::MeshNormals);
+                        continue;
+                    };
                     builder
                         .bind_pipeline_graphics(mesh_normals_pipeline.clone())
                         .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
@@ -683,41 +782,44 @@ impl Renderer {
         // Generate flat-color vertices from queued commands
         self.fill_flat_color_vertices();
         if !self.flat_vertex_scratch.is_empty() {
-            let vertex_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                self.flat_vertex_scratch.iter().copied(),
-            )
-            .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
-
-            let vertex_count = vertex_buffer.len() as u32;
-            let flat_color_pipeline = self.pipelines.get(BuiltinPipeline::FlatColor);
-            builder
-                .bind_pipeline_graphics(flat_color_pipeline.clone())
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                .push_constants(
-                    flat_color_pipeline.layout().clone(),
-                    0,
-                    flat_color_vs::PushConstants {
-                        viewport_size: [viewport_extent[0] as f32, viewport_extent[1] as f32],
+            if let Some(flat_color_pipeline) = self.pipelines.get_opt(BuiltinPipeline::FlatColor) {
+                let vertex_buffer = Buffer::from_iter(
+                    self.memory_allocator.clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::VERTEX_BUFFER,
+                        ..Default::default()
                     },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    self.flat_vertex_scratch.iter().copied(),
                 )
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                .bind_vertex_buffers(0, vertex_buffer)
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
-            // SAFETY: vertex data matches the pipeline's vertex input state
-            unsafe {
+                .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
+
+                let vertex_count = vertex_buffer.len() as u32;
                 builder
-                    .draw(vertex_count, 1, 0, 0)
+                    .bind_pipeline_graphics(flat_color_pipeline.clone())
+                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                    .push_constants(
+                        flat_color_pipeline.layout().clone(),
+                        0,
+                        flat_color_vs::PushConstants {
+                            viewport_size: [viewport_extent[0] as f32, viewport_extent[1] as f32],
+                        },
+                    )
+                    .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
+                    .bind_vertex_buffers(0, vertex_buffer)
                     .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+                // SAFETY: vertex data matches the pipeline's vertex input state
+                unsafe {
+                    builder
+                        .draw(vertex_count, 1, 0, 0)
+                        .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
+                }
+            } else {
+                self.warn_absent_pipeline(BuiltinPipeline::FlatColor);
             }
         }
 
@@ -741,6 +843,11 @@ impl Renderer {
                 _ => continue,
             };
 
+            let Some(textured_pipeline) = self.pipelines.get_opt(BuiltinPipeline::Textured) else {
+                self.warn_absent_pipeline(BuiltinPipeline::Textured);
+                continue;
+            };
+
             let resources = self
                 .textures
                 .get(&texture_id)
@@ -762,7 +869,6 @@ impl Renderer {
             )
             .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
 
-            let textured_pipeline = self.pipelines.get(BuiltinPipeline::Textured);
             builder
                 .bind_pipeline_graphics(textured_pipeline.clone())
                 .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
@@ -876,17 +982,39 @@ impl Renderer {
             .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
 
             let first_pass = if is_grating {
-                (self.pipelines.get(BuiltinPipeline::Grating), 0u32)
+                let Some(pipeline) = self.pipelines.get_opt(BuiltinPipeline::Grating) else {
+                    self.warn_absent_pipeline(BuiltinPipeline::Grating);
+                    continue;
+                };
+                (pipeline, 0u32)
             } else if additive {
-                (self.pipelines.get(BuiltinPipeline::AdditiveGabor), 1u32)
+                let Some(pipeline) = self.pipelines.get_opt(BuiltinPipeline::AdditiveGabor) else {
+                    self.warn_absent_pipeline(BuiltinPipeline::AdditiveGabor);
+                    continue;
+                };
+                (pipeline, 1u32)
             } else {
-                (self.pipelines.get(BuiltinPipeline::Gabor), 0u32)
+                let Some(pipeline) = self.pipelines.get_opt(BuiltinPipeline::Gabor) else {
+                    self.warn_absent_pipeline(BuiltinPipeline::Gabor);
+                    continue;
+                };
+                (pipeline, 0u32)
             };
             // Normalized swapchain formats cannot reliably carry a negative
             // fragment source into ONE+ONE blending. Split signed modulation
-            // into positive-add and negative-magnitude subtract passes.
-            let second_pass =
-                additive.then_some((self.pipelines.get(BuiltinPipeline::SubtractiveGabor), 2u32));
+            // into positive-add and negative-magnitude subtract passes. If the
+            // subtractive pipeline is absent, skip just the second pass.
+            let second_pass = if additive {
+                match self.pipelines.get_opt(BuiltinPipeline::SubtractiveGabor) {
+                    Some(pipeline) => Some((pipeline, 2u32)),
+                    None => {
+                        self.warn_absent_pipeline(BuiltinPipeline::SubtractiveGabor);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
 
             for (pipeline, composite_mode) in std::iter::once(first_pass).chain(second_pass) {
                 builder
@@ -960,8 +1088,12 @@ impl Renderer {
             )
             .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
 
+            let Some(dot_pipeline) = self.pipelines.get_opt(BuiltinPipeline::Dot) else {
+                self.warn_absent_pipeline(BuiltinPipeline::Dot);
+                continue;
+            };
+
             let c = color.to_array();
-            let dot_pipeline = self.pipelines.get(BuiltinPipeline::Dot);
             builder
                 .bind_pipeline_graphics(dot_pipeline.clone())
                 .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
@@ -1094,10 +1226,18 @@ impl Renderer {
         )
         .map_err(|e| RendererError::TextureCreationFailed(e.to_string()))?;
 
-        // Create descriptor set
+        // Create descriptor set. The layout comes from the textured pipeline, so
+        // loading a texture requires it to be in the active suite.
         let layout = self
             .pipelines
-            .get(BuiltinPipeline::Textured)
+            .get_opt(BuiltinPipeline::Textured)
+            .ok_or_else(|| {
+                RendererError::DescriptorSetFailed(
+                    "textured pipeline not in active PipelineSuite — add BuiltinPipeline::Textured \
+                     to load textures"
+                        .to_string(),
+                )
+            })?
             .layout()
             .set_layouts()
             .first()
@@ -1623,6 +1763,51 @@ mod tests {
         // Exactly the eight built-ins, no duplicates (array len already asserts 8).
         assert_eq!(keys.len(), 8, "descriptor keys must be unique");
         assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn pipeline_suite_default_contains_all_eight_builtins() {
+        let suite = PipelineSuite::default();
+        for descriptor in builtin_pipeline_descriptors() {
+            assert!(
+                suite.contains(descriptor.key),
+                "default suite must contain {:?}",
+                descriptor.key
+            );
+        }
+        // And exactly eight, no more.
+        assert_eq!(suite.len(), 8);
+    }
+
+    #[test]
+    fn pipeline_suite_minimal_contains_only_flat_color() {
+        let suite = PipelineSuite::minimal();
+        assert!(suite.contains(BuiltinPipeline::FlatColor));
+        assert_eq!(suite.len(), 1);
+        assert!(!suite.contains(BuiltinPipeline::Textured));
+    }
+
+    #[test]
+    fn pipeline_suite_empty_contains_none() {
+        let suite = PipelineSuite::empty();
+        assert_eq!(suite.len(), 0);
+        for descriptor in builtin_pipeline_descriptors() {
+            assert!(!suite.contains(descriptor.key));
+        }
+    }
+
+    #[test]
+    fn pipeline_suite_with_and_without_add_and_remove_keys() {
+        let suite = PipelineSuite::empty().with(BuiltinPipeline::Dot);
+        assert!(suite.contains(BuiltinPipeline::Dot));
+        assert!(!suite.contains(BuiltinPipeline::Gabor));
+
+        let suite = suite.with(BuiltinPipeline::Gabor);
+        assert!(suite.contains(BuiltinPipeline::Gabor));
+
+        let suite = suite.without(BuiltinPipeline::Dot);
+        assert!(!suite.contains(BuiltinPipeline::Dot));
+        assert!(suite.contains(BuiltinPipeline::Gabor));
     }
 
     #[test]

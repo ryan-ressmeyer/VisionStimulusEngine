@@ -12,7 +12,7 @@ use super::{
 };
 use crate::data::ExperimentSession;
 use crate::drawing::renderer::RendererError;
-use crate::drawing::ModelError;
+use crate::drawing::{ModelError, PipelineSuite};
 
 use super::context::VSEContext;
 
@@ -127,6 +127,9 @@ pub struct VSEConfig {
     /// Enable the opt-in host↔scanout clock bridge (see [`VSEContextBuilder::with_host_clock_bridge`]).
     /// Off by default: display timing lives in the scanout clock and needs no bridge.
     pub host_clock_bridge: bool,
+    /// Which built-in graphics pipelines to compile at startup
+    /// (see [`VSEContextBuilder::with_pipelines`]). Defaults to the full suite.
+    pub pipeline_suite: PipelineSuite,
 }
 
 impl Default for VSEConfig {
@@ -145,6 +148,7 @@ impl Default for VSEConfig {
             direct_display_video_mode: None,
             direct_display_acquisition_order: None,
             host_clock_bridge: false,
+            pipeline_suite: PipelineSuite::default(),
         }
     }
 }
@@ -287,6 +291,26 @@ impl VSEContextBuilder {
     /// Use this if you know your environment and want to skip failed probes.
     pub fn with_acquisition_order(mut self, order: Vec<AcquisitionMethod>) -> Self {
         self.config.direct_display_acquisition_order = Some(order);
+        self
+    }
+
+    /// Select which built-in graphics pipelines VSE compiles at startup.
+    ///
+    /// By default the full suite ([`PipelineSuite::default`]) is built, so every
+    /// built-in `draw_*` works. Subselecting skips compiling unused pipelines;
+    /// a draw whose pipeline was not built is skipped at render time with a
+    /// one-time warning rather than causing an error.
+    ///
+    /// ```no_run
+    /// use vision_stimulus_engine::prelude::*;
+    ///
+    /// let context = VSEContext::builder()
+    ///     .with_pipelines(PipelineSuite::minimal().with(BuiltinPipeline::Dot))
+    ///     .build()?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn with_pipelines(mut self, suite: PipelineSuite) -> Self {
+        self.config.pipeline_suite = suite;
         self
     }
 

@@ -172,6 +172,7 @@ impl VSEContext {
             swapchain.format(),
             swapchain.images().len(),
             swapchain.extent(),
+            &config.pipeline_suite,
         )?;
 
         // Initialize timing
@@ -299,6 +300,7 @@ impl VSEContext {
             swapchain.format(),
             swapchain.images().len(),
             swapchain.extent(),
+            &config.pipeline_suite,
         )?;
 
         let clock = Clock::new();

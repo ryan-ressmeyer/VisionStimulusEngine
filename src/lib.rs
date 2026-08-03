@@ -42,8 +42,9 @@ pub mod prelude {
         OverflowBehavior, ParquetDataWriter,
     };
     pub use crate::drawing::{
-        Bounds3D, Color, GaborParams, GratingParams, ModelError, ModelHandle, ModelInfo,
-        NoiseParams, NoiseType, PerspectiveCamera, TextureHandle, WaveType,
+        Bounds3D, BuiltinPipeline, Color, GaborParams, GratingParams, ModelError, ModelHandle,
+        ModelInfo, NoiseParams, NoiseType, PerspectiveCamera, PipelineSuite, TextureHandle,
+        WaveType,
     };
     pub use crate::host::HostInfo;
     pub use crate::timing::{
