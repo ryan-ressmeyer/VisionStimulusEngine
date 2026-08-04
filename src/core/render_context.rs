@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tracing::warn;
 use winit::{dpi::LogicalPosition, window::Fullscreen};
 
-use super::config::{VSEConfig, VSEError};
+use super::config::{RenderConfig, VSEError};
 use super::input::{
     DisplayBackend, InputEvent, KeyCode, MonitorInfo, MouseButton, VideoModeInfo, WindowMode,
 };
@@ -27,7 +27,7 @@ use crate::timing::{Clock, ScanoutTimestamp, Timestamp, TimingSource};
 /// This provides access to rendering operations during the frame callback.
 pub struct RenderContext<'a> {
     pub(super) state: &'a mut VSEState,
-    pub(super) config: &'a mut VSEConfig,
+    pub(super) config: &'a mut RenderConfig,
 }
 
 impl<'a> RenderContext<'a> {
@@ -1238,7 +1238,7 @@ impl<'a> RenderContext<'a> {
             w.set_fullscreen(fullscreen);
 
             // Auto-update cursor visibility if not explicitly overridden by config
-            if self.config.cursor_visible.is_none() {
+            if !present.cursor_visibility_overridden {
                 let visible = matches!(mode, WindowMode::Windowed);
                 present.cursor_visible = visible;
                 w.set_cursor_visible(visible);
@@ -1288,7 +1288,7 @@ fn monitor_handle_to_info(index: usize, handle: &winit::monitor::MonitorHandle) 
 /// [`HeadlessContext::capture_host_info`](crate::core::HeadlessContext::capture_host_info):
 /// the headless context has no `RenderContext` to hand out when it is not
 /// running a frame, but the snapshot does not need one.
-pub(super) fn capture_host_info(state: &VSEState, config: &VSEConfig) -> crate::host::HostInfo {
+pub(super) fn capture_host_info(state: &VSEState, config: &RenderConfig) -> crate::host::HostInfo {
     // Headless runs report the offscreen target in place of a swapchain,
     // and no present-timing observations — there was no presentation to
     // observe. The `SwapchainInfo` strings say so explicitly.

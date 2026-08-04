@@ -19,10 +19,9 @@ only as well as the two implementations happened to agree.
 ```rust
 use vision_stimulus_engine::prelude::*;
 
-let mut headless = VSEContext::builder()
-    .with_headless(512, 512)
+let mut headless = HeadlessContext::builder(512, 512)
     .with_clear_color(0.5, 0.5, 0.5, 1.0)
-    .build_headless()?;
+    .build()?;
 
 let mut frame = 0u64;
 headless.run_headless(
@@ -44,7 +43,7 @@ headless.run_headless(
 )?;
 ```
 
-`build_headless()` replaces `build()`, and `run_headless()` replaces `run()`.
+`HeadlessContext::builder()` selects the offscreen builder, and `run_headless()` replaces a displayed runtime.
 Everything between — every `draw_*` call, `load_image`, `register_pipeline`,
 `draw_with`, `draw_custom`, `record_frame` — is unchanged, so an experiment's
 render closure runs in both modes as written.
@@ -79,9 +78,8 @@ Build the target from the recording rather than from arguments you retype:
 ```rust
 let recovered: HostInfo = serde_json::from_str(&std::fs::read_to_string("host_info.json")?)?;
 
-let mut regenerated = VSEContext::builder()
-    .with_headless_from_host_info(&recovered)?
-    .build_headless()?;
+let mut regenerated = HeadlessContext::builder_from_host_info(&recovered)?
+    .build()?;
 ```
 
 That takes the color format, extent, and pipeline suite from

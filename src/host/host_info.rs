@@ -3,9 +3,9 @@
 //! All structs derive Serialize for flexible output (JSON, TOML, etc.) and
 //! Deserialize so a recorded snapshot can be read back — post-hoc stimulus
 //! regeneration reconstructs its render target from exactly this metadata
-//! (see [`VSEContextBuilder::with_headless_from_host_info`]).
+//! (see [`HeadlessContext::builder_from_host_info`]).
 //!
-//! [`VSEContextBuilder::with_headless_from_host_info`]: crate::prelude::VSEContextBuilder::with_headless_from_host_info
+//! [`HeadlessContext::builder_from_host_info`]: crate::prelude::HeadlessContext::builder_from_host_info
 //! and Debug/Clone for inspection and copying.
 
 use serde::{Deserialize, Serialize};

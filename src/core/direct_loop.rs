@@ -36,7 +36,7 @@ impl VSEContext {
         if let Some(setup) = setup {
             let mut setup_ctx = RenderContext {
                 state: &mut state,
-                config: &mut config,
+                config: &mut config.render,
             };
             setup(&mut setup_ctx)?;
         }
@@ -80,7 +80,7 @@ impl VSEContext {
 
             let mut render_ctx = RenderContext {
                 state: &mut state,
-                config: &mut config,
+                config: &mut config.render,
             };
 
             if let Err(e) = render_fn(&mut render_ctx) {

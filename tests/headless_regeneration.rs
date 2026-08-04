@@ -41,11 +41,10 @@ fn a_session_rebuilt_from_its_recorded_host_info_regenerates_the_same_pixels() {
     let suite = PipelineSuite::minimal().with(BuiltinPipeline::Dot);
 
     // --- The "recorded" session ---
-    let mut original = VSEContext::builder()
-        .with_headless(48, 32)
+    let mut original = HeadlessContext::builder(48, 32)
         .with_pipelines(suite.clone())
         .with_clear_color(0.25, 0.25, 0.25, 1.0)
-        .build_headless()
+        .build()
         .expect("headless context");
     let recorded_info = original.capture_host_info();
     let original_pixels = render_scene(&mut original);
@@ -56,11 +55,10 @@ fn a_session_rebuilt_from_its_recorded_host_info_regenerates_the_same_pixels() {
     let recovered: HostInfo = serde_json::from_str(&json).expect("deserialize host info");
 
     // --- The regeneration ---
-    let mut regenerated = VSEContext::builder()
-        .with_headless_from_host_info(&recovered)
+    let mut regenerated = HeadlessContext::builder_from_host_info(&recovered)
         .expect("host info describes a renderable target")
         .with_clear_color(0.25, 0.25, 0.25, 1.0)
-        .build_headless()
+        .build()
         .expect("regenerated headless context");
 
     assert_eq!(
@@ -90,9 +88,8 @@ fn a_session_rebuilt_from_its_recorded_host_info_regenerates_the_same_pixels() {
 
 #[test]
 fn host_info_from_a_headless_run_is_not_mistakable_for_a_presented_one() {
-    let mut ctx = VSEContext::builder()
-        .with_headless(16, 16)
-        .build_headless()
+    let mut ctx = HeadlessContext::builder(16, 16)
+        .build()
         .expect("headless context");
     let info = ctx.capture_host_info();
 
@@ -103,6 +100,8 @@ fn host_info_from_a_headless_run_is_not_mistakable_for_a_presented_one() {
     );
     assert_eq!(info.swapchain.image_count, 1);
     assert_eq!(info.swapchain.extent, [16, 16]);
+    assert_eq!(info.pipeline.window_size, (16, 16));
+    assert_eq!(info.pipeline.present_mode, "n/a (headless)");
 
     // And its flips are tagged as synthesized, never measured.
     let sources = RefCell::new(Vec::new());

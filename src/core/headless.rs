@@ -33,7 +33,7 @@ use vulkano::format::Format;
 use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 
-use super::config::{VSEConfig, VSEError};
+use super::config::{HeadlessConfig, HeadlessContextBuilder, VSEError};
 use super::device::DeviceSelector;
 use super::input::InputState;
 use super::render_context::RenderContext;
@@ -165,23 +165,34 @@ impl OffscreenTarget {
 ///
 /// Unlike [`VSEContext`](super::context::VSEContext), whose GPU state cannot
 /// exist until a window does, this is fully constructed by
-/// [`VSEContextBuilder::build_headless`](super::config::VSEContextBuilder::build_headless)
+/// [`HeadlessContext::builder`] or [`HeadlessContext::builder_from_host_info`]
 /// — there is no surface to negotiate, so nothing has to wait for a run loop.
 pub struct HeadlessContext {
-    config: VSEConfig,
+    config: HeadlessConfig,
     state: VSEState,
 }
 
 impl HeadlessContext {
-    /// Build the GPU core and offscreen target. Called by
-    /// [`VSEContextBuilder::build_headless`](super::config::VSEContextBuilder::build_headless).
+    /// Start configuring an offscreen context with the requested extent.
+    pub fn builder(width: u32, height: u32) -> HeadlessContextBuilder {
+        HeadlessContextBuilder::new(width, height)
+    }
+
+    /// Start configuring an offscreen context from recorded render-target metadata.
+    pub fn builder_from_host_info(
+        info: &crate::host::HostInfo,
+    ) -> Result<HeadlessContextBuilder, VSEError> {
+        HeadlessContextBuilder::from_host_info(info)
+    }
+
+    /// Build the GPU core and offscreen target. Called by [`HeadlessContextBuilder::build`].
     pub(super) fn new(
-        config: VSEConfig,
+        config: HeadlessConfig,
         session: Option<ExperimentSession>,
-        format: Format,
-        extent: [u32; 2],
     ) -> Result<Self, VSEError> {
-        let device_selector = DeviceSelector::new(config.gpu_preference)?;
+        let format = config.format;
+        let extent = config.extent;
+        let device_selector = DeviceSelector::new(config.render.gpu_preference)?;
         let (device, queue) = device_selector.create_standard_device()?;
 
         let renderer = Renderer::new(
@@ -190,7 +201,7 @@ impl HeadlessContext {
             format,
             1,
             extent,
-            &config.pipeline_suite,
+            &config.render.pipeline_suite,
         )?;
 
         let memory_allocator = renderer.memory_allocator();
@@ -230,6 +241,7 @@ impl HeadlessContext {
         .map_err(|e| VSEError::Window(format!("readback buffer allocation failed: {e}")))?;
 
         let frame_interval = config
+            .render
             .expected_refresh_rate
             .map(|hz| Duration::from_micros((1_000_000.0 / hz) as u64))
             .unwrap_or(DEFAULT_FRAME_INTERVAL);
@@ -289,7 +301,7 @@ impl HeadlessContext {
     /// would report a color space and present mode — so a regeneration's
     /// metadata is never mistakable for a recording's.
     pub fn capture_host_info(&self) -> crate::host::HostInfo {
-        super::render_context::capture_host_info(&self.state, &self.config)
+        super::render_context::capture_host_info(&self.state, &self.config.render)
     }
 
     fn offscreen(&self) -> &OffscreenTarget {
@@ -315,9 +327,8 @@ impl HeadlessContext {
     /// use vision_stimulus_engine::prelude::*;
     ///
     /// # fn demo() -> Result<(), VSEError> {
-    /// let mut headless = VSEContext::builder()
-    ///     .with_headless(256, 256)
-    ///     .build_headless()?;
+    /// let mut headless = HeadlessContext::builder(256, 256)
+    ///     .build()?;
     ///
     /// let mut frames = 0;
     /// headless.run_headless(
@@ -371,7 +382,7 @@ impl HeadlessContext {
         let mut setup_state = {
             let mut ctx = RenderContext {
                 state: &mut self.state,
-                config: &mut self.config,
+                config: &mut self.config.render,
             };
             setup(&mut ctx)?
         };
@@ -380,7 +391,7 @@ impl HeadlessContext {
             {
                 let mut ctx = RenderContext {
                     state: &mut self.state,
-                    config: &mut self.config,
+                    config: &mut self.config.render,
                 };
                 render(&mut ctx, &mut setup_state)?;
             }

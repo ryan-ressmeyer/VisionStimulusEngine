@@ -33,10 +33,9 @@ fn render_one_frame(
     let pixels = RefCell::new(Vec::new());
     let mut draw = draw;
 
-    let mut ctx = VSEContext::builder()
-        .with_headless(width, height)
+    let mut ctx = HeadlessContext::builder(width, height)
         .with_clear_color(clear.r, clear.g, clear.b, clear.a)
-        .build_headless()
+        .build()
         .expect("headless context creation requires a Vulkan device but no display");
 
     ctx.run_headless(
@@ -272,10 +271,9 @@ fn a_registered_draw_composites_between_the_builtins_queued_around_it() {
     let height = 64;
     let pixels = RefCell::new(Vec::new());
 
-    let mut ctx = VSEContext::builder()
-        .with_headless(width, height)
+    let mut ctx = HeadlessContext::builder(width, height)
         .with_clear_color(0.0, 0.0, 0.0, 1.0)
-        .build_headless()
+        .build()
         .expect("headless context");
 
     ctx.run_headless_with_setup(

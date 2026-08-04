@@ -13,7 +13,7 @@ use super::host_info::{
     BuildInfo, CpuInfo, DisplayInfo, GpuInfo, HostInfo, MemoryInfo, OsInfo, PipelineConfig,
     RuntimeEnv, SwapchainInfo, TimingCapabilities,
 };
-use crate::core::{SwapchainManager, VSEConfig};
+use crate::core::{RenderConfig, SwapchainManager};
 use vulkano::device::Device;
 
 /// Capture operating system information
@@ -192,12 +192,16 @@ pub fn capture_swapchain_info(swapchain_manager: &SwapchainManager) -> Swapchain
 }
 
 /// Capture user-configured pipeline settings
-pub fn capture_pipeline_config(config: &VSEConfig) -> PipelineConfig {
+pub(crate) fn capture_pipeline_config(
+    config: &RenderConfig,
+    target_size: (u32, u32),
+    present_mode: String,
+) -> PipelineConfig {
     PipelineConfig {
-        window_size: (config.window_width, config.window_height),
+        window_size: target_size,
         clear_color: config.clear_color,
         gpu_preference: format!("{:?}", config.gpu_preference),
-        present_mode: format!("{:?}", config.present_mode),
+        present_mode,
         expected_refresh_rate: config.expected_refresh_rate,
         builtin_pipelines: config
             .pipeline_suite
@@ -344,7 +348,7 @@ pub fn capture_host_info(
     device: &Arc<Device>,
     window: Option<&Window>,
     render_target: SwapchainInfo,
-    config: &VSEConfig,
+    config: &RenderConfig,
     observed: ObservedPresentTiming,
 ) -> HostInfo {
     let captured_at = {
@@ -381,6 +385,9 @@ pub fn capture_host_info(
             });
     timing.queue_global_priority = observed.queue_global_priority.map(|o| o.label());
 
+    let target_size = (render_target.extent[0], render_target.extent[1]);
+    let configured_present_mode = render_target.present_mode.clone();
+
     HostInfo {
         captured_at,
         os: capture_os_info(),
@@ -390,7 +397,7 @@ pub fn capture_host_info(
         timing,
         display: capture_display_info(window),
         swapchain: render_target,
-        pipeline: capture_pipeline_config(config),
+        pipeline: capture_pipeline_config(config, target_size, configured_present_mode),
         build: BuildInfo::from_compile_time(),
         runtime: capture_runtime_env(),
         edid: capture_edid(),
@@ -440,19 +447,19 @@ mod tests {
     fn pipeline_config_records_the_selected_builtin_pipelines() {
         use crate::drawing::{BuiltinPipeline, PipelineSuite};
 
-        let config = VSEConfig {
+        let config = RenderConfig {
             pipeline_suite: PipelineSuite::minimal().with(BuiltinPipeline::Dot),
             ..Default::default()
         };
 
-        let captured = capture_pipeline_config(&config);
+        let captured = capture_pipeline_config(&config, (800, 600), "Fifo".into());
 
         assert_eq!(captured.builtin_pipelines, vec!["Dot", "FlatColor"]);
     }
 
     #[test]
     fn pipeline_config_records_the_full_suite_by_default() {
-        let captured = capture_pipeline_config(&VSEConfig::default());
+        let captured = capture_pipeline_config(&RenderConfig::default(), (800, 600), "Fifo".into());
 
         assert_eq!(
             captured.builtin_pipelines,

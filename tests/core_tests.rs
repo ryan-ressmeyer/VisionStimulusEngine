@@ -19,6 +19,18 @@ fn test_present_mode_default() {
     assert_eq!(mode, PresentMode::Fifo);
 }
 
+/// Displayed and headless contexts start from distinct concrete builders.
+#[test]
+fn displayed_and_headless_builders_have_separate_entry_points() {
+    let _displayed = VSEContext::builder()
+        .with_window_size(640, 480)
+        .with_present_mode(PresentMode::Fifo);
+
+    let _headless = HeadlessContext::builder(64, 48)
+        .with_clear_color(0.25, 0.25, 0.25, 1.0)
+        .with_expected_refresh_rate(120.0);
+}
+
 /// Test builder pattern for VSEContext
 ///
 /// Note: `.build()` creates an EventLoop which must run on the main thread.

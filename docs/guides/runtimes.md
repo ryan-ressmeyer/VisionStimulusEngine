@@ -139,9 +139,8 @@ With the default depth of one, frame N+1 has already been submitted when confirm
 Headless rendering uses the same drawing and `flip()` calls as synchronous displayed rendering, but sends completed pixels to a sink instead of a display.
 
 ```rust,ignore
-let mut headless = VSEContext::builder()
-    .with_headless(512, 512)
-    .build_headless()?;
+let mut headless = HeadlessContext::builder(512, 512)
+    .build()?;
 
 headless.run_headless(
     |captured| {

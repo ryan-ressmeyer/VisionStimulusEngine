@@ -38,10 +38,9 @@ use vision_stimulus_engine::prelude::*;
 const EXTENT: u32 = 64;
 
 fn headless(suite: PipelineSuite) -> HeadlessContext {
-    VSEContext::builder()
-        .with_headless(EXTENT, EXTENT)
+    HeadlessContext::builder(EXTENT, EXTENT)
         .with_pipelines(suite)
-        .build_headless()
+        .build()
         .expect("benchmarks need a Vulkan device (no display required)")
 }
 

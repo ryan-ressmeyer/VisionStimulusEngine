@@ -10,7 +10,7 @@ use winit::{
     window::Window,
 };
 
-use super::config::{VSEConfig, VSEError};
+use super::config::{DisplayedConfig, VSEError};
 use super::device::DeviceSelector;
 use super::input::{AcquisitionMethod, InputState, WindowMode};
 use super::present_engine::{PresentEngine, ScheduledTarget};
@@ -161,6 +161,7 @@ pub(super) struct PresentTarget {
     pub(super) swapchain: SwapchainManager,
     pub(super) minimized: bool,
     pub(super) cursor_visible: bool,
+    pub(super) cursor_visibility_overridden: bool,
     pub(super) window_mode: WindowMode,
     // Timing state
     pub(super) timing_provider: Box<dyn TimingProvider>,
@@ -273,7 +274,7 @@ pub(super) fn build_timing_provider(
 /// CPU-estimate path it cannot function, so the request is refused loudly rather than silently
 /// producing a dead bridge.
 pub(super) fn build_host_bridge(
-    config: &VSEConfig,
+    config: &DisplayedConfig,
     provider: &dyn TimingProvider,
 ) -> Option<HostClockBridge> {
     if !config.host_clock_bridge {

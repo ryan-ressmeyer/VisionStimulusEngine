@@ -28,7 +28,8 @@ mod swapchain;
 
 // Public API exports
 pub use buffered::{BufferedConfig, BufferedFrame, ConfirmedFrame};
-pub use config::{FrameError, VSEConfig, VSEContextBuilder, VSEError};
+pub(crate) use config::RenderConfig;
+pub use config::{FrameError, HeadlessContextBuilder, VSEContextBuilder, VSEError};
 pub use context::VSEContext;
 pub use device::{DeviceError, DeviceSelector, GPUPreference};
 pub use external_frame::{ExternalFrameError, ExternalFramePolicy, ExternalFrameRing};

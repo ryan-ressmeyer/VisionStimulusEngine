@@ -12,7 +12,7 @@
 //!    `HostInfo` to `host_info.json`. In a real experiment this is the metadata
 //!    a *displayed* session recorded alongside its data.
 //! 2. **Regenerate.** Rebuild the render target from that JSON with
-//!    [`VSEContextBuilder::with_headless_from_host_info`] — color format,
+//!    [`HeadlessContext::builder_from_host_info`] — color format,
 //!    extent, and pipeline suite all come from the recording, not from
 //!    hand-passed arguments — replay the same closure, and write each frame to
 //!    a PNG plus a hash.
@@ -112,10 +112,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Stands in for a displayed session: what matters is that it writes the
     // HostInfo describing exactly what it rendered into.
     println!("== recording ==");
-    let mut recording = VSEContext::builder()
-        .with_headless(WIDTH, HEIGHT)
+    let mut recording = HeadlessContext::builder(WIDTH, HEIGHT)
         .with_clear_color(0.5, 0.5, 0.5, 1.0)
-        .build_headless()?;
+        .build()?;
 
     let host_info = recording.capture_host_info();
     std::fs::write(&info_path, serde_json::to_string_pretty(&host_info)?)?;
@@ -152,10 +151,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n== regenerating from {} ==", info_path.display());
     let recovered: HostInfo = serde_json::from_str(&std::fs::read_to_string(&info_path)?)?;
 
-    let mut regenerated = VSEContext::builder()
-        .with_headless_from_host_info(&recovered)?
+    let mut regenerated = HeadlessContext::builder_from_host_info(&recovered)?
         .with_clear_color(0.5, 0.5, 0.5, 1.0)
-        .build_headless()?;
+        .build()?;
 
     let mut regenerated_hashes = Vec::new();
     let mut png_error = None;

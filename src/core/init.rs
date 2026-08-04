@@ -11,7 +11,7 @@ use winit::{
     window::{Fullscreen, Window, WindowBuilder},
 };
 
-use super::config::{VSEConfig, VSEError};
+use super::config::{DisplayedConfig, VSEError};
 use super::context::VSEContext;
 use super::device::DeviceSelector;
 use super::input::{InputState, MonitorSelection, WindowMode};
@@ -50,7 +50,7 @@ impl VSEContext {
     /// Initialize Vulkan state from an event loop window target
     pub(super) fn initialize_compositor(
         elwt: &EventLoopWindowTarget<()>,
-        config: &VSEConfig,
+        config: &DisplayedConfig,
     ) -> Result<VSEState, VSEError> {
         // --- Resolve target monitor ---
         let target_monitor = match &config.monitor_selection {
@@ -163,7 +163,7 @@ impl VSEContext {
         );
 
         let (device_selector, surface) =
-            DeviceSelector::with_surface(config.gpu_preference, window.clone())?;
+            DeviceSelector::with_surface(config.render.gpu_preference, window.clone())?;
         let swapchain_size = window.inner_size();
 
         Self::initialize_present_target(
@@ -184,7 +184,7 @@ impl VSEContext {
 
     /// Initialize Vulkan state for direct display mode (no winit, no compositor).
     #[cfg(target_os = "linux")]
-    pub(super) fn initialize_direct(config: &VSEConfig) -> Result<VSEState, VSEError> {
+    pub(super) fn initialize_direct(config: &DisplayedConfig) -> Result<VSEState, VSEError> {
         use crate::core::direct_display::{acquire_display, default_acquisition_order};
         use vulkano::VulkanObject;
 
@@ -194,7 +194,8 @@ impl VSEContext {
         };
 
         let (device_selector, instance) =
-            DeviceSelector::with_direct_display(config.gpu_preference).map_err(VSEError::Device)?;
+            DeviceSelector::with_direct_display(config.render.gpu_preference)
+                .map_err(VSEError::Device)?;
 
         let phys_dev = device_selector.physical_device().handle();
 
@@ -229,7 +230,7 @@ impl VSEContext {
 
     /// Initialize the Vulkan and runtime state shared by every displayed session.
     fn initialize_present_target(
-        config: &VSEConfig,
+        config: &DisplayedConfig,
         endpoint: DisplayEndpoint,
     ) -> Result<VSEState, VSEError> {
         let DisplayEndpoint {
@@ -264,7 +265,7 @@ impl VSEContext {
             swapchain.format(),
             swapchain.images().len(),
             swapchain.extent(),
-            &config.pipeline_suite,
+            &config.render.pipeline_suite,
         )?;
 
         let clock = Clock::new();
@@ -277,6 +278,7 @@ impl VSEContext {
             timing_provider.as_ref(),
         );
         let expected_frame_duration = config
+            .render
             .expected_refresh_rate
             .map(|hz| Duration::from_micros((1_000_000.0 / hz) as u64));
 
@@ -318,6 +320,7 @@ impl VSEContext {
                 swapchain,
                 minimized: false,
                 cursor_visible,
+                cursor_visibility_overridden: config.cursor_visible.is_some(),
                 window_mode,
                 timing_provider,
                 present_engine,

@@ -8,7 +8,7 @@ use winit::event::{Event, WindowEvent};
 use winit::event_loop::ControlFlow;
 
 use super::buffered::BufferedConfig;
-use super::config::{VSEConfig, VSEError};
+use super::config::{DisplayedConfig, VSEError};
 use super::context::{RenderContext, VSEContext};
 use super::input::WindowMode;
 use super::state::{RecordingState, VSEState};
@@ -155,7 +155,7 @@ impl VSEContext {
                                 if let Some(setup) = setup.take() {
                                     let mut setup_ctx = RenderContext {
                                         state: &mut s,
-                                        config: &mut config,
+                                        config: &mut config.render,
                                     };
                                     if let Err(e) = setup(&mut setup_ctx) {
                                         *error_clone.borrow_mut() = Some(e);
@@ -210,7 +210,7 @@ impl VSEContext {
 
                                 let mut render_ctx = RenderContext {
                                     state: s,
-                                    config: &mut config,
+                                    config: &mut config.render,
                                 };
 
                                 if let Err(e) = render_fn(&mut render_ctx) {
@@ -386,7 +386,7 @@ impl VSEContext {
 
                                 let mut init_ctx = RenderContext {
                                     state: &mut s,
-                                    config: &mut vse_config,
+                                    config: &mut vse_config.render,
                                 };
                                 let init = initialize
                                     .take()
@@ -497,7 +497,7 @@ impl VSEContext {
                                 let frame = {
                                     let mut render_ctx = RenderContext {
                                         state: s,
-                                        config: &mut vse_config,
+                                        config: &mut vse_config.render,
                                     };
                                     match render(experiment, &mut render_ctx) {
                                         Ok(frame) => frame,
@@ -523,7 +523,7 @@ impl VSEContext {
                                 let submit_result = {
                                     let mut render_ctx = RenderContext {
                                         state: s,
-                                        config: &mut vse_config,
+                                        config: &mut vse_config.render,
                                     };
                                     render_ctx.submit_buffered_frame(frame)
                                 };
@@ -611,7 +611,7 @@ impl VSEContext {
 
     fn deliver_buffered_frame<S, T, C>(
         state: &mut VSEState,
-        config: &mut VSEConfig,
+        config: &mut DisplayedConfig,
         experiment: &mut S,
         pending: crate::core::buffered::PendingFrame<T>,
         confirm: &mut C,
@@ -635,7 +635,10 @@ impl VSEContext {
         }
 
         let callback_result = {
-            let mut render_ctx = RenderContext { state, config };
+            let mut render_ctx = RenderContext {
+                state,
+                config: &mut config.render,
+            };
             confirm(
                 experiment,
                 super::buffered::ConfirmedFrame {
@@ -661,7 +664,7 @@ impl VSEContext {
 
     fn drain_buffered<S, T, C>(
         state: &mut VSEState,
-        config: &mut VSEConfig,
+        config: &mut DisplayedConfig,
         experiment: &mut S,
         pending_frames: &mut std::collections::VecDeque<crate::core::buffered::PendingFrame<T>>,
         confirm: &mut C,

@@ -5,7 +5,7 @@
 
 use winit::event_loop::EventLoop;
 
-pub use super::config::{VSEConfig, VSEContextBuilder, VSEError};
+pub use super::config::{VSEContextBuilder, VSEError};
 pub use super::render_context::RenderContext;
 
 /// Main VisionStimulusEngine context
@@ -36,7 +36,7 @@ pub use super::render_context::RenderContext;
 /// }
 /// ```
 pub struct VSEContext {
-    pub(super) config: VSEConfig,
+    pub(super) config: super::config::DisplayedConfig,
     pub(super) session: Option<crate::data::ExperimentSession>,
     pub(super) event_loop: Option<EventLoop<()>>,
 }
