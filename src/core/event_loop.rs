@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::ControlFlow;
 
-use super::buffered::{BufferedConfig, FlipEvent};
+use super::buffered::BufferedConfig;
 use super::config::{VSEConfig, VSEError};
 use super::context::{RenderContext, VSEContext};
 use super::input::WindowMode;
@@ -263,155 +263,66 @@ impl VSEContext {
         Ok(())
     }
 
-    /// Run the experiment loop in buffered (pipelined) mode.
+    /// Run a stateless buffered experiment.
     ///
-    /// Unlike [`Self::run`], which blocks on every GPU fence, `run_buffered` pipelines CPU
-    /// and GPU work across frames. The callback receives two alternating event variants:
-    ///
-    /// - [`FlipEvent::Render`]: build and submit frame `N` via
-    ///   [`flip_with_payload()`](RenderContext::flip_with_payload). Fires every vblank.
-    /// - [`FlipEvent::Presented`]: GPU has confirmed frame `N - depth` was scanned out.
-    ///   `flip_info.present_time` is a confirmed timestamp. Call `record_frame(payload)?`
-    ///   here to record data with accurate timing.
-    ///
-    /// During the first `config.depth` iterations only `Render` fires (queue warming up).
-    /// On clean exit, all pending `Presented` events are drained before returning.
-    ///
-    /// # Closed-loop experiments
-    ///
-    /// The B-frame latency is explicit and predictable: when `Presented` fires for frame
-    /// `N`, frame `N+1` has already been submitted. Stimulus updates in `Presented` take
-    /// effect from frame `N+2` onward.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use std::{cell::RefCell, rc::Rc};
-    /// use vision_stimulus_engine::prelude::*;
-    ///
-    /// #[derive(serde::Serialize)]
-    /// struct FrameData { trial: u32, contrast: f32 }
-    ///
-    /// let context = VSEContext::builder().with_window_size(800, 600).build()?;
-    ///
-    /// let contrast = Rc::new(RefCell::new(1.0f32));
-    /// let trial    = Rc::new(RefCell::new(0u32));
-    /// let c = contrast.clone();
-    /// let t = trial.clone();
-    ///
-    /// context.run_buffered::<FrameData, _>(BufferedConfig::default(), move |event, vse| {
-    ///     match event {
-    ///         FlipEvent::Render => {
-    ///             vse.clear()?;
-    ///             // draw stimulus …
-    ///             let data = FrameData { trial: *t.borrow(), contrast: *c.borrow() };
-    ///             vse.flip_with_payload(None, data)?;
-    ///         }
-    ///         FlipEvent::Presented { flip_info, payload } => {
-    ///             // Confirmed hardware timing — safe to record
-    ///             vse.record_frame(payload)?;
-    ///             // Closed-loop: reduce contrast on missed frames
-    ///             if flip_info.missed {
-    ///                 *c.borrow_mut() *= 0.9;
-    ///             }
-    ///         }
-    ///         _ => {}
-    ///     }
-    ///     Ok(())
-    /// })?;
-    ///
-    /// # Ok::<(), VSEError>(())
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// Propagates any `VSEError` returned by the callback, or returns
-    /// `VSEError::EventLoop` if the underlying windowing system fails.
-    pub fn run_buffered<T, F>(self, config: BufferedConfig, callback: F) -> Result<(), VSEError>
-    where
-        T: std::any::Any + serde::Serialize + Send + 'static,
-        F: FnMut(FlipEvent<T>, &mut RenderContext<'_>) -> Result<(), VSEError> + 'static,
-    {
-        self.run_buffered_boxed(config, None, callback)
-    }
-
-    /// Like [`run_buffered`](Self::run_buffered), but runs `setup` once before
-    /// the first frame and threads its result into every event.
-    ///
-    /// The buffered counterpart of
-    /// [`run_with_setup`](Self::run_with_setup), and it exists for the same
-    /// reason: compiling a [`StimulusPipeline`](crate::prelude::StimulusPipeline)
-    /// or loading assets inside the first `Render` event would inflate that
-    /// frame past its deadline. `setup` runs after the GPU state and swapchain
-    /// exist — including the buffered depth adjustment — and before frame 0.
-    ///
-    /// ```no_run
-    /// use vision_stimulus_engine::prelude::*;
-    /// # fn demo(context: VSEContext) -> Result<(), VSEError> {
-    /// context.run_buffered_with_setup::<u32, _, _, _>(
-    ///     BufferedConfig::default(),
-    ///     |vse| vse.load_image("stimulus.png"),
-    ///     |event, vse, texture| {
-    ///         if let FlipEvent::Render = event {
-    ///             vse.draw_texture(*texture, 0.0, 0.0, 256.0, 256.0);
-    ///             vse.flip_with_payload(None, 0u32)?;
-    ///         }
-    ///         Ok(())
-    ///     },
-    /// )
-    /// # }
-    /// ```
-    pub fn run_buffered_with_setup<T, S, U, F>(
+    /// `render` builds one frame and returns its target and payload. VSE submits
+    /// that frame after the callback returns. `confirm` later receives the same
+    /// payload with confirmed presentation timing.
+    pub fn run_buffered<T, R, C>(
         self,
         config: BufferedConfig,
-        setup: S,
-        mut callback: F,
+        mut render: R,
+        mut confirm: C,
     ) -> Result<(), VSEError>
     where
-        T: std::any::Any + serde::Serialize + Send + 'static,
-        S: FnOnce(&mut RenderContext) -> Result<U, VSEError> + 'static,
-        U: 'static,
-        F: FnMut(FlipEvent<T>, &mut RenderContext<'_>, &mut U) -> Result<(), VSEError> + 'static,
+        T: 'static,
+        R: FnMut(&mut RenderContext<'_>) -> Result<super::buffered::BufferedFrame<T>, VSEError>
+            + 'static,
+        C: FnMut(
+                super::buffered::ConfirmedFrame<T>,
+                &mut RenderContext<'_>,
+            ) -> Result<(), VSEError>
+            + 'static,
     {
-        // Produced in one closure and consumed in another, so it lands in a
-        // shared slot rather than in the loop's type signature — the same shape
-        // `run_with_setup` uses.
-        let slot: Rc<RefCell<Option<U>>> = Rc::new(RefCell::new(None));
-        let setup_slot = slot.clone();
-
-        self.run_buffered_boxed(
+        self.run_buffered_with_state(
             config,
-            Some(Box::new(move |ctx| {
-                *setup_slot.borrow_mut() = Some(setup(ctx)?);
-                Ok(())
-            })),
-            move |event, ctx| {
-                let mut slot = slot.borrow_mut();
-                let state = slot
-                    .as_mut()
-                    .expect("setup runs before the first frame, so the slot is filled");
-                callback(event, ctx, state)
-            },
+            |_ctx| Ok(()),
+            move |(), ctx| render(ctx),
+            move |(), confirmed, ctx| confirm(confirmed, ctx),
         )
     }
 
-    /// Shared implementation of [`run_buffered`](Self::run_buffered) and
-    /// [`run_buffered_with_setup`](Self::run_buffered_with_setup).
-    fn run_buffered_boxed<T, F>(
+    /// Run a buffered experiment with state shared by rendering and confirmation.
+    ///
+    /// `initialize` runs once after the GPU and final buffered swapchain exist,
+    /// but before frame zero. Its result is passed to both frame callbacks.
+    pub fn run_buffered_with_state<S, T, I, R, C>(
         mut self,
         config: BufferedConfig,
-        mut setup: Option<SetupFn>,
-        mut callback: F,
+        initialize: I,
+        mut render: R,
+        mut confirm: C,
     ) -> Result<(), VSEError>
     where
-        T: std::any::Any + serde::Serialize + Send + 'static,
-        F: FnMut(FlipEvent<T>, &mut RenderContext<'_>) -> Result<(), VSEError> + 'static,
+        S: 'static,
+        T: 'static,
+        I: FnOnce(&mut RenderContext<'_>) -> Result<S, VSEError> + 'static,
+        R: FnMut(
+                &mut S,
+                &mut RenderContext<'_>,
+            ) -> Result<super::buffered::BufferedFrame<T>, VSEError>
+            + 'static,
+        C: FnMut(
+                &mut S,
+                super::buffered::ConfirmedFrame<T>,
+                &mut RenderContext<'_>,
+            ) -> Result<(), VSEError>
+            + 'static,
     {
-        // Branch for direct display mode
         #[cfg(target_os = "linux")]
         if self.config.window_mode == WindowMode::DirectDisplay {
             return Err(VSEError::EventLoop(
-                "run_buffered() does not support DirectDisplay mode".into(),
+                "buffered presentation does not support DirectDisplay mode".into(),
             ));
         }
 
@@ -423,6 +334,10 @@ impl VSEContext {
         let mut vse_config = self.config;
         let mut session = self.session;
         let mut state: Option<VSEState> = None;
+        let mut experiment_state: Option<S> = None;
+        let mut initialize = Some(initialize);
+        let mut pending_frames =
+            std::collections::VecDeque::<crate::core::buffered::PendingFrame<T>>::new();
 
         let error: Rc<RefCell<Option<VSEError>>> = Rc::new(RefCell::new(None));
         let error_clone = error.clone();
@@ -455,9 +370,6 @@ impl VSEContext {
                                     elwt.exit();
                                     return;
                                 }
-                                // The raw present engine pipelines `depth + 1` frames, so its
-                                // sync ring must have at least that many slots (+1 slack) or a
-                                // slot's fence would be reset while its frame is still in flight.
                                 let present = s.target.present_expect_mut();
                                 if let Some(engine) = &mut present.present_engine {
                                     let slots = present.swapchain.images().len() + 1;
@@ -471,15 +383,17 @@ impl VSEContext {
                                         return;
                                     }
                                 }
-                                // One-time setup AFTER the swapchain depth is
-                                // final and BEFORE frame 0, so pipeline
-                                // compilation stays off the presentation path.
-                                if let Some(setup) = setup.take() {
-                                    let mut setup_ctx = RenderContext {
-                                        state: &mut s,
-                                        config: &mut vse_config,
-                                    };
-                                    if let Err(e) = setup(&mut setup_ctx) {
+
+                                let mut init_ctx = RenderContext {
+                                    state: &mut s,
+                                    config: &mut vse_config,
+                                };
+                                let init = initialize
+                                    .take()
+                                    .expect("buffered initialization runs exactly once");
+                                match init(&mut init_ctx) {
+                                    Ok(value) => experiment_state = Some(value),
+                                    Err(e) => {
                                         *error_clone.borrow_mut() = Some(e);
                                         elwt.exit();
                                         return;
@@ -505,7 +419,6 @@ impl VSEContext {
                             WindowEvent::CloseRequested => {
                                 info!("Window close requested");
                                 s.should_close = true;
-                                // Do NOT call elwt.exit() yet — let RedrawRequested drain.
                             }
                             WindowEvent::Resized(new_size) => {
                                 debug!("Window resized to {}x{}", new_size.width, new_size.height);
@@ -528,39 +441,49 @@ impl VSEContext {
                                 if s.target.present_expect().minimized {
                                     return;
                                 }
+                                let experiment = experiment_state
+                                    .as_mut()
+                                    .expect("buffered state initialized before redraw");
 
-                                // ── Phase 1: Check for confirmed presentation ──────────
-                                let oldest_complete = s
-                                    .target
-                                    .present_expect()
-                                    .buffered_pending_frames
+                                let oldest_complete = pending_frames
                                     .front()
                                     .is_some_and(|frame| frame.submission.completion.is_complete());
-
                                 if oldest_complete {
-                                    let pending = s
-                                        .target
-                                        .present_expect_mut()
-                                        .buffered_pending_frames
+                                    let pending = pending_frames
                                         .pop_front()
                                         .expect("oldest buffered frame was just observed");
                                     if let Err(e) = Self::deliver_buffered_frame(
                                         s,
                                         &mut vse_config,
+                                        experiment,
                                         pending,
-                                        &mut callback,
+                                        &mut confirm,
                                     ) {
                                         *error_clone.borrow_mut() = Some(e);
+                                        if let Err(drain_error) = Self::drain_buffered(
+                                            s,
+                                            &mut vse_config,
+                                            experiment,
+                                            &mut pending_frames,
+                                            &mut confirm,
+                                        ) {
+                                            if error_clone.borrow().is_none() {
+                                                *error_clone.borrow_mut() = Some(drain_error);
+                                            }
+                                        }
                                         elwt.exit();
                                         return;
                                     }
                                 }
 
-                                // Early exit if callback requested close during Presented
                                 if s.should_close {
-                                    if let Err(e) =
-                                        Self::drain_buffered(s, &mut vse_config, &mut callback)
-                                    {
+                                    if let Err(e) = Self::drain_buffered(
+                                        s,
+                                        &mut vse_config,
+                                        experiment,
+                                        &mut pending_frames,
+                                        &mut confirm,
+                                    ) {
                                         *error_clone.borrow_mut() = Some(e);
                                     }
                                     if let Some(recording) = &mut s.recording {
@@ -571,25 +494,69 @@ impl VSEContext {
                                     return;
                                 }
 
-                                // ── Phase 2: Render ────────────────────────────────────
-                                {
+                                let frame = {
                                     let mut render_ctx = RenderContext {
                                         state: s,
                                         config: &mut vse_config,
                                     };
-                                    if let Err(e) = callback(FlipEvent::Render, &mut render_ctx) {
+                                    match render(experiment, &mut render_ctx) {
+                                        Ok(frame) => frame,
+                                        Err(e) => {
+                                            *error_clone.borrow_mut() = Some(e);
+                                            if let Err(drain_error) = Self::drain_buffered(
+                                                s,
+                                                &mut vse_config,
+                                                experiment,
+                                                &mut pending_frames,
+                                                &mut confirm,
+                                            ) {
+                                                if error_clone.borrow().is_none() {
+                                                    *error_clone.borrow_mut() = Some(drain_error);
+                                                }
+                                            }
+                                            elwt.exit();
+                                            return;
+                                        }
+                                    }
+                                };
+
+                                let submit_result = {
+                                    let mut render_ctx = RenderContext {
+                                        state: s,
+                                        config: &mut vse_config,
+                                    };
+                                    render_ctx.submit_buffered_frame(frame)
+                                };
+                                match submit_result {
+                                    Ok(Some(pending)) => pending_frames.push_back(pending),
+                                    Ok(None) => {}
+                                    Err(e) => {
                                         *error_clone.borrow_mut() = Some(e);
+                                        if let Err(drain_error) = Self::drain_buffered(
+                                            s,
+                                            &mut vse_config,
+                                            experiment,
+                                            &mut pending_frames,
+                                            &mut confirm,
+                                        ) {
+                                            if error_clone.borrow().is_none() {
+                                                *error_clone.borrow_mut() = Some(drain_error);
+                                            }
+                                        }
                                         elwt.exit();
                                         return;
                                     }
                                 }
 
                                 s.input.begin_frame();
-
                                 if s.should_close {
-                                    if let Err(e) =
-                                        Self::drain_buffered(s, &mut vse_config, &mut callback)
-                                    {
+                                    if let Err(e) = Self::drain_buffered(
+                                        s,
+                                        &mut vse_config,
+                                        experiment,
+                                        &mut pending_frames,
+                                        &mut confirm,
+                                    ) {
                                         *error_clone.borrow_mut() = Some(e);
                                     }
                                     if let Some(recording) = &mut s.recording {
@@ -610,7 +577,19 @@ impl VSEContext {
                         }
                     }
                     Event::LoopExiting => {
-                        if let Some(s) = &mut state {
+                        if let (Some(s), Some(experiment)) = (&mut state, experiment_state.as_mut())
+                        {
+                            if let Err(e) = Self::drain_buffered(
+                                s,
+                                &mut vse_config,
+                                experiment,
+                                &mut pending_frames,
+                                &mut confirm,
+                            ) {
+                                if error_clone.borrow().is_none() {
+                                    *error_clone.borrow_mut() = Some(e);
+                                }
+                            }
                             s.target.present_expect_mut().in_buffered_mode = false;
                             if let Some(recording) = &mut s.recording {
                                 recording.on_shutdown();
@@ -630,22 +609,21 @@ impl VSEContext {
         Ok(())
     }
 
-    /// Confirm one submitted frame, dispatch its `Presented` event, and finalize recording.
-    fn deliver_buffered_frame<T, F>(
+    fn deliver_buffered_frame<S, T, C>(
         state: &mut VSEState,
         config: &mut VSEConfig,
-        pending: crate::core::buffered::PendingFrame<Box<dyn std::any::Any + Send + 'static>>,
-        callback: &mut F,
+        experiment: &mut S,
+        pending: crate::core::buffered::PendingFrame<T>,
+        confirm: &mut C,
     ) -> Result<(), VSEError>
     where
-        T: std::any::Any + serde::Serialize + Send + 'static,
-        F: FnMut(FlipEvent<T>, &mut RenderContext<'_>) -> Result<(), VSEError>,
+        C: FnMut(
+            &mut S,
+            super::buffered::ConfirmedFrame<T>,
+            &mut RenderContext<'_>,
+        ) -> Result<(), VSEError>,
     {
         pending.submission.completion.wait_blocking();
-        let payload = *pending
-            .payload
-            .downcast::<T>()
-            .expect("buffered payload type mismatch");
         let clock = &state.clock;
         let confirmed = state
             .target
@@ -658,10 +636,11 @@ impl VSEContext {
 
         let callback_result = {
             let mut render_ctx = RenderContext { state, config };
-            callback(
-                FlipEvent::Presented {
+            confirm(
+                experiment,
+                super::buffered::ConfirmedFrame {
                     flip_info: confirmed,
-                    payload,
+                    payload: pending.payload,
                 },
                 &mut render_ctx,
             )
@@ -680,33 +659,30 @@ impl VSEContext {
         Ok(())
     }
 
-    /// Drain all remaining in-flight frames and fire `Presented` events.
-    ///
-    /// Called on clean shutdown from within `run_buffered()`. All frames are
-    /// retired even if a callback fails; the first error is returned afterward.
-    fn drain_buffered<T, F>(
+    fn drain_buffered<S, T, C>(
         state: &mut VSEState,
         config: &mut VSEConfig,
-        callback: &mut F,
+        experiment: &mut S,
+        pending_frames: &mut std::collections::VecDeque<crate::core::buffered::PendingFrame<T>>,
+        confirm: &mut C,
     ) -> Result<(), VSEError>
     where
-        T: std::any::Any + serde::Serialize + Send + 'static,
-        F: FnMut(FlipEvent<T>, &mut RenderContext<'_>) -> Result<(), VSEError>,
+        C: FnMut(
+            &mut S,
+            super::buffered::ConfirmedFrame<T>,
+            &mut RenderContext<'_>,
+        ) -> Result<(), VSEError>,
     {
         let mut first_error = None;
-        while let Some(pending) = state
-            .target
-            .present_expect_mut()
-            .buffered_pending_frames
-            .pop_front()
-        {
-            if let Err(e) = Self::deliver_buffered_frame(state, config, pending, callback) {
+        while let Some(pending) = pending_frames.pop_front() {
+            if let Err(e) =
+                Self::deliver_buffered_frame(state, config, experiment, pending, confirm)
+            {
                 if first_error.is_none() {
                     first_error = Some(e);
                 }
             }
         }
-
         first_error.map_or(Ok(()), Err)
     }
 }

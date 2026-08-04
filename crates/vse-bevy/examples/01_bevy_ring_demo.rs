@@ -64,55 +64,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let st = state.clone();
     let mut attached = false;
 
-    context.run_buffered::<u64, _>(BufferedConfig::default(), move |event, vse| {
-        match event {
-            FlipEvent::Render => {
-                if !attached {
-                    // Device exists only inside the callback (after Resumed).
-                    vse.attach_external_frame_source(
-                        producer.export_ring().map_err(box_err)?,
-                        release_tx.clone(),
-                    )?;
-                    attached = true;
-                }
-                let n = vse.frame_number();
-                let slot = producer.render_frame(n).map_err(box_err)?;
-                vse.queue_external_frame(slot)?;
-                vse.flip_with_payload(None, n)?;
-                if n + 1 >= frames {
-                    vse.close();
-                }
+    context.run_buffered(
+        BufferedConfig::default(),
+        move |vse| {
+            if !attached {
+                // Device exists only inside the callback (after Resumed).
+                vse.attach_external_frame_source(
+                    producer.export_ring().map_err(box_err)?,
+                    release_tx.clone(),
+                )?;
+                attached = true;
             }
-            FlipEvent::Presented { flip_info, .. } => {
-                let mut s = st.borrow_mut();
-                if s.source.is_none() {
-                    s.source = Some(vse.timing_source());
-                    let caps = vse.capture_host_info().timing;
-                    s.queue_priority = caps.queue_global_priority;
-                }
-                s.presented += 1;
-                s.missed_total += flip_info.missed_count as u64;
-                if flip_info.on_target {
-                    s.on_target += 1;
-                }
-                if let Some(last) = s.last_present {
-                    let dt_us = flip_info.present_time.as_micros() as i64 - last.as_micros() as i64;
-                    if s.dt_count == 0 {
-                        s.min_dt_us = dt_us;
-                        s.max_dt_us = dt_us;
-                    } else {
-                        s.min_dt_us = s.min_dt_us.min(dt_us);
-                        s.max_dt_us = s.max_dt_us.max(dt_us);
-                    }
-                    s.sum_dt_us += dt_us;
-                    s.dt_count += 1;
-                }
-                s.last_present = Some(flip_info.present_time);
+            let n = vse.frame_number();
+            let slot = producer.render_frame(n).map_err(box_err)?;
+            vse.queue_external_frame(slot)?;
+            if n + 1 >= frames {
+                vse.close();
             }
-            _ => {}
-        }
-        Ok(())
-    })?;
+            Ok(BufferedFrame::new(n))
+        },
+        move |confirmed, vse| {
+            let flip_info = confirmed.flip_info;
+            let mut s = st.borrow_mut();
+            if s.source.is_none() {
+                s.source = Some(vse.timing_source());
+                let caps = vse.capture_host_info().timing;
+                s.queue_priority = caps.queue_global_priority;
+            }
+            s.presented += 1;
+            s.missed_total += flip_info.missed_count as u64;
+            if flip_info.on_target {
+                s.on_target += 1;
+            }
+            if let Some(last) = s.last_present {
+                let dt_us = flip_info.present_time.as_micros() as i64 - last.as_micros() as i64;
+                if s.dt_count == 0 {
+                    s.min_dt_us = dt_us;
+                    s.max_dt_us = dt_us;
+                } else {
+                    s.min_dt_us = s.min_dt_us.min(dt_us);
+                    s.max_dt_us = s.max_dt_us.max(dt_us);
+                }
+                s.sum_dt_us += dt_us;
+                s.dt_count += 1;
+            }
+            s.last_present = Some(flip_info.present_time);
+            Ok(())
+        },
+    )?;
 
     report(&state.borrow(), frames, sync_kind);
     Ok(())

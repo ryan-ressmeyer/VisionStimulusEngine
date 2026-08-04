@@ -86,22 +86,15 @@ pub enum VSEError {
     #[error("Data recording error: {0}")]
     DataRecording(String),
 
-    /// `record_frame()` called in `FlipEvent::Render` arm of `run_buffered()`.
-    /// Move the `record_frame()` call to the `FlipEvent::Presented` arm.
+    /// `record_frame()` called from the render phase of a buffered loop.
     #[error(
-        "record_frame() is only valid in the FlipEvent::Presented arm — \
-             move it out of the Render arm"
+        "record_frame() requires a confirmed buffered frame — \
+             move it to the confirmation callback"
     )]
     NoConfirmedFlip,
 
-    /// `flip_with_payload()` called outside of `run_buffered()`.
-    /// Use `flip()` in the standard `run()` loop instead.
-    #[error("flip_with_payload() requires run_buffered() — use flip() inside run()")]
-    NotInBufferedMode,
-
-    /// `flip()` called inside `run_buffered()`.
-    /// Replace with `flip_with_payload()` in the Render arm.
-    #[error("flip() is not supported in run_buffered() — use flip_with_payload() instead")]
+    /// `flip()` called inside a structured buffered render callback.
+    #[error("flip() is managed by run_buffered() — return BufferedFrame from the render callback")]
     NotSupportedInBufferedMode,
 }
 

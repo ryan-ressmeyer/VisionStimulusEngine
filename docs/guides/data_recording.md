@@ -157,23 +157,22 @@ Every row in `frames.csv` / `frames.parquet` includes a `timing_source` column:
 
 ## Buffered Flip
 
-For pipelined GPU experiments, use `run_buffered()` instead of `run()`. In buffered mode,
-`record_frame()` is called in the `FlipEvent::Presented` arm, after VSE has correlated the
-frame with its present result. On the EXT path this gives scanout-clock timing; on the CPU path
-it remains a fence-time estimate. See the [buffered flips guide](buffered_flips.md) for details.
+For pipelined GPU experiments, use `run_buffered()` instead of `run()`. Call
+`record_frame()` from the confirmation callback after VSE has correlated the frame with its
+present result. On the EXT path this can provide scanout-clock timing; on the CPU path it
+remains a fence-time estimate. See the [buffered flips guide](buffered_flips.md) for details.
 
 ```rust
-context.run_buffered::<MyData, _>(BufferedConfig::default(), |event, vse| {
-    match event {
-        FlipEvent::Render => {
-            vse.flip_with_payload(None, MyData { /* ... */ })?;
-        }
-        FlipEvent::Presented { flip_info, payload } => {
-            // flip_info.present_time uses the domain identified by flip_info.timing_source
-            vse.record_frame(payload)?;
-        }
-        _ => {}
-    }
-    Ok(())
-})?;
+context.run_buffered(
+    BufferedConfig::default(),
+    |vse| {
+        // Draw the stimulus represented by this payload.
+        Ok(BufferedFrame::new(MyData { /* ... */ }))
+    },
+    |confirmed, vse| {
+        // present_time uses the domain identified by timing_source.
+        vse.record_frame(confirmed.payload)?;
+        Ok(())
+    },
+)?;
 ```

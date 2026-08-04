@@ -59,52 +59,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let st = state.clone();
     let mut attached = false;
 
-    context.run_buffered::<String, _>(BufferedConfig::default(), move |event, vse| {
-        match event {
-            FlipEvent::Render => {
-                if !attached {
-                    vse.attach_external_frame_source_with_policy(
-                        producer.export_ring().map_err(box_producer_err)?,
-                        producer.release_tx(),
-                        ExternalFramePolicy::LatestReadyHoldLast,
-                    )?;
-                    attached = true;
-                }
-
-                let vse_frame = vse.frame_number();
-                producer
-                    .request_frame(vse_frame)
-                    .map_err(box_producer_err)?;
-
-                let mut ready = Vec::new();
-                while let Some(frame) = producer.try_recv_ready().map_err(box_producer_err)? {
-                    vse.queue_external_frame_with_timeline_value(frame.slot, frame.timeline_value)?;
-                    ready.push(frame);
-                }
-
-                let log = st.borrow_mut().plan_frame_log(vse_frame, &ready);
-                vse.flip_with_payload(None, log.describe())?;
-
-                if vse_frame + 1 >= frames {
-                    vse.close();
-                }
+    let st_render = state.clone();
+    context.run_buffered(
+        BufferedConfig::default(),
+        move |vse| {
+            if !attached {
+                vse.attach_external_frame_source_with_policy(
+                    producer.export_ring().map_err(box_producer_err)?,
+                    producer.release_tx(),
+                    ExternalFramePolicy::LatestReadyHoldLast,
+                )?;
+                attached = true;
             }
-            FlipEvent::Presented { flip_info, payload } => {
-                let mut s = st.borrow_mut();
-                s.presented += 1;
-                s.missed_total += flip_info.missed_count as u64;
-                if s.timing_source.is_none() {
-                    s.timing_source = Some(vse.timing_source());
-                }
-                println!(
-                    "{} on_target={} missed_count={}",
-                    payload, flip_info.on_target, flip_info.missed_count
-                );
+
+            let vse_frame = vse.frame_number();
+            producer
+                .request_frame(vse_frame)
+                .map_err(box_producer_err)?;
+
+            let mut ready = Vec::new();
+            while let Some(frame) = producer.try_recv_ready().map_err(box_producer_err)? {
+                vse.queue_external_frame_with_timeline_value(frame.slot, frame.timeline_value)?;
+                ready.push(frame);
             }
-            _ => {}
-        }
-        Ok(())
-    })?;
+
+            let payload = st_render
+                .borrow_mut()
+                .plan_frame_log(vse_frame, &ready)
+                .describe();
+            if vse_frame + 1 >= frames {
+                vse.close();
+            }
+            Ok(BufferedFrame::new(payload))
+        },
+        move |confirmed, vse| {
+            let mut s = st.borrow_mut();
+            s.presented += 1;
+            s.missed_total += confirmed.flip_info.missed_count as u64;
+            if s.timing_source.is_none() {
+                s.timing_source = Some(vse.timing_source());
+            }
+            println!(
+                "{} on_target={} missed_count={}",
+                confirmed.payload, confirmed.flip_info.on_target, confirmed.flip_info.missed_count
+            );
+            Ok(())
+        },
+    )?;
 
     report(&state.borrow(), frames, sync_kind, timeline_forced);
     Ok(())

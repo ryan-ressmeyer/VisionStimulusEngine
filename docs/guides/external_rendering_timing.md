@@ -44,13 +44,13 @@ The existing `attach_external_frame_source(...)` method uses `ExternalFramePolic
 
 This is the default policy.
 
-For each VSE frame, the producer renders a matching external frame and queues its ring slot before `flip()` or `flip_with_payload()`:
+For each VSE frame, the producer renders a matching external frame and queues its ring slot before `flip()` or before returning a `BufferedFrame`:
 
 ```rust
 let n = vse.frame_number();
 let slot = producer.render_frame(n)?;
 vse.queue_external_frame(slot)?;
-vse.flip_with_payload(None, n)?;
+Ok(BufferedFrame::new(n))
 ```
 
 VSE consumes the queued external frame for that flip. If several frames accumulated, VSE displays the newest but still waits the older binary semaphores so those slots can be safely reused.
@@ -119,7 +119,7 @@ For analysis, distinguish these events:
 - **repeat**: VSE displayed the pinned producer slot again;
 - **stale drop**: multiple producer frames were ready and VSE displayed only the newest.
 
-The current API exposes the policy and preserves safe slot ownership. If an experiment needs per-frame external-stream annotations, include the producer frame id and repeat/drop status in the payload passed to `flip_with_payload()`.
+The current API exposes the policy and preserves safe slot ownership. If an experiment needs per-frame external-stream annotations, include the producer frame id and repeat/drop status in the payload returned with `BufferedFrame`.
 
 ---
 
@@ -127,12 +127,12 @@ The current API exposes the policy and preserves safe slot ownership. If an expe
 
 `LatestReadyHoldLast` is most useful when the external producer is nonblocking from VSE's point of view. `vse-bevy` provides both synchronous and asynchronous producer APIs.
 
-The synchronous API renders before the flip:
+A buffered render callback queues the producer slot before returning its frame:
 
 ```rust
 let slot = producer.render_frame(vse.frame_number())?;
 vse.queue_external_frame(slot)?;
-vse.flip_with_payload(None, payload)?;
+Ok(BufferedFrame::new(payload))
 ```
 
 This preserves a simple frame-indexed model, but VSE waits for Bevy.
@@ -149,12 +149,12 @@ vse.attach_external_frame_source_with_policy(
     ExternalFramePolicy::LatestReadyHoldLast,
 )?;
 
-// In FlipEvent::Render:
+// In the buffered render callback:
 producer.request_frame(vse.frame_number())?;
 while let Some(frame) = producer.try_recv_ready()? {
     vse.queue_external_frame_with_timeline_value(frame.slot, frame.timeline_value)?;
 }
-vse.flip_with_payload(None, payload)?;
+Ok(BufferedFrame::new(payload))
 ```
 
 For binary-per-slot and CPU-blocking producers, `frame.timeline_value` is `None`. For timeline-synchronized producers, it is the value signaled by the producer for that completed frame.
@@ -179,12 +179,12 @@ VSE_BEVY_FORCE_TIMELINE=1 CARGO_INCREMENTAL=0 cargo run -p vse-bevy --profile de
   --example 03_async_latest_ready_demo -- 300
 ```
 
-The example does the following in each `FlipEvent::Render` callback:
+The example does the following in each buffered render callback:
 
 1. requests the next Bevy frame with `AsyncBevyProducer::request_frame(vse.frame_number())`;
 2. drains all completed frames with `try_recv_ready()`;
 3. queues each ready slot with `queue_external_frame_with_timeline_value(frame.slot, frame.timeline_value)`;
-4. calls `flip_with_payload(None, log)` without waiting for Bevy.
+4. returns `BufferedFrame::new(log)` without waiting for Bevy.
 
 Each confirmed frame prints the external-stream decision:
 

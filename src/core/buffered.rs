@@ -1,4 +1,4 @@
-//! Buffered flip types — `BufferedConfig`, `FlipEvent<T>`, and internal fence abstraction.
+//! Structured buffered presentation types and internal fence abstraction.
 
 use crate::timing::FlipInfo;
 
@@ -29,9 +29,9 @@ pub struct BufferedConfig {
     /// | `2`     | 3               | ~33 ms           | High GPU utilization |
     ///
     /// With `depth = 1`, the CPU is always one frame ahead of the last confirmed
-    /// scanout. When `FlipEvent::Presented` fires for frame N, frame N+1 has already
-    /// been submitted to the GPU. Closed-loop updates in `Presented` take effect
-    /// from frame N+2 onward.
+    /// scanout. When confirmation arrives for frame N, frame N+1 has already
+    /// been submitted to the GPU. Closed-loop updates in the confirmation callback
+    /// take effect from frame N+2 onward.
     ///
     /// Higher values increase GPU pipeline fill and can improve frame rate
     /// stability, but each additional level adds one frame (~16 ms at 60 Hz)
@@ -45,84 +45,43 @@ impl Default for BufferedConfig {
     }
 }
 
-/// Events dispatched by [`crate::core::VSEContext::run_buffered`].
+/// One frame returned by a buffered render callback.
 ///
-/// Each vblank produces two events (after the warm-up period):
-///
-/// 1. **`Presented`** — the GPU has confirmed that frame `N - depth` was scanned out.
-///    `flip_info.present_time` carries a hardware-verified timestamp. Call
-///    `RenderContext::record_frame` here.
-/// 2. **`Render`** — build and submit frame `N`. Call
-///    `RenderContext::flip_with_payload` before returning.
-///
-/// During the first `depth` iterations the queue is warming up and only `Render`
-/// fires — there are no confirmed frames yet.
-///
-/// # Two-phase frame timeline (depth = 1)
-///
-/// ```text
-/// vblank N:   [Render N]   → submit non-blocking → GPU processing
-/// vblank N+1: [Presented N] → record confirmed timing
-///             [Render N+1] → submit non-blocking → GPU processing
-/// vblank N+2: [Presented N+1] → record confirmed timing
-///             [Render N+2] → ...
-/// ```
-///
-/// # Pattern matching
-///
-/// Because this enum is `#[non_exhaustive]`, always include a catch-all arm:
-///
-/// ```rust,ignore
-/// use vision_stimulus_engine::prelude::*;
-///
-/// #[derive(serde::Serialize)]
-/// struct FrameData { contrast: f32 }
-///
-/// let mut contrast = 1.0f32;
-///
-/// context.run_buffered::<FrameData, _>(BufferedConfig::default(), move |event, vse| {
-///     match event {
-///         FlipEvent::Render => {
-///             vse.clear()?;
-///             // draw stimulus at current contrast …
-///             vse.flip_with_payload(None, FrameData { contrast })?;
-///         }
-///         FlipEvent::Presented { flip_info, payload } => {
-///             // Confirmed timing — safe to record
-///             vse.record_frame(payload)?;
-///             // Closed-loop: reduce contrast when a frame is missed
-///             if flip_info.missed { contrast *= 0.9; }
-///         }
-///         _ => {}
-///     }
-///     Ok(())
-/// })?;
-/// # Ok::<(), vision_stimulus_engine::prelude::VSEError>(())
-/// ```
-#[non_exhaustive]
-pub enum FlipEvent<T> {
-    /// Build and submit the next frame.
-    ///
-    /// Call `RenderContext::flip_with_payload` before returning from this arm.
-    /// Drawing calls (`clear`, `draw_rect`, etc.) work normally here.
-    /// `record_frame()` is **not** valid in this arm — call it in `Presented`.
-    Render,
+/// VSE submits the frame after the callback returns, guaranteeing one submission
+/// for every successful render invocation.
+#[derive(Debug)]
+pub struct BufferedFrame<T> {
+    /// Optional scanout-clock target for this presentation.
+    pub target_time: Option<crate::timing::Timestamp>,
+    /// Per-frame data returned with the matching confirmation.
+    pub payload: T,
+}
 
-    /// A frame has been confirmed by the GPU/driver.
-    ///
-    /// `flip_info.present_time` is a scanout-clock timestamp on the `ExtPresentTiming` path;
-    /// otherwise it is derived from the fence signal.
-    ///
-    /// `payload` is the value passed to `flip_with_payload()` when this frame was rendered.
-    ///
-    /// Call `vse.record_frame(payload)?` here to record with confirmed timing.
-    /// Closed-loop stimulus adjustments based on `flip_info.missed` belong here.
-    Presented {
-        /// Confirmed timing for this frame.
-        flip_info: FlipInfo,
-        /// The per-frame data payload from the matching `Render` invocation.
-        payload: T,
-    },
+impl<T> BufferedFrame<T> {
+    /// Present at the next available vblank.
+    pub fn new(payload: T) -> Self {
+        Self {
+            target_time: None,
+            payload,
+        }
+    }
+
+    /// Present at a specific scanout-clock target.
+    pub fn at(target_time: crate::timing::Timestamp, payload: T) -> Self {
+        Self {
+            target_time: Some(target_time),
+            payload,
+        }
+    }
+}
+
+/// One confirmed buffered presentation.
+#[derive(Debug)]
+pub struct ConfirmedFrame<T> {
+    /// Confirmed timing and presentation metadata.
+    pub flip_info: FlipInfo,
+    /// Payload returned by the render callback for this frame.
+    pub payload: T,
 }
 
 /// Type-erased in-flight GPU future.
@@ -194,38 +153,16 @@ mod tests {
     }
 
     #[test]
-    fn flip_event_render_matches() {
-        let event: FlipEvent<u32> = FlipEvent::Render;
-        match event {
-            FlipEvent::Render => {}
-            FlipEvent::Presented { .. } => {}
-            // catch-all required by #[non_exhaustive]
-            _ => {}
-        }
-    }
+    fn buffered_frame_constructors_set_target_and_payload() {
+        use crate::timing::Timestamp;
 
-    #[test]
-    fn flip_event_presented_matches() {
-        use crate::timing::{FlipInfo, Timestamp, TimingSource};
-        let flip = FlipInfo {
-            frame_number: 0,
-            timing_source: TimingSource::CpuEstimate,
-            submit_time: Timestamp::from_micros(0),
-            present_time: Timestamp::from_micros(16_667),
-            present_id: 0,
-            target_time: None,
-            on_target: true,
-            missed: false,
-            missed_count: 0,
-            skipped: false,
-        };
-        let event: FlipEvent<u32> = FlipEvent::Presented {
-            flip_info: flip,
-            payload: 42,
-        };
-        match event {
-            FlipEvent::Presented { payload, .. } => assert_eq!(payload, 42),
-            _ => panic!("expected Presented"),
-        }
+        let immediate = BufferedFrame::new(42_u32);
+        assert_eq!(immediate.target_time, None);
+        assert_eq!(immediate.payload, 42);
+
+        let target = Timestamp::from_micros(50_000);
+        let scheduled = BufferedFrame::at(target, "frame");
+        assert_eq!(scheduled.target_time, Some(target));
+        assert_eq!(scheduled.payload, "frame");
     }
 }

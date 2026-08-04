@@ -58,8 +58,8 @@ impl<'a> RenderContext<'a> {
     /// In synchronous `run()`: call after `flip()`. Uses the confirmed present time
     /// from the blocking fence wait.
     ///
-    /// In `run_buffered()`: call inside `FlipEvent::Presented`. Uses the confirmed
-    /// hardware scanout timestamp delivered to that arm — never an estimate.
+    /// In `run_buffered()`: call inside the confirmation callback. Uses the confirmed
+    /// timing delivered with that frame.
     ///
     /// The data struct must implement `serde::Serialize`. Multiple calls per frame
     /// are allowed — each produces one row keyed to the same `frame_number`.
@@ -68,7 +68,7 @@ impl<'a> RenderContext<'a> {
     ///
     /// - [`VSEError::NoSession`] if no session was attached to the builder.
     /// - [`VSEError::NoFlipPending`] if called before `flip()` in synchronous mode.
-    /// - [`VSEError::NoConfirmedFlip`] if called in the `FlipEvent::Render` arm.
+    /// - [`VSEError::NoConfirmedFlip`] if called from a buffered render callback.
     pub fn record_frame<F: serde::Serialize>(&mut self, data: F) -> Result<(), VSEError> {
         // Buffered mode: use the confirmed flip set by run_buffered() before this callback.
         // A headless session has no present target and is never buffered.
@@ -333,7 +333,8 @@ impl<'a> RenderContext<'a> {
     /// Queue the external frame in `slot` for consumption by the next flip.
     ///
     /// Call after the producer finishes rendering into `slot` (and signals its
-    /// ready semaphore), before `flip`/`flip_with_payload`. Slots must be
+    /// ready semaphore), before `flip()` or returning a [`BufferedFrame`](crate::core::BufferedFrame).
+    /// Slots must be
     /// queued in the order the producer acquired them.
     pub fn queue_external_frame(
         &mut self,

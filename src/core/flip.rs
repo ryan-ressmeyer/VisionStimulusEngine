@@ -548,24 +548,6 @@ impl<'a> RenderContext<'a> {
         FlipInfo::skipped(request.frame_number)
     }
 
-    /// Queue a deferred submission and finish the request-side bookkeeping.
-    fn queue_submission<T: std::any::Any + Send + 'static>(
-        &mut self,
-        submission: Submission,
-        payload: T,
-    ) {
-        self.state
-            .target
-            .present_expect_mut()
-            .buffered_pending_frames
-            .push_back(crate::core::buffered::PendingFrame {
-                payload: Box::new(payload),
-                submission,
-            });
-        self.state.frame_number += 1;
-        self.state.input.clear_events();
-    }
-
     /// Present the current frame to the screen
     ///
     /// Optionally accepts a target presentation time. When provided:
@@ -578,6 +560,15 @@ impl<'a> RenderContext<'a> {
     ///
     /// Returns `VSEError` if presentation fails.
     pub fn flip(&mut self, target_time: Option<Timestamp>) -> Result<FlipInfo, VSEError> {
+        if self
+            .state
+            .target
+            .present()
+            .is_some_and(|present| present.in_buffered_mode)
+        {
+            return Err(VSEError::NotSupportedInBufferedMode);
+        }
+
         // Headless: no swapchain to acquire from and nothing to present to.
         if self.state.target.offscreen_mut().is_some() {
             return self.flip_offscreen(target_time);
@@ -681,51 +672,31 @@ impl<'a> RenderContext<'a> {
         Ok(flip_info)
     }
 
-    /// Submit the current frame to the GPU without blocking, attaching a typed payload.
-    ///
-    /// Only valid inside the [`FlipEvent::Render`] arm of [`VSEContext::run_buffered`].
-    /// The `payload` is stored and delivered alongside the confirmed [`FlipInfo`] in
-    /// the next [`FlipEvent::Presented`] for this frame.
-    ///
-    /// After this call returns, the GPU is processing frame `N` while the CPU is free
-    /// to compute frame `N+1` on the next vblank.
-    ///
-    /// The `target_time` argument optionally schedules the present for a specific
-    /// [`Timestamp`]. Pass `None` for immediate VSync-locked presentation.
-    ///
-    /// Call this method exactly **once** per `Render` event. Calling it multiple times
-    /// or not at all results in queue desynchronisation.
-    ///
-    /// # Errors
-    ///
-    /// - [`VSEError::NotInBufferedMode`] if called from `run()` instead of `run_buffered()`.
-    /// - [`VSEError::Swapchain`] if image acquisition or submission fails.
-    pub fn flip_with_payload<T: std::any::Any + Send + 'static>(
+    /// Submit one frame returned by a structured buffered render callback.
+    pub(super) fn submit_buffered_frame<T>(
         &mut self,
-        target_time: Option<Timestamp>,
-        payload: T,
-    ) -> Result<(), VSEError> {
-        if !self.state.target.present_expect_mut().in_buffered_mode {
-            return Err(VSEError::NotInBufferedMode);
-        }
+        frame: crate::core::buffered::BufferedFrame<T>,
+    ) -> Result<Option<crate::core::buffered::PendingFrame<T>>, VSEError> {
+        debug_assert!(self.state.target.present_expect().in_buffered_mode);
 
-        let request = FrameRequest::new(self.state.frame_number, target_time);
-        if self.state.target.present_expect_mut().minimized {
-            // Skip silently — no fence, no payload stored; run_buffered() skips push.
+        let request = FrameRequest::new(self.state.frame_number, frame.target_time);
+        if self.state.target.present_expect().minimized {
             self.finish_skipped_request(request);
-            return Ok(());
+            return Ok(None);
         }
 
-        match self.submit_displayed(request, PresentPacing::HardwareOnly)? {
-            Some(submission) => {
-                self.prepare_deferred_confirmation(&submission);
-                self.queue_submission(submission, payload);
-            }
-            None => {
-                self.finish_skipped_request(request);
-            }
-        }
-        Ok(())
+        let Some(submission) = self.submit_displayed(request, PresentPacing::HardwareOnly)? else {
+            self.finish_skipped_request(request);
+            return Ok(None);
+        };
+
+        self.prepare_deferred_confirmation(&submission);
+        self.state.frame_number += 1;
+        self.state.input.clear_events();
+        Ok(Some(crate::core::buffered::PendingFrame {
+            payload: frame.payload,
+            submission,
+        }))
     }
 }
 

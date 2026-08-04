@@ -342,7 +342,6 @@ impl VSEContext {
                 acquired_display,
                 buffered_confirmed_flip: None,
                 in_buffered_mode: false,
-                buffered_pending_frames: std::collections::VecDeque::new(),
                 ext_features,
                 external_source: None,
                 external_readback: None,

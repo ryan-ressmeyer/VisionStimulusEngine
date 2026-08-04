@@ -1,301 +1,187 @@
 # Buffered Flips
 
-`run_buffered()` is VSE's pipelined rendering mode. It pipelines CPU and GPU work across
-frames, correlates each submitted frame with its present result, and provides a predictable
-closed-loop latency contract for neural recording experiments.
+`run_buffered()` pipelines CPU and GPU work across frames. It correlates each submitted payload with one confirmed presentation result and exposes the reaction delay to the experiment.
 
----
+See [Choosing a Runtime](runtimes.md) before selecting a buffered API.
 
-## Why buffered flips?
+## Presentation pipeline
 
-### CPU–GPU pipelining
+A synchronous frame follows this sequence:
 
-In the synchronous `run()` loop, each frame follows this sequence:
-
-```
-CPU: build commands → submit → wait for GPU → record data → build commands → …
-GPU:                  render → idle          → render → …
+```text
+build → submit → wait → inspect timing → build next frame
 ```
 
-The GPU idles while the CPU waits for the fence. With `run_buffered()`, the CPU submits frame
-`N` non-blocking, so it is free to handle input and prepare state for frame `N+1` while the
-GPU is still rendering frame `N`:
+Buffered presentation overlaps the work:
 
-```
-CPU: build N → submit → build N+1 → submit → build N+2 → …
-GPU:           render N →           render N+1 →          …
+```text
+CPU: build N → submit → build N+1 → submit → build N+2
+GPU:           render N →           render N+1
 ```
 
-This is standard double-buffering. The driver's swapchain image management provides natural
-backpressure — `acquire_next_image()` blocks if all images are in use, keeping the pipeline
-at the configured depth.
+The driver provides backpressure through swapchain image acquisition. VSE does not discard an already-submitted frame.
 
-### Present-result correlation
+## Structured callbacks
 
-On the `ExtPresentTiming` path, `run_buffered()` assigns a `VK_KHR_present_id2` id to every
-present and later matches `FlipEvent::Presented` to the corresponding driver result. When the
-driver provides `IMAGE_FIRST_PIXEL_OUT`, `FlipInfo::present_time` is the hardware scanout time.
-On drivers that advertise present timing but return zero-valued scanout feedback, VSE falls back
-to a calibrated scanout-clock sample after `wait_for_present` and records that behavior in
-`HostInfo.timing.scanout_feedback_populated`.
+The stateless runtime takes separate render and confirmation callbacks:
 
-On the `CpuEstimate` path, `FlipInfo::present_time` is taken after the GPU fence signals. That
-confirms render completion, not display scanout, and `timing_source` records the difference.
-
-### Scheduled presentation
-
-`flip_with_payload(Some(target_time), payload)` schedules the present for a scanout-clock target
-on the EXT path. If the driver does not enforce `targetTime`, VSE software-paces against the
-scanout clock and records the observed driver behavior in `HostInfo.timing.absolute_scheduling_enforced`.
-
----
-
-## The two-phase mental model
-
-At every vblank, `run_buffered()` fires two events in order:
-
-```
-vblank N:   [Presented N-1]  ← react to confirmed timing, record data
-            [Render N]       ← build stimulus, call flip_with_payload()
-
-vblank N+1: [Presented N]    ← react + record
-            [Render N+1]     ← build + submit
-
-vblank N+2: [Presented N+1]  ← react + record
-            [Render N+2]     ← build + submit
+```rust,ignore
+context.run_buffered(
+    BufferedConfig::default(),
+    |vse| {
+        draw_stimulus(vse)?;
+        Ok(BufferedFrame::new(FrameData { contrast: 1.0 }))
+    },
+    |confirmed, vse| {
+        vse.record_frame(confirmed.payload)?;
+        Ok(())
+    },
+)?;
 ```
 
-During the first `depth` vblanks (the warm-up period), only `Render` fires — there are no
-confirmed frames yet.
+The render callback returns one `BufferedFrame<T>`. VSE converts it to a `FrameRequest`, submits it through the active displayed backend, and stores its payload with the resulting `Submission`. The confirmation callback receives a `ConfirmedFrame<T>` containing:
 
-On clean exit (when `vse.close()` is called), all pending `Presented` events are drained
-synchronously before `run_buffered()` returns.
+- `flip_info`, with the timing and present identifier for that submission;
+- `payload`, moved from the matching `BufferedFrame<T>`.
 
----
+The payload type does not need `Serialize` unless user code passes it to `record_frame()`.
 
-## Choosing buffer depth
+Use `run_buffered_with_state()` when the two callbacks share experiment state or GPU resources:
 
-| `depth` | Swapchain images | Extra latency at 60 Hz | Extra latency at 120 Hz | Recommended for |
-|---------|-----------------|------------------------|-------------------------|-----------------|
-| `1`     | 2               | 0 frames               | 0 frames                | Most experiments (**default**) |
-| `2`     | 3               | 1 frame (~16 ms)       | 1 frame (~8 ms)         | High GPU utilization / VR |
-
-`depth = 1` is the right choice for closed-loop neural recording. It gives you one frame of
-pipelining with the minimum possible confirmed-timing latency.
-
-`depth = 2` may improve frame-rate stability on very GPU-bound workloads (complex shaders,
-high-resolution textures) at the cost of one additional frame of closed-loop latency.
-
-Configure depth via [`BufferedConfig`](../../src/core/buffered.rs):
-
-```rust
-use vision_stimulus_engine::prelude::*;
-
-let cfg = BufferedConfig { depth: 1 };
-```
-
-Swapchain image acquisition provides backpressure when all images are in use. Buffered
-presentation never drops an already-submitted frame. Configure writer-channel overflow
-separately with `ExperimentSessionBuilder::with_overflow()`.
-
----
-
-## The closed-loop latency contract
-
-When `FlipEvent::Presented` fires for frame `N`:
-
-- Frame `N` has been confirmed by the GPU (fence signaled).
-- Frame `N+1` has **already been submitted** to the GPU.
-- Stimulus changes you make in the `Presented` arm take effect from frame `N+2` onward.
-
-The B-frame latency is therefore exactly `depth` frames — one frame with the default
-`depth = 1`. This is explicit and predictable. There is no hidden estimation or jitter: you
-always know exactly how many vblanks separate a stimulus decision from its display.
-
-**Example at 60 Hz, depth = 1:**
-
-| Time    | Event                          | Latency |
-|---------|-------------------------------|---------|
-| T=0 ms  | Render(N): decide contrast    | —       |
-| T=16 ms | Presented(N-1): observe outcome, update contrast | 16 ms from last decision |
-| T=16 ms | Render(N+1): apply new contrast | — |
-| T=32 ms | Presented(N): contrast hits display | 32 ms from decision |
-
----
-
-## State management between arms
-
-### What goes in the payload
-
-The payload `T` carries the **per-frame stimulus parameters you need to record** — the values
-that describe exactly what was shown on the display for frame `N`. Put anything that:
-
-- Must be correlated with `flip_info.present_time` in your data file
-- Changes frame-by-frame based on your experiment design
-- Is determined at render time and needs to be confirmed at presentation time
-
-```rust
-#[derive(serde::Serialize)]
-struct FrameData {
-    trial:    u32,
-    contrast: f32,
-    phase:    f32,
-    grating_sf: f32,
-}
-```
-
-### What stays in external state
-
-Persistent experiment state that both arms access lives in your closure captures (via
-`Rc<RefCell<...>>`). Put here:
-
-- The current trial counter
-- Adaptive algorithm state (e.g. staircase threshold estimate)
-- Anything that needs to persist across frames without being recorded each frame
-
-```rust
-let trial   = Rc::new(RefCell::new(0u32));
-let contrast = Rc::new(RefCell::new(1.0f32));
-```
-
----
-
-## Full annotated example
-
-A closed-loop contrast-tracking experiment that reduces stimulus contrast whenever the GPU
-misses a frame, and records confirmed timing for each frame:
-
-```rust
-use std::{cell::RefCell, rc::Rc};
-use vision_stimulus_engine::prelude::*;
-
-#[derive(serde::Serialize)]
-struct FrameData {
-    trial:    u32,
-    contrast: f32,
-}
-
-fn run_experiment(context: VSEContext, session: ExperimentSession) -> Result<(), VSEError> {
-    // Persistent state shared between Render and Presented arms
-    let trial     = Rc::new(RefCell::new(0u32));
-    let contrast  = Rc::new(RefCell::new(1.0f32));
-    let max_frames = 300u32; // 5 seconds at 60 Hz
-
-    let trial_c    = trial.clone();
-    let contrast_c = contrast.clone();
-
-    let context = VSEContext::builder()
-        .with_window_size(1920, 1080)
-        .with_session(session)
-        .build()?;
-
-    context.run_buffered::<FrameData, _>(BufferedConfig::default(), move |event, vse| {
-        match event {
-            FlipEvent::Render => {
-                let t = *trial_c.borrow();
-                let c = *contrast_c.borrow();
-
-                vse.clear()?;
-                // draw Gabor patch at current contrast …
-
-                // Submit and attach the frame's parameters as payload
-                vse.flip_with_payload(None, FrameData { trial: t, contrast: c })?;
-
-                *trial_c.borrow_mut() += 1;
-                if t >= max_frames {
-                    vse.close();
-                }
-            }
-
-            FlipEvent::Presented { flip_info, payload } => {
-                // Record after the frame has been correlated with its present result.
-                vse.record_frame(payload)?;
-
-                // Closed-loop: reduce contrast on missed frames
-                if flip_info.missed {
-                    tracing::warn!(
-                        "Frame {} missed ({} skipped). Reducing contrast.",
-                        flip_info.frame_number,
-                        flip_info.missed_count,
-                    );
-                    *contrast_c.borrow_mut() *= 0.9;
-                }
-            }
-
-            _ => {}
+```rust,ignore
+context.run_buffered_with_state(
+    BufferedConfig::default(),
+    |vse| {
+        Ok(Experiment {
+            pipeline: vse.register_pipeline(MyPipeline::new())?,
+            contrast: 1.0,
+        })
+    },
+    |experiment, vse| {
+        draw_grating(vse, experiment.pipeline, experiment.contrast)?;
+        Ok(BufferedFrame::new(FrameData {
+            contrast: experiment.contrast,
+        }))
+    },
+    |experiment, confirmed, vse| {
+        vse.record_frame(confirmed.payload)?;
+        if confirmed.flip_info.missed {
+            experiment.contrast *= 0.9;
         }
         Ok(())
-    })?;
+    },
+)?;
+```
 
+The initializer runs after the GPU and final buffered swapchain exist but before frame zero.
+
+## Target times
+
+`BufferedFrame::new(payload)` presents at the next available vblank.
+
+`BufferedFrame::at(target_time, payload)` requests a specific scanout-clock target. On the EXT path, VSE places the target in the present-timing chain. Buffered presentation leaves pacing to the pipelined driver queue.
+
+## Confirmation and timing
+
+On the `ExtPresentTiming` path, VSE assigns a `VK_KHR_present_id2` identifier to every successful present. It drains EXT feedback once after each buffered submission and caches records by present identifier. Confirmation uses the matching feedback record when the driver supplies `IMAGE_FIRST_PIXEL_OUT`.
+
+If per-present scanout feedback is unavailable, buffered confirmation falls back to the timing provider's CPU observation. `FlipInfo::timing_source` and recorded host capabilities describe the active timing path.
+
+On the `CpuEstimate` path, confirmation follows the GPU fence. This confirms rendering completion rather than physical scanout.
+
+## Buffer depth
+
+| `depth` | Minimum swapchain images | Additional reaction delay | Suggested use |
+|---|---:|---:|---|
+| `1` | 2 | One pipelined frame | Most experiments |
+| `2` | 3 | Two pipelined frames | GPU-bound workloads after measurement |
+
+`BufferedConfig::default()` uses depth one.
+
+When confirmation arrives for frame N at depth one, frame N+1 has already been submitted. A state change made in that confirmation callback first affects frame N+2. Increasing depth gives the GPU more queued work and delays closed-loop reactions by another frame.
+
+## Payload design
+
+A payload should describe what the render callback submitted for one frame. Typical fields include:
+
+- trial and condition identifiers;
+- contrast, phase, position, or image identifier;
+- external producer frame and slot identifiers;
+- repeat or stale-frame decisions made before submission.
+
+Persistent controllers, loaded resources, and adaptive state belong in the state returned to `run_buffered_with_state()`.
+
+VSE stores each payload in the same FIFO entry as its submission metadata and completion object. Confirmation removes that entry as one unit, preserving payload order through normal operation and shutdown draining.
+
+## Recording
+
+Call `record_frame()` from the confirmation callback:
+
+```rust,ignore
+|confirmed, vse| {
+    vse.record_frame(confirmed.payload)?;
     Ok(())
 }
 ```
 
----
+Before invoking the callback, VSE installs the confirmed `FlipInfo` as the active recording context. If the callback does not claim the frame with `record_frame()`, VSE writes one timing-only row when confirmation finishes.
 
-## Migration guide: `run()` → `run_buffered()`
+This behavior also applies while draining the final submissions during clean shutdown.
 
-| Synchronous `run()`                           | Buffered `run_buffered()`                      |
-|----------------------------------------------|------------------------------------------------|
-| `vse.flip(None)?`                            | `vse.flip_with_payload(None, data)?` in `Render` arm |
-| `vse.record_frame(data)?`                    | `vse.record_frame(payload)?` in `Presented` arm |
-| `flip_info` returned by `flip()`             | `flip_info` delivered in `FlipEvent::Presented` |
-| No explicit payload                          | `T: serde::Serialize + Send + 'static`         |
-| Single callback `FnMut(&mut RenderContext)`  | `FnMut(FlipEvent<T>, &mut RenderContext)`       |
+## Shutdown
 
-**Synchronous:**
+Calling `vse.close()` from the render callback still submits the `BufferedFrame` returned by that invocation. VSE then waits for every queued submission and invokes confirmation in FIFO order before `run_buffered()` returns.
 
-```rust
+Calling `close()` from a confirmation callback prevents another render invocation and drains submissions already in flight.
+
+If a confirmation callback returns an error during draining, VSE continues retiring the queue and returns the first error afterward. A panic unwinds the event loop and does not guarantee delivery of remaining confirmation callbacks.
+
+## External rendering
+
+Queue an external frame before returning the corresponding `BufferedFrame`:
+
+```rust,ignore
+let ready = producer.render_frame(vse.frame_number())?;
+vse.queue_external_frame(ready.slot)?;
+
+Ok(BufferedFrame::new(ExternalFrameRecord {
+    producer_frame: ready.frame_number,
+    slot: ready.slot,
+}))
+```
+
+The confirmation fence also marks matching readback copies and external-frame consumption as complete. See [External Rendering Timing](external_rendering_timing.md).
+
+## Migrating from synchronous presentation
+
+Synchronous:
+
+```rust,ignore
 context.run(|vse| {
-    vse.clear()?;
-    let info = vse.flip(None)?;
-    if info.frame_number < 300 {
-        vse.record_frame(MyData { contrast: 1.0 })?;
-    } else {
-        vse.close();
-    }
+    draw_stimulus(vse)?;
+    let flip_info = vse.flip(None)?;
+    vse.record_frame(FrameData { contrast: 1.0 })?;
+    react_to_flip(&flip_info);
     Ok(())
 })?;
 ```
 
-**Buffered equivalent:**
+Buffered:
 
-```rust
-let frame = Rc::new(RefCell::new(0u64));
-let fr = frame.clone();
-
-context.run_buffered::<MyData, _>(BufferedConfig::default(), move |event, vse| {
-    match event {
-        FlipEvent::Render => {
-            vse.clear()?;
-            *fr.borrow_mut() += 1;
-            vse.flip_with_payload(None, MyData { contrast: 1.0 })?;
-            if *fr.borrow() >= 300 { vse.close(); }
-        }
-        FlipEvent::Presented { payload, .. } => {
-            vse.record_frame(payload)?;
-        }
-        _ => {}
-    }
-    Ok(())
-})?;
+```rust,ignore
+context.run_buffered_with_state(
+    BufferedConfig::default(),
+    |_vse| Ok(ExperimentState::new()),
+    |state, vse| {
+        draw_stimulus(vse)?;
+        Ok(BufferedFrame::new(state.frame_data()))
+    },
+    |state, confirmed, vse| {
+        vse.record_frame(confirmed.payload)?;
+        state.react_to_flip(&confirmed.flip_info);
+        Ok(())
+    },
+)?;
 ```
 
-The key differences:
-- `flip()` → `flip_with_payload()` in `Render`
-- `record_frame()` moves to `Presented`, where `flip_info` carries confirmed timing
-- Per-frame state (e.g. frame counter) lives in `Rc<RefCell<...>>` captures
-
----
-
-## Shutdown and panic behavior
-
-**Clean shutdown** (`vse.close()` or window close): `run_buffered()` drains all pending
-in-flight fences synchronously, firing `Presented` for every submitted frame before
-returning. Data for all submitted frames is guaranteed to reach your writer.
-
-**Panic**: If your callback panics, Rust's unwinding will drop all in-flight
-`FenceSignalFuture`s. Vulkano's `Drop` impl for `FenceSignalFuture` blocks until the fence
-signals, so the GPU is always quiesced cleanly. However, any pending `Presented` callbacks
-will not fire — data for the in-flight frames at the time of the panic is lost. This is the
-same guarantee as synchronous `run()`.
+The buffered version moves the reaction into the confirmation phase and makes the pipeline delay explicit. Keep the synchronous runtime when the next frame must incorporate the immediately preceding result.

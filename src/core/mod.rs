@@ -27,7 +27,7 @@ mod state;
 mod swapchain;
 
 // Public API exports
-pub use buffered::{BufferedConfig, FlipEvent};
+pub use buffered::{BufferedConfig, BufferedFrame, ConfirmedFrame};
 pub use config::{FrameError, VSEConfig, VSEContextBuilder, VSEError};
 pub use context::VSEContext;
 pub use device::{DeviceError, DeviceSelector, GPUPreference};

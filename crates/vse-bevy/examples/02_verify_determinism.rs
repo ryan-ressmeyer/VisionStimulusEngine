@@ -53,69 +53,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Rc::new(RefCell::new(BTreeMap::new()));
     let hashes: Rc<RefCell<BTreeMap<u64, u64>>> = Rc::new(RefCell::new(BTreeMap::new()));
     let captured: Rc<RefCell<Option<Vec<u8>>>> = Rc::new(RefCell::new(None));
-    let (pend, hsh, cap) = (pending.clone(), hashes.clone(), captured.clone());
+    let pend_render = pending.clone();
+    let pend_confirm = pending.clone();
+    let (hsh, cap) = (hashes.clone(), captured.clone());
     let mut attached = false;
 
-    context.run_buffered::<u64, _>(BufferedConfig::default(), move |event, vse| {
-        match event {
-            FlipEvent::Render => {
-                if !attached {
-                    vse.attach_external_frame_source(
-                        producer
-                            .export_ring()
-                            .map_err(|e| VSEError::EventLoop(format!("producer: {e}")))?,
-                        release_tx.clone(),
-                    )?;
-                    attached = true;
-                }
-                let n = vse.frame_number();
-                let slot = producer
-                    .render_frame(n)
-                    .map_err(|e| VSEError::EventLoop(format!("producer: {e}")))?;
-                vse.queue_external_frame(slot)?;
-                if HASH_FRAMES.contains(&n) {
-                    let buffer = vulkano::buffer::Buffer::new_slice::<u8>(
-                        vse.memory_allocator(),
-                        vulkano::buffer::BufferCreateInfo {
-                            usage: vulkano::buffer::BufferUsage::TRANSFER_DST,
-                            ..Default::default()
-                        },
-                        vulkano::memory::allocator::AllocationCreateInfo {
-                            memory_type_filter:
-                                vulkano::memory::allocator::MemoryTypeFilter::PREFER_HOST
-                                    | vulkano::memory::allocator::MemoryTypeFilter::HOST_RANDOM_ACCESS,
-                            ..Default::default()
-                        },
-                        byte_len,
-                    )
-                    .map_err(|e| VSEError::EventLoop(format!("readback alloc: {e}")))?;
-                    vse.arm_external_readback(buffer.clone());
-                    pend.borrow_mut().insert(n, buffer);
-                }
-                vse.flip_with_payload(None, n)?;
-                if n + 1 >= FRAMES {
-                    vse.close();
+    context.run_buffered(
+        BufferedConfig::default(),
+        move |vse| {
+            if !attached {
+                vse.attach_external_frame_source(
+                    producer
+                        .export_ring()
+                        .map_err(|e| VSEError::EventLoop(format!("producer: {e}")))?,
+                    release_tx.clone(),
+                )?;
+                attached = true;
+            }
+            let n = vse.frame_number();
+            let slot = producer
+                .render_frame(n)
+                .map_err(|e| VSEError::EventLoop(format!("producer: {e}")))?;
+            vse.queue_external_frame(slot)?;
+            if HASH_FRAMES.contains(&n) {
+                let buffer = vulkano::buffer::Buffer::new_slice::<u8>(
+                    vse.memory_allocator(),
+                    vulkano::buffer::BufferCreateInfo {
+                        usage: vulkano::buffer::BufferUsage::TRANSFER_DST,
+                        ..Default::default()
+                    },
+                    vulkano::memory::allocator::AllocationCreateInfo {
+                        memory_type_filter:
+                            vulkano::memory::allocator::MemoryTypeFilter::PREFER_HOST
+                                | vulkano::memory::allocator::MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                        ..Default::default()
+                    },
+                    byte_len,
+                )
+                .map_err(|e| VSEError::EventLoop(format!("readback alloc: {e}")))?;
+                vse.arm_external_readback(buffer.clone());
+                pend_render.borrow_mut().insert(n, buffer);
+            }
+            if n + 1 >= FRAMES {
+                vse.close();
+            }
+            Ok(BufferedFrame::new(n))
+        },
+        move |confirmed, _vse| {
+            // Fence confirmed, so this frame's readback copy is complete.
+            let payload = confirmed.payload;
+            if let Some(buffer) = pend_confirm.borrow_mut().remove(&payload) {
+                let content = buffer
+                    .read()
+                    .map_err(|e| VSEError::EventLoop(format!("readback read: {e}")))?;
+                let mut hasher = DefaultHasher::new();
+                content.hash(&mut hasher);
+                hsh.borrow_mut().insert(payload, hasher.finish());
+                if cap.borrow().is_none() {
+                    *cap.borrow_mut() = Some(content.to_vec());
                 }
             }
-            FlipEvent::Presented { flip_info, payload } => {
-                // Fence confirmed => the readback copy for this frame is complete.
-                let _ = flip_info;
-                if let Some(buffer) = pend.borrow_mut().remove(&payload) {
-                    let content = buffer
-                        .read()
-                        .map_err(|e| VSEError::EventLoop(format!("readback read: {e}")))?;
-                    let mut hasher = DefaultHasher::new();
-                    content.hash(&mut hasher);
-                    hsh.borrow_mut().insert(payload, hasher.finish());
-                    if cap.borrow().is_none() {
-                        *cap.borrow_mut() = Some(content.to_vec());
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
 
     let hashes = hashes.borrow();
     for (frame, hash) in hashes.iter() {

@@ -35,25 +35,23 @@ fn main() -> Result<()> {
     let presented_in_callback = presented.clone();
 
     context
-        .run_buffered::<(), _>(BufferedConfig::default(), move |event, vse| {
-            match event {
-                FlipEvent::Render => {
-                    *rendered_in_callback.borrow_mut() += 1;
-                    let frame = *rendered_in_callback.borrow();
-                    vse.set_clear_color(frame as f32 / FRAME_COUNT as f32, 0.0, 0.0, 1.0);
-                    vse.flip_with_payload(None, ())?;
-                    if frame == FRAME_COUNT {
-                        vse.close();
-                    }
+        .run_buffered(
+            BufferedConfig::default(),
+            move |vse| {
+                *rendered_in_callback.borrow_mut() += 1;
+                let frame = *rendered_in_callback.borrow();
+                vse.set_clear_color(frame as f32 / FRAME_COUNT as f32, 0.0, 0.0, 1.0);
+                if frame == FRAME_COUNT {
+                    vse.close();
                 }
-                FlipEvent::Presented { .. } => {
-                    *presented_in_callback.borrow_mut() += 1;
-                    // Deliberately omit record_frame(): VSE must write timing-only data.
-                }
-                _ => {}
-            }
-            Ok(())
-        })
+                Ok(BufferedFrame::new(()))
+            },
+            move |_confirmed, _vse| {
+                *presented_in_callback.borrow_mut() += 1;
+                // Deliberately omit record_frame(): VSE must write timing-only data.
+                Ok(())
+            },
+        )
         .context("run buffered presentation")?;
 
     let rendered = *rendered.borrow();

@@ -57,6 +57,13 @@ cargo run --example 03_gabor_field
 
 Some examples depend on display configuration, fullscreen behavior, or Linux-specific direct-display/input access. Expect those paths to require more machine-specific setup than the basic windowed examples.
 
+## Guides
+
+- [Choosing a runtime](docs/guides/runtimes.md)
+- [Buffered flips](docs/guides/buffered_flips.md)
+- [Headless rendering](docs/guides/headless.md)
+- [Data recording](docs/guides/data_recording.md)
+
 ## License
 
 MIT

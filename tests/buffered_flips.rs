@@ -19,26 +19,24 @@ fn run_buffered_fires_render_events() {
     let pc = presented_count.clone();
 
     context
-        .run_buffered::<u32, _>(BufferedConfig::default(), move |event, vse| {
-            match event {
-                FlipEvent::Render => {
-                    *rc.borrow_mut() += 1;
-                    let n = *rc.borrow();
-                    vse.clear()?;
-                    vse.flip_with_payload(None, n)?;
-                    if n >= 5 {
-                        vse.close();
-                    }
+        .run_buffered(
+            BufferedConfig::default(),
+            move |vse| {
+                *rc.borrow_mut() += 1;
+                let n = *rc.borrow();
+                vse.clear()?;
+                if n >= 5 {
+                    vse.close();
                 }
-                FlipEvent::Presented { flip_info, payload } => {
-                    *pc.borrow_mut() += 1;
-                    assert!(payload >= 1 && payload <= 5);
-                    let _ = flip_info;
-                }
-                _ => {}
-            }
-            Ok(())
-        })
+                Ok(BufferedFrame::new(n))
+            },
+            move |confirmed, _vse| {
+                *pc.borrow_mut() += 1;
+                assert!(confirmed.payload >= 1 && confirmed.payload <= 5);
+                let _ = confirmed.flip_info;
+                Ok(())
+            },
+        )
         .expect("run_buffered");
 
     assert_eq!(*render_count.borrow(), 5);
@@ -61,24 +59,22 @@ fn run_buffered_payload_fifo_order() {
     let fr = frame.clone();
 
     context
-        .run_buffered::<u32, _>(BufferedConfig::default(), move |event, vse| {
-            match event {
-                FlipEvent::Render => {
-                    *fr.borrow_mut() += 1;
-                    let n = *fr.borrow();
-                    vse.clear()?;
-                    vse.flip_with_payload(None, n)?;
-                    if n >= 10 {
-                        vse.close();
-                    }
+        .run_buffered(
+            BufferedConfig::default(),
+            move |vse| {
+                *fr.borrow_mut() += 1;
+                let n = *fr.borrow();
+                vse.clear()?;
+                if n >= 10 {
+                    vse.close();
                 }
-                FlipEvent::Presented { payload, .. } => {
-                    ps.borrow_mut().push(payload);
-                }
-                _ => {}
-            }
-            Ok(())
-        })
+                Ok(BufferedFrame::new(n))
+            },
+            move |confirmed, _vse| {
+                ps.borrow_mut().push(confirmed.payload);
+                Ok(())
+            },
+        )
         .expect("run_buffered");
 
     let seq = present_seq.borrow();
@@ -87,12 +83,11 @@ fn run_buffered_payload_fifo_order() {
     }
 }
 
-/// `run_buffered_with_setup` runs its setup before the first Render event, and
-/// hands the setup's value to every frame.
+/// `run_buffered_with_state` initializes its state before the first rendered
+/// frame and hands that state to both buffered phases.
 ///
-/// Pipeline compilation and asset loading belong off the presentation path in
-/// buffered mode exactly as they do in `run` — before this hook existed,
-/// `run_buffered` was the one loop with nowhere to put them.
+/// Pipeline compilation, asset loading, and experiment-state construction
+/// belong off the presentation path.
 ///
 /// Cannot run under the test harness at all, not merely without a display:
 /// winit panics when an `EventLoop` is created off the main thread, and the
@@ -101,7 +96,7 @@ fn run_buffered_payload_fifo_order() {
 /// equivalent from a `main`, where `setup` printed before frame 0.
 #[test]
 #[ignore = "winit requires the main thread; cannot run under the test harness"]
-fn run_buffered_with_setup_runs_setup_before_the_first_frame() {
+fn run_buffered_with_state_initializes_before_the_first_frame() {
     let context = VSEContext::builder()
         .with_window_size(100, 100)
         .build()
@@ -114,28 +109,26 @@ fn run_buffered_with_setup_runs_setup_before_the_first_frame() {
     let frames = Rc::new(RefCell::new(0u32));
 
     context
-        .run_buffered_with_setup::<u32, _, _, _>(
+        .run_buffered_with_state(
             BufferedConfig::default(),
             move |_vse| {
                 setup_order.borrow_mut().push("setup");
                 Ok(7u32)
             },
-            move |event, vse, from_setup| {
-                if let FlipEvent::Render = event {
-                    assert_eq!(*from_setup, 7, "setup's value must reach the render arm");
-                    render_order.borrow_mut().push("render");
-                    *frames.borrow_mut() += 1;
-                    let n = *frames.borrow();
-                    vse.clear()?;
-                    vse.flip_with_payload(None, n)?;
-                    if n >= 3 {
-                        vse.close();
-                    }
+            move |from_setup, vse| {
+                assert_eq!(*from_setup, 7, "setup's value must reach the render phase");
+                render_order.borrow_mut().push("render");
+                *frames.borrow_mut() += 1;
+                let n = *frames.borrow();
+                vse.clear()?;
+                if n >= 3 {
+                    vse.close();
                 }
-                Ok(())
+                Ok(BufferedFrame::new(n))
             },
+            |_from_setup, _confirmed, _vse| Ok(()),
         )
-        .expect("run_buffered_with_setup");
+        .expect("run_buffered_with_state");
 
     let order = order.borrow();
     assert_eq!(
@@ -148,4 +141,29 @@ fn run_buffered_with_setup_runs_setup_before_the_first_frame() {
         1,
         "setup must run exactly once, got {order:?}"
     );
+}
+
+/// Buffered payloads do not need `Serialize` or `Send` unless user code sends
+/// or records them. This ignored test exists as a compile-time contract.
+#[test]
+#[ignore = "winit requires the main thread; compile-time contract only"]
+fn run_buffered_accepts_local_unserialized_payload() {
+    struct LocalPayload(Rc<()>);
+
+    let context = VSEContext::builder()
+        .with_window_size(100, 100)
+        .build()
+        .expect("context build");
+
+    context
+        .run_buffered(
+            BufferedConfig::default(),
+            |_vse| Ok(BufferedFrame::new(LocalPayload(Rc::new(())))),
+            |confirmed, vse| {
+                assert_eq!(Rc::strong_count(&confirmed.payload.0), 1);
+                vse.close();
+                Ok(())
+            },
+        )
+        .expect("run_buffered");
 }

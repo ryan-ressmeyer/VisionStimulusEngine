@@ -32,11 +32,11 @@ pub use vse_external_frame as external_frame;
 // Re-export commonly used types
 pub mod prelude {
     pub use crate::core::{
-        absolute_scheduling_verdict, AcquisitionMethod, BufferedConfig, DeviceSelector,
-        DisplayBackend, ExternalFramePolicy, FlipEvent, GPUPreference, InputEvent, KeyCode,
-        MonitorInfo, MonitorSelection, MouseButton, NamedKey, PresentMode, RenderContext,
-        ScanoutFeedback, SchedulingTrial, SwapchainConfig, SwapchainManager, VSEContext,
-        VSEContextBuilder, VSEError, VideoModeInfo, WindowMode,
+        absolute_scheduling_verdict, AcquisitionMethod, BufferedConfig, BufferedFrame,
+        ConfirmedFrame, DeviceSelector, DisplayBackend, ExternalFramePolicy, GPUPreference,
+        InputEvent, KeyCode, MonitorInfo, MonitorSelection, MouseButton, NamedKey, PresentMode,
+        RenderContext, ScanoutFeedback, SchedulingTrial, SwapchainConfig, SwapchainManager,
+        VSEContext, VSEContextBuilder, VSEError, VideoModeInfo, WindowMode,
     };
     pub use crate::data::{
         CsvDataWriter, DataError, DataWriter, ExperimentSession, ExperimentSessionBuilder,

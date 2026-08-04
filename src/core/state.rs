@@ -224,21 +224,14 @@ pub(super) struct PresentTarget {
     pub(super) acquired_display: Option<AcquisitionMethod>,
 
     // --- Buffered flip state (None/false when using synchronous run()) ---
-    /// The confirmed FlipInfo for the frame being delivered in a Presented callback.
-    /// Set by run_buffered() before invoking the Presented arm; cleared after.
+    /// The confirmed FlipInfo for the frame being delivered to a confirmation callback.
+    /// Set by run_buffered() before invoking that callback and cleared afterward.
     /// record_frame() reads this field instead of pending_flip when Some.
     pub(super) buffered_confirmed_flip: Option<FlipInfo>,
 
-    /// True while run_buffered() is executing. Guards flip_with_payload() and
-    /// prevents flip() from being called in that context.
+    /// True while a structured buffered loop is executing.
+    /// Prevents synchronous `flip()` from bypassing the loop-owned submission.
     pub(super) in_buffered_mode: bool,
-
-    /// Submitted buffered frames awaiting confirmation, in presentation order.
-    /// Each entry owns its timing estimate, payload, and completion so correlation
-    /// cannot drift across parallel queues.
-    pub(super) buffered_pending_frames: std::collections::VecDeque<
-        crate::core::buffered::PendingFrame<Box<dyn std::any::Any + Send + 'static>>,
-    >,
 
     /// Present-timing sub-features enabled at device creation (`Some` on the EXT backend).
     /// Carries the queue global-priority outcome into host-info snapshots.
@@ -939,10 +932,7 @@ mod tests {
     #[test]
     fn vse_error_variants_display() {
         let e = VSEError::NoConfirmedFlip;
-        assert!(e.to_string().contains("Presented"));
-
-        let e = VSEError::NotInBufferedMode;
-        assert!(e.to_string().contains("run_buffered"));
+        assert!(e.to_string().contains("confirmed"));
 
         let e = VSEError::NotSupportedInBufferedMode;
         assert!(e.to_string().contains("flip()"));

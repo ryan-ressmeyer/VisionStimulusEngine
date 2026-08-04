@@ -417,58 +417,60 @@ fn mode_buffered(frames: u32, depth: usize) -> Result<(), Box<dyn std::error::Er
         depth,
         ..BufferedConfig::default()
     };
-    let st = state.clone();
+    let st_render = state.clone();
+    let st_confirm = state.clone();
     let rn = render_n.clone();
 
-    context.run_buffered::<u32, _>(cfg, move |event, vse| {
-        let mut s = st.borrow_mut();
-        match event {
-            FlipEvent::Render => {
-                if s.source.is_none() {
-                    s.source = Some(vse.timing_source());
-                }
-                let mut n = rn.borrow_mut();
-                *n += 1;
-                let c = if *n % 2 == 0 { 0.15 } else { 0.35 };
-                vse.set_clear_color(c, c, c, 1.0);
-                vse.clear()?;
-                vse.flip_with_payload(None, *n)?;
-                if *n >= frames {
-                    vse.close();
+    context.run_buffered(
+        cfg,
+        move |vse| {
+            let mut s = st_render.borrow_mut();
+            if s.source.is_none() {
+                s.source = Some(vse.timing_source());
+            }
+            let mut n = rn.borrow_mut();
+            *n += 1;
+            let c = if *n % 2 == 0 { 0.15 } else { 0.35 };
+            vse.set_clear_color(c, c, c, 1.0);
+            vse.clear()?;
+            if *n >= frames {
+                vse.close();
+            }
+            Ok(BufferedFrame::new(*n))
+        },
+        move |confirmed, vse| {
+            let mut s = st_confirm.borrow_mut();
+            let flip_info = confirmed.flip_info;
+            let payload = confirmed.payload;
+            if flip_info.present_id == 0 {
+                s.zero_present_id = true;
+            }
+            if let Some(last) = s.last_present_id {
+                if flip_info.present_id <= last {
+                    s.present_id_non_monotonic = true;
                 }
             }
-            FlipEvent::Presented { flip_info, payload } => {
-                if flip_info.present_id == 0 {
-                    s.zero_present_id = true;
-                }
-                if let Some(last) = s.last_present_id {
-                    if flip_info.present_id <= last {
-                        s.present_id_non_monotonic = true;
-                    }
-                }
-                s.last_present_id = Some(flip_info.present_id);
+            s.last_present_id = Some(flip_info.present_id);
 
-                if let Some(last) = s.last_payload {
-                    if payload <= last {
-                        s.payload_out_of_order = true;
-                    }
-                }
-                s.last_payload = Some(payload);
-                s.presented += 1;
-                if flip_info.missed {
-                    s.missed += 1;
-                }
-
-                for fb in vse.scanout_feedback() {
-                    s.feedback_records += 1;
-                    s.feedback_ids.insert(fb.present_id);
-                    s.first_pixel_out.observe(fb.first_pixel_out_ns);
+            if let Some(last) = s.last_payload {
+                if payload <= last {
+                    s.payload_out_of_order = true;
                 }
             }
-            _ => {}
-        }
-        Ok(())
-    })?;
+            s.last_payload = Some(payload);
+            s.presented += 1;
+            if flip_info.missed {
+                s.missed += 1;
+            }
+
+            for fb in vse.scanout_feedback() {
+                s.feedback_records += 1;
+                s.feedback_ids.insert(fb.present_id);
+                s.first_pixel_out.observe(fb.first_pixel_out_ns);
+            }
+            Ok(())
+        },
+    )?;
 
     report_buffered(&state.borrow(), *render_n.borrow(), depth);
     Ok(())

@@ -5,7 +5,7 @@ Timing fields are in microseconds. Their clock domain depends on `timing_source`
 
 ## frames.csv / frames.parquet — Frame Records
 
-One row per `flip()` or `flip_with_payload()` call. Timing columns are always populated.
+One row per synchronous `flip()` or confirmed `BufferedFrame`. Timing columns are always populated.
 User columns (from `record_frame()`) are empty/null for frames where
 `record_frame` was not called.
 
