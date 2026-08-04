@@ -249,6 +249,7 @@ pub fn capture_timing_capabilities(device: &Arc<Device>) -> TimingCapabilities {
         // Behaviorally-observed fields: measured at runtime, not from the physical-device probe.
         scanout_feedback_populated: None,
         absolute_scheduling_enforced: None,
+        present_timing_surface: None,
         queue_global_priority: None,
     };
 
@@ -330,6 +331,9 @@ pub struct ObservedPresentTiming {
     pub scanout_feedback_populated: Option<bool>,
     /// Whether absolute `targetTime` scheduling was observed to be enforced (see field docs).
     pub absolute_scheduling_enforced: Option<bool>,
+    /// What the surface advertised about present timing (see [`PresentTimingSurface`]).
+    pub present_timing_surface:
+        Option<crate::core::present_timing_ext::PresentTimingSurfaceCapabilitiesEXT>,
     /// Queue global-priority outcome from device creation (see field docs on
     /// [`TimingCapabilities::queue_global_priority`]).
     pub queue_global_priority: Option<crate::core::present_timing_ext::QueuePriorityOutcome>,
@@ -363,6 +367,18 @@ pub fn capture_host_info(
     // Overlay behaviorally-observed conformance onto the advertised capabilities.
     timing.scanout_feedback_populated = observed.scanout_feedback_populated;
     timing.absolute_scheduling_enforced = observed.absolute_scheduling_enforced;
+    timing.present_timing_surface =
+        observed
+            .present_timing_surface
+            .map(|c| crate::host::host_info::PresentTimingSurface {
+                present_timing_supported: c.present_timing_supported != 0,
+                present_at_absolute_time_supported: c.present_at_absolute_time_supported != 0,
+                present_at_relative_time_supported: c.present_at_relative_time_supported != 0,
+                present_stage_queries: c.present_stage_queries,
+                present_stage_queries_labels: crate::core::present_timing_ext::present_stage_labels(
+                    c.present_stage_queries,
+                ),
+            });
     timing.queue_global_priority = observed.queue_global_priority.map(|o| o.label());
 
     HostInfo {

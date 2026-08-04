@@ -161,13 +161,14 @@ fn build_ash_swapchain_device(device: &Arc<Device>) -> ash::khr::swapchain::Devi
     }
 }
 
-/// Log what the surface reports about present timing, so a session's log records the driver's own
-/// claim rather than VSE's assumption (see CLAUDE.md "Driver conformance caveat").
-fn log_present_timing_surface_caps(device: &Arc<Device>, surface: &Arc<Surface>) {
-    let Some(caps) = pt::query_present_timing_surface_caps(device.physical_device(), surface)
-    else {
-        return;
-    };
+/// Query and log what the surface reports about present timing, so a session's log *and* its host
+/// snapshot record the driver's own claim rather than VSE's assumption (see CLAUDE.md "Driver
+/// conformance caveat").
+fn query_and_log_present_timing_surface_caps(
+    device: &Arc<Device>,
+    surface: &Arc<Surface>,
+) -> Option<pt::PresentTimingSurfaceCapabilitiesEXT> {
+    let caps = pt::query_present_timing_surface_caps(device.physical_device(), surface)?;
     info!(
         "VK_EXT_present_timing surface caps: presentTimingSupported={}, \
          presentAtAbsoluteTimeSupported={}, presentAtRelativeTimeSupported={}, \
@@ -177,6 +178,7 @@ fn log_present_timing_surface_caps(device: &Arc<Device>, surface: &Arc<Surface>)
         caps.present_at_relative_time_supported != 0,
         caps.present_stage_queries,
     );
+    Some(caps)
 }
 
 /// Manages swapchain and associated resources
@@ -200,6 +202,9 @@ pub struct SwapchainManager {
     raw_present: Option<ash::khr::swapchain::Device>,
     /// Which per-swapchain opt-ins the current swapchain was created with.
     opt_ins: pt::SwapchainOptIns,
+    /// What the surface advertised about present timing at creation, recorded into the host
+    /// snapshot so a run keeps the driver's claim alongside the behavior VSE observed.
+    present_timing_surface_caps: Option<pt::PresentTimingSurfaceCapabilitiesEXT>,
 }
 
 impl SwapchainManager {
@@ -235,7 +240,8 @@ impl SwapchainManager {
         config: SwapchainConfig,
         opt_ins: pt::SwapchainOptIns,
     ) -> Result<Self, SwapchainError> {
-        log_present_timing_surface_caps(&device, &surface);
+        let present_timing_surface_caps =
+            query_and_log_present_timing_surface_caps(&device, &surface);
 
         let raw_present = if opt_ins.needs_raw_path() {
             Some(build_ash_swapchain_device(&device))
@@ -274,7 +280,14 @@ impl SwapchainManager {
             needs_recreation: false,
             raw_present,
             opt_ins,
+            present_timing_surface_caps,
         })
+    }
+
+    /// What the surface advertised about `VK_EXT_present_timing` when this swapchain was created.
+    /// `None` if the query entry point was unavailable or failed.
+    pub fn present_timing_surface_caps(&self) -> Option<pt::PresentTimingSurfaceCapabilitiesEXT> {
+        self.present_timing_surface_caps
     }
 
     /// Whether the current swapchain was created with the present-wait2 opt-in flag, i.e. whether

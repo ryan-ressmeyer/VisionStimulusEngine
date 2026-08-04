@@ -39,6 +39,6 @@ pub use input::{
     AcquisitionMethod, DisplayBackend, InputEvent, Key, KeyCode, MonitorInfo, MonitorSelection,
     MouseButton, NamedKey, PhysicalKey, VideoModeInfo, WindowMode,
 };
-pub use present_timing_ext::ScanoutFeedback;
+pub use present_timing_ext::{absolute_scheduling_verdict, ScanoutFeedback, SchedulingTrial};
 pub use render_context::RenderContext;
 pub use swapchain::{PresentMode, SwapchainConfig, SwapchainError, SwapchainManager};

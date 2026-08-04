@@ -97,6 +97,29 @@ pub struct GpuInfo {
     pub max_image_dimension_2d: u32,
 }
 
+/// What the presentation surface *advertised* about `VK_EXT_present_timing`, from
+/// `VkPresentTimingSurfaceCapabilitiesEXT`.
+///
+/// These are the driver's per-surface claims — deliberately kept separate from the
+/// behaviorally-observed fields on [`TimingCapabilities`], because the two disagreeing is exactly
+/// the situation VSE's driver-conformance posture exists to record. (It has also been the other
+/// way round: VSE once read `image_first_pixel_out` as unimplemented when the real cause was its
+/// own missing swapchain opt-in. See `docs/clock-synchronization.md` §6.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresentTimingSurface {
+    /// Surface reports present timing can be queried on it at all.
+    pub present_timing_supported: bool,
+    /// Surface reports it can present at an absolute `targetTime`.
+    pub present_at_absolute_time_supported: bool,
+    /// Surface reports it can present at a relative time.
+    pub present_at_relative_time_supported: bool,
+    /// Raw `VkPresentStageFlagsEXT` bitmask of stages the surface says it can timestamp.
+    pub present_stage_queries: u32,
+    /// `present_stage_queries` decoded into stable labels (e.g. `"image_first_pixel_out"`).
+    /// Unrecognized bits are preserved as `unknown(0x…)` rather than dropped.
+    pub present_stage_queries_labels: Vec<String>,
+}
+
 /// Present-timing and clock-synchronization capabilities of the GPU + driver.
 ///
 /// Captured into every experiment's host snapshot so a run's timing pedigree is auditable:
@@ -139,6 +162,13 @@ pub struct TimingCapabilities {
     /// `docs/clock-synchronization.md`.
     #[serde(default)]
     pub absolute_scheduling_enforced: Option<bool>,
+    /// **Advertised, per surface**: what `VkPresentTimingSurfaceCapabilitiesEXT` reported for the
+    /// surface this session presented to. Recorded next to the behaviorally-observed fields above
+    /// so a run keeps both the driver's claim and what actually happened — the pair is what makes
+    /// a conformance judgement reviewable after the fact. `None` on the CPU-estimate backend, the
+    /// offscreen target, or where the query is unavailable.
+    #[serde(default)]
+    pub present_timing_surface: Option<PresentTimingSurface>,
     /// Whether VSE's queue was created at elevated global priority
     /// (`VK_KHR_global_priority`), protecting the present deadline against other GPU
     /// contexts (e.g. an external renderer's device). Stable labels from
@@ -330,13 +360,24 @@ impl std::fmt::Display for HostInfo {
             "  advertised: present_timing={}, present_id2={}, present_wait2={}, calibrated_timestamps={}",
             t.present_timing, t.present_id2, t.present_wait2, t.calibrated_timestamps
         )?;
+        if let Some(s) = &t.present_timing_surface {
+            writeln!(
+                f,
+                "  surface:    present_timing={}, absolute_time={}, relative_time={}, stage_queries=[{}]",
+                s.present_timing_supported,
+                s.present_at_absolute_time_supported,
+                s.present_at_relative_time_supported,
+                s.present_stage_queries_labels.join(", ")
+            )?;
+        }
         writeln!(
             f,
             "  observed:   scanout feedback timestamps: {}",
             observed(
                 t.scanout_feedback_populated,
                 "real (IMAGE_FIRST_PIXEL_OUT populated)",
-                "STUBBED to 0 — advertised, not implemented; present_time uses the calibrated scanout clock"
+                "all-zero — check the swapchain present-timing opt-in and whether the display was \
+                 blanked before blaming the driver; present_time uses the calibrated scanout clock"
             )
         )?;
         writeln!(

@@ -195,6 +195,16 @@ pub(super) struct PresentTarget {
     pub(super) scanout_feedback_populated: Option<bool>,
     /// Count of feedback records seen while `scanout_feedback_populated` is still undetermined.
     pub(super) scanout_feedback_probe_count: u32,
+    /// Whether the driver enforces absolute `targetTime` scheduling. Not auto-probed (measuring it
+    /// requires deliberately dropping frames), so `None` unless a characterization run set it via
+    /// `RenderContext::record_absolute_scheduling_enforced`. Recorded into `HostInfo`.
+    pub(super) absolute_scheduling_enforced: Option<bool>,
+    /// Diagnostic escape hatch: when `false`, the sync EXT flip path does **not** software-pace
+    /// scheduled presents against the scanout clock, leaving `VkPresentTimingInfoEXT.targetTime`
+    /// as the only thing that could delay the present. Required to measure whether the driver
+    /// honors it — with pacing on, the measurement can only ever confirm VSE's own pacing.
+    /// Defaults to `true`; experiments should leave it alone.
+    pub(super) software_present_pacing: bool,
     /// One-time-warning latches for driver-conformance guardrails (feedback stubbed; scheduling
     /// software-paced), so the warnings fire once per session rather than every frame.
     pub(super) warned_feedback_stub: bool,

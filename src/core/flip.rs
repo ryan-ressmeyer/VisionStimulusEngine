@@ -401,10 +401,18 @@ impl<'a> RenderContext<'a> {
         let scheduled =
             target_time.and_then(|t| self.state.target.present_expect_mut().scheduled_target(t));
 
-        // Software scanout-domain pacing: not every driver enforces `targetTime` (Intel/ANV/Mesa
-        // 26.1 does not), so pace the present ourselves against the scanout clock. Harmless when the
-        // driver *does* honor the hardware target above. Sync path only (buffered stays pipelined).
-        if let Some(target) = target_time {
+        // Software scanout-domain pacing: a driver may not enforce `targetTime`, so pace the
+        // present ourselves against the scanout clock. Harmless when the driver *does* honor the
+        // hardware target above. Sync path only (buffered stays pipelined).
+        //
+        // `software_present_pacing` disables this for driver characterization only: with pacing on,
+        // a scheduling measurement can only ever confirm VSE's own pacing, never the hardware.
+        let pacing_enabled = self
+            .state
+            .target
+            .present_expect_mut()
+            .software_present_pacing;
+        if let Some(target) = target_time.filter(|_| pacing_enabled) {
             self.state
                 .target
                 .present_expect_mut()

@@ -958,6 +958,40 @@ impl<'a> RenderContext<'a> {
         self.state.target.present()?.scanout_feedback_populated
     }
 
+    /// Whether the driver was measured to enforce absolute `targetTime` scheduling.
+    ///
+    /// `None` unless a characterization run called
+    /// [`record_absolute_scheduling_enforced`](Self::record_absolute_scheduling_enforced) — the
+    /// measurement deliberately drops frames, so it is never auto-run.
+    pub fn absolute_scheduling_enforced(&self) -> Option<bool> {
+        self.state.target.present()?.absolute_scheduling_enforced
+    }
+
+    /// **Driver characterization only.** Disable VSE's software pacing of scheduled presents, so
+    /// `VkPresentTimingInfoEXT.targetTime` is the only thing that could hold a present back.
+    ///
+    /// Experiments must not call this: with pacing off, scheduled flips land wherever the driver
+    /// decides, which on a non-enforcing driver is the next vblank regardless of the target. It
+    /// exists so [`record_absolute_scheduling_enforced`](Self::record_absolute_scheduling_enforced)
+    /// can measure the hardware rather than measuring VSE's own pacing loop.
+    pub fn set_software_present_pacing(&mut self, enabled: bool) {
+        if let Some(p) = self.state.target.present_mut() {
+            p.software_present_pacing = enabled;
+        }
+    }
+
+    /// Record the verdict of an absolute-scheduling characterization run so it lands in the
+    /// session's [`HostInfo`](crate::host::HostInfo).
+    ///
+    /// Build the verdict with
+    /// [`absolute_scheduling_verdict`](crate::core::present_timing_ext::absolute_scheduling_verdict)
+    /// over trials collected with software pacing disabled.
+    pub fn record_absolute_scheduling_enforced(&mut self, enforced: Option<bool>) {
+        if let Some(p) = self.state.target.present_mut() {
+            p.absolute_scheduling_enforced = enforced;
+        }
+    }
+
     // === Input polling (frame-aligned) ===
 
     /// Returns `true` if the key is currently held down.
@@ -1265,9 +1299,10 @@ pub(super) fn capture_host_info(state: &VSEState, config: &VSEConfig) -> crate::
             crate::host::capture::capture_swapchain_info(&p.swapchain),
             crate::host::capture::ObservedPresentTiming {
                 scanout_feedback_populated: p.scanout_feedback_populated,
-                // Enforcement is not auto-probed (it disrupts frames); `None` here. The
-                // direct-display characterization example measures and reports it.
-                absolute_scheduling_enforced: None,
+                // Enforcement is not auto-probed (it disrupts frames); `None` unless a
+                // characterization run recorded it via `record_absolute_scheduling_enforced`.
+                absolute_scheduling_enforced: p.absolute_scheduling_enforced,
+                present_timing_surface: p.swapchain.present_timing_surface_caps(),
                 queue_global_priority: p.ext_features.map(|f| f.queue_priority),
             },
         ),

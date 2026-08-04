@@ -18,19 +18,22 @@
 //!      clock-model way); normal scheduled frames hold steady refresh cadence with `on_target`
 //!      true, and periodic **deliberate multi-vblank gaps** actually land that many vblanks later
 //!      (measured). VSE software-paces scheduled flips against the scanout clock, so this passes
-//!      whether or not the driver enforces `targetTime`. (Whether the *hardware* honors `targetTime`
-//!      — `absolute_scheduling_enforced` — is a separate driver-conformance fact: measured false on
-//!      Intel/ANV/Mesa 26.1; see docs/clock-synchronization.md §6.)
+//!      whether or not the driver enforces `targetTime`.
+//!   5. **whether the *hardware* honors `targetTime`** — a separate, appended phase that runs with
+//!      VSE's software pacing **disabled**, so the hardware target is the only thing that could
+//!      hold a present back. It requests deliberate multi-vblank gaps and measures where scanout
+//!      actually lands; a non-enforcing driver presents at the next vblank regardless. The verdict
+//!      is recorded into `HostInfo.timing.absolute_scheduling_enforced`. Phases 1–4 cannot answer
+//!      this: with pacing on, an on-target gap only proves VSE's own pacing loop works.
 //!
-//! Scanout source: measured on Intel/ANV/Mesa 26.1, `vkGetPastPresentationTimingEXT` returns
-//! *complete* records that correlate by `present_id` but stub the stage timestamps
-//! (`IMAGE_FIRST_PIXEL_OUT` = 0). VSE therefore samples the calibrated `PRESENT_STAGE_LOCAL` clock
-//! right after `wait_for_present` for `present_time`; on a driver that fills the feedback stage
-//! times, that true per-present value is preferred automatically.
+//! Scanout source: `present_time` prefers the driver's per-present `IMAGE_FIRST_PIXEL_OUT` feedback
+//! and falls back to sampling the calibrated `PRESENT_STAGE_LOCAL` clock after `wait_for_present`
+//! when feedback is all-zero. If you see the fallback, check the swapchain present-timing opt-in and
+//! whether the display was blanked before blaming the driver — see docs/clock-synchronization.md §6.
 //!
 //! It records every flip to `b3_direct_display/frames.csv` and prints a PASS/FAIL summary. It
-//! **auto-terminates** after `[frames]` (default 640) — no SIGINT (which bricks the VT); Escape
-//! also exits.
+//! **auto-terminates** after `[frames]` plus the characterization phase — no SIGINT (which bricks
+//! the VT); Escape also exits.
 //!
 //! Run from a spare TTY:
 //! ```bash
@@ -43,6 +46,17 @@ use vision_stimulus_engine::prelude::*;
 const GAP_EVERY: u64 = 50;
 /// A gap event schedules this many vblanks ahead (vs 1 for a normal scheduled frame).
 const GAP_VBLANKS: u64 = 3;
+
+/// Frames appended after the main run to characterize whether the *hardware* honors
+/// `VkPresentTimingInfoEXT.targetTime`, with VSE's software pacing disabled.
+///
+/// This must be its own phase: while VSE paces scheduled presents itself, a gap landing on target
+/// only proves VSE's pacing loop works — the driver could be ignoring `targetTime` entirely and the
+/// result would look identical. With pacing off, a non-enforcing driver presents at the next vblank
+/// regardless of how far ahead the target was, which is the discriminator.
+const ENFORCE_FRAMES: u64 = 90;
+/// Within the characterization phase, every Nth frame requests a multi-vblank gap.
+const ENFORCE_GAP_EVERY: u64 = 6;
 
 #[derive(serde::Serialize)]
 struct Row {
@@ -102,6 +116,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut vblank_idx: u64 = 0;
     let mut sched_seq: u64 = 0;
 
+    // --- Absolute-scheduling characterization (appended phase, software pacing OFF) ---
+    let mut enforce_started = false;
+    let mut enforce_seq: u64 = 0;
+    let mut trials: Vec<SchedulingTrial> = Vec::new();
+    let enforce_start = total;
+    let grand_total = total + ENFORCE_FRAMES;
+
     context.run(move |vse| {
         if source.is_none() {
             source = Some(vse.timing_source());
@@ -119,8 +140,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vse.set_clear_color(c, c, c, 1.0);
         vse.clear()?;
 
+        // --- Phase switch: enter the pacing-off characterization phase once ---
+        let enforcing = n >= enforce_start;
+        if enforcing && !enforce_started {
+            enforce_started = true;
+            vse.set_software_present_pacing(false);
+            // Re-anchor: targets from here are measured against where scanout actually is now.
+            anchor_us = Some(last_present_us.unwrap_or(0));
+            vblank_idx = 0;
+            eprintln!(
+                "\n--- absolute-scheduling characterization: software pacing OFF for \
+                 {ENFORCE_FRAMES} frames (targetTime is now the only scheduler) ---"
+            );
+        }
+
         let scheduled = n >= warmup;
         let mut is_gap = false;
+
+        if enforcing {
+            // Same fixed-anchor scheme, but every ENFORCE_GAP_EVERY-th frame asks for a
+            // GAP_VBLANKS-vblank jump with nothing but the hardware target to enforce it.
+            let anchor = *anchor_us.get_or_insert(0);
+            is_gap = enforce_seq > 0 && enforce_seq % ENFORCE_GAP_EVERY == 0;
+            vblank_idx += if is_gap { GAP_VBLANKS } else { 1 };
+            enforce_seq += 1;
+            let target_us = anchor + vblank_idx * refresh_us - refresh_us / 2;
+            let info = vse.flip(Some(Timestamp::from_micros(target_us)))?;
+
+            let pt = info.present_time.as_micros();
+            if let (Some(prev), true) = (last_present_us, is_gap) {
+                // Round the measured gap to whole vblanks.
+                let observed = (pt.saturating_sub(prev) + refresh_us / 2) / refresh_us;
+                trials.push(SchedulingTrial {
+                    requested_vblanks: GAP_VBLANKS,
+                    observed_vblanks: observed,
+                });
+            }
+            last_present_us = Some(pt);
+
+            vse.record_frame(Row {
+                idx: n,
+                scheduled: true,
+                gap_event: is_gap,
+                present_id: info.present_id,
+                on_target: info.on_target,
+                missed: info.missed,
+            })?;
+
+            n += 1;
+            if n >= grand_total {
+                let verdict = absolute_scheduling_verdict(&trials);
+                vse.record_absolute_scheduling_enforced(verdict);
+                report_enforcement(&trials, verdict);
+                vse.request_exit();
+            }
+            return Ok(());
+        }
 
         // Compute the hardware target for scheduled frames from the fixed anchor.
         let target = if scheduled {
@@ -211,13 +286,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 scheduled_frames,
                 on_target_true,
             });
-            vse.request_exit();
+            // Do not exit here: the pacing-off characterization phase runs next.
         }
         Ok(())
     })?;
 
     eprintln!("Clean shutdown.");
     Ok(())
+}
+
+/// Report the hardware `targetTime` enforcement characterization.
+///
+/// This is the only measurement that can distinguish a driver honoring `targetTime` from VSE
+/// pacing the present itself, because it runs with VSE's pacing disabled.
+fn report_enforcement(trials: &[SchedulingTrial], verdict: Option<bool>) {
+    println!("\n──────── Absolute scheduling (targetTime) enforcement ────────");
+    println!("software pacing            : DISABLED for this phase");
+    println!("gap trials                 : {}", trials.len());
+    if !trials.is_empty() {
+        let on_target = trials
+            .iter()
+            .filter(|t| t.observed_vblanks >= t.requested_vblanks)
+            .count();
+        println!(
+            "landed at/after target     : {}/{}  (requested {GAP_VBLANKS} vblanks each)",
+            on_target,
+            trials.len()
+        );
+        let mut observed: Vec<u64> = trials.iter().map(|t| t.observed_vblanks).collect();
+        observed.sort_unstable();
+        println!("observed vblank gaps       : {observed:?}");
+    }
+    // A driver that honors targetTime only *sometimes* is the worst case for an experiment: it
+    // looks like it works. Call that out separately from a clean yes/no.
+    let unstable = !trials.is_empty() && {
+        let hit = trials
+            .iter()
+            .filter(|t| t.observed_vblanks >= t.requested_vblanks)
+            .count();
+        hit > 0 && hit < trials.len()
+    };
+
+    match verdict {
+        Some(true) => println!(
+            "VERDICT: targetTime IS enforced by the driver — presents were held to their target."
+        ),
+        Some(false) => println!(
+            "VERDICT: targetTime NOT enforced — presents landed at the next vblank regardless.\n\
+             VSE's software pacing (re-enabled outside this phase) is what makes scheduling work."
+        ),
+        None => println!(
+            "VERDICT: inconclusive — no multi-vblank trials completed; cannot discriminate."
+        ),
+    }
+    if unstable {
+        println!(
+            "WARNING: enforcement was INCONSISTENT across trials (see the gaps above). A driver \
+             that honors targetTime only sometimes is more dangerous than one that never does — \
+             it looks reliable. Treat hardware scheduling as unusable here and keep VSE's software \
+             pacing on; re-run to confirm before recording any conclusion."
+        );
+    }
+    println!("Recorded into HostInfo as timing.absolute_scheduling_enforced.");
+    println!("──────────────────────────────────────────────────────────────\n");
 }
 
 struct Summary<'a> {

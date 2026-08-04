@@ -205,10 +205,24 @@ direct-display and windowed:**
 | `vkGetPastPresentationTimingEXT` stage timestamps | ✓ | ✓ **(since 2026-08-03)** | Real per-present `IMAGE_FIRST_PIXEL_OUT` is used when populated; the calibrated-clock path remains as fallback. |
 | **Absolute scheduling `VkPresentTimingInfoEXT.targetTime`** | ✓ (`presentAtAbsoluteTime`) | **? — not re-measured since the opt-in fix** | VSE **software-paces** scheduled flips against the scanout clock (still sends the hardware target). |
 
-The scheduling row was characterized *before* the swapchain opt-in was fixed and has **not** been
-re-measured since. Because the same missing bit explained the feedback row entirely, this row is now
-suspect for the same reason and should be treated as unknown, not as a driver defect. Re-run
-`examples/13_direct_display_scanout` (needs a TTY + direct display) to settle it.
+The scheduling row was characterized *before* the swapchain opt-in was fixed, and a windowed probe
+run after the fix shows it was **confounded by the same bug**:
+
+| Swapchain | Observed vblank gap for a 3-vblank request, software pacing off |
+|---|---|
+| **without** the timing bit | `[1,1,1,1,1,1,1,1,1,1,1,1,1,1]` — `targetTime` wholly ignored |
+| **with** the timing bit | `[3,3,3,3,3,1,1,1,1,1,2,1,3,3]` — sometimes honored, unstable |
+
+So "not enforced" was measured on a swapchain that had never opted into present timing, exactly as
+the feedback row was. But the post-fix windowed result is **not** authoritative either: under a
+compositor the compositor mediates presentation, and the run-to-run variation above (an earlier run
+of the same binary gave all-3s) is what you would expect from that. Treat this row as **unresolved**
+— neither a driver defect nor a working feature — until `examples/13_direct_display_scanout`
+measures it on the direct-display path with no compositor in the way.
+
+Note the failure mode this hints at: intermittent enforcement is worse for an experiment than none,
+because it looks like it works. VSE keeps software-pacing scheduled flips regardless, so stimulus
+onsets do not depend on the answer.
 
 The driver also states its claims **per surface**. `VkPresentTimingSurfaceCapabilitiesEXT` on this
 machine returns:
@@ -258,8 +272,15 @@ Two consequences worth carrying:
   are software-paced and that hardware `targetTime` enforcement is driver-dependent and unverified.
 - **Enforcement characterization (on demand):** actively testing scheduling enforcement requires
   presenting deliberate multi-vblank gaps, which disrupts frames, so it is **not** auto-run.
-  `examples/13_direct_display_scanout` measures it (schedules gaps from a fixed `t0 + k·T` anchor and
-  checks the measured scanout gap) and reports `absolute_scheduling_enforced`. Run it once per
+  `examples/13_direct_display_scanout` measures it in an appended phase that **disables VSE's
+  software pacing** (`RenderContext::set_software_present_pacing(false)`), leaving
+  `VkPresentTimingInfoEXT.targetTime` as the only thing that could hold a present back. It then
+  schedules multi-vblank gaps from a fixed `t0 + k·T` anchor and measures where scanout lands: a
+  non-enforcing driver presents at the *next* vblank regardless of the target.
+  `absolute_scheduling_verdict()` turns the trials into a verdict, which the example records via
+  `record_absolute_scheduling_enforced()` so it reaches `HostInfo`. **This distinction matters:**
+  with pacing left on, a gap landing on target only proves VSE's own pacing loop works — the driver
+  could be ignoring `targetTime` entirely and the result would look identical. Run it once per
   hardware/driver config; `examples/12_host_and_display_info` prints the advertised-vs-observed table.
 
 The guiding rule: **VSE's behavior stays correct via fallbacks, and provenance

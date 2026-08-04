@@ -404,7 +404,7 @@ pub struct SwapchainTimingPropertiesEXT {
 /// `VkPresentTimingSurfaceCapabilitiesEXT` — chained onto surface-capabilities queries to
 /// learn which present stages the *current* surface/path can timestamp (compositor detection).
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct PresentTimingSurfaceCapabilitiesEXT {
     pub s_type: vk::StructureType,
     pub p_next: *mut c_void,
@@ -687,6 +687,73 @@ pub struct EnabledPresentTimingFeatures {
     /// required to import an external renderer's image ring (see
     /// `crate::core::external_frame`).
     pub external_handles: bool,
+}
+
+/// Decode a `VkPresentStageFlagsEXT` bitmask into stable labels for the host snapshot.
+///
+/// Unrecognized bits are preserved as `unknown(0x…)` rather than dropped: this lands in a
+/// recorded session's provenance, where a silently discarded stage would misrepresent what the
+/// driver claimed.
+pub fn present_stage_labels(flags: u32) -> Vec<String> {
+    const KNOWN: [(u32, &str); 4] = [
+        (
+            PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT,
+            "queue_operations_end",
+        ),
+        (PRESENT_STAGE_REQUEST_DEQUEUED_BIT, "request_dequeued"),
+        (
+            PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT,
+            "image_first_pixel_out",
+        ),
+        (
+            PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT,
+            "image_first_pixel_visible",
+        ),
+    ];
+
+    let mut labels = Vec::new();
+    let mut remaining = flags;
+    for (bit, name) in KNOWN {
+        if flags & bit != 0 {
+            labels.push(name.to_string());
+            remaining &= !bit;
+        }
+    }
+    if remaining != 0 {
+        labels.push(format!("unknown(0x{remaining:08x})"));
+    }
+    labels
+}
+
+/// One deliberate-gap scheduling trial, run with VSE's **software pacing disabled** so that
+/// `VkPresentTimingInfoEXT.targetTime` is the only thing that could hold the present back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedulingTrial {
+    /// How many vblanks ahead of the previous scanout the present was targeted.
+    pub requested_vblanks: u64,
+    /// How many vblanks actually elapsed before it scanned out.
+    pub observed_vblanks: u64,
+}
+
+/// Decide whether the driver enforces absolute `targetTime` scheduling, from unpaced trials.
+///
+/// A driver that ignores `targetTime` presents at the **next** vblank no matter how far ahead the
+/// target was, so `observed < requested` on every gap trial. A conformant driver holds the present
+/// until the target, giving `observed >= requested`.
+///
+/// Only trials requesting more than one vblank can discriminate — a 1-vblank request lands at one
+/// vblank either way — so a run without them returns `None` (inconclusive) rather than a guess.
+/// A two-thirds majority decides, so one dropped or late frame cannot flip a clear result.
+pub fn absolute_scheduling_verdict(trials: &[SchedulingTrial]) -> Option<bool> {
+    let gaps: Vec<_> = trials.iter().filter(|t| t.requested_vblanks > 1).collect();
+    if gaps.is_empty() {
+        return None;
+    }
+    let on_target = gaps
+        .iter()
+        .filter(|t| t.observed_vblanks >= t.requested_vblanks)
+        .count();
+    Some(on_target * 3 >= gaps.len() * 2)
 }
 
 /// The per-swapchain opt-in flags a raw `vkCreateSwapchainKHR` should request, derived from what
@@ -1241,6 +1308,93 @@ mod tests {
         assert!(wait2_only.needs_raw_path());
 
         assert!(!SwapchainOptIns::default().needs_raw_path());
+    }
+
+    // ─── Present-stage flag decoding ────────────────────────────────────────
+
+    #[test]
+    fn present_stage_flags_decode_to_stable_labels() {
+        // 0x5 is what ANV reports for presentStageQueries on the reference machine.
+        assert_eq!(
+            present_stage_labels(
+                PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT | PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT
+            ),
+            vec!["queue_operations_end", "image_first_pixel_out"]
+        );
+        assert!(present_stage_labels(0).is_empty());
+    }
+
+    #[test]
+    fn present_stage_labels_report_unknown_bits_rather_than_dropping_them() {
+        // A future stage bit must not vanish from the host snapshot silently.
+        assert_eq!(
+            present_stage_labels(PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT | 0x8000_0000),
+            vec!["queue_operations_end", "unknown(0x80000000)"]
+        );
+    }
+
+    // ─── Absolute-scheduling enforcement verdict ────────────────────────────
+
+    #[test]
+    fn scheduling_verdict_is_none_without_multi_vblank_trials() {
+        // Nothing to learn: a 1-vblank request lands at 1 vblank whether or not the driver
+        // enforces the target, so these trials cannot discriminate.
+        assert_eq!(absolute_scheduling_verdict(&[]), None);
+        assert_eq!(
+            absolute_scheduling_verdict(&[SchedulingTrial {
+                requested_vblanks: 1,
+                observed_vblanks: 1
+            }]),
+            None
+        );
+    }
+
+    #[test]
+    fn scheduling_verdict_is_enforced_when_gaps_land_at_their_target() {
+        let trials = [
+            SchedulingTrial {
+                requested_vblanks: 3,
+                observed_vblanks: 3,
+            },
+            SchedulingTrial {
+                requested_vblanks: 3,
+                observed_vblanks: 3,
+            },
+            SchedulingTrial {
+                requested_vblanks: 3,
+                observed_vblanks: 4,
+            },
+        ];
+        assert_eq!(absolute_scheduling_verdict(&trials), Some(true));
+    }
+
+    #[test]
+    fn scheduling_verdict_is_not_enforced_when_presents_land_next_vblank() {
+        // The signature of an ignored targetTime with software pacing off: everything
+        // scans out at the very next vblank regardless of how far ahead it was targeted.
+        let trials: Vec<_> = (0..4)
+            .map(|_| SchedulingTrial {
+                requested_vblanks: 3,
+                observed_vblanks: 1,
+            })
+            .collect();
+        assert_eq!(absolute_scheduling_verdict(&trials), Some(false));
+    }
+
+    #[test]
+    fn scheduling_verdict_tolerates_a_minority_of_outliers() {
+        // One dropped/late frame must not flip a clear verdict either way.
+        let mut trials: Vec<_> = (0..5)
+            .map(|_| SchedulingTrial {
+                requested_vblanks: 3,
+                observed_vblanks: 3,
+            })
+            .collect();
+        trials.push(SchedulingTrial {
+            requested_vblanks: 3,
+            observed_vblanks: 1,
+        });
+        assert_eq!(absolute_scheduling_verdict(&trials), Some(true));
     }
 
     #[test]
