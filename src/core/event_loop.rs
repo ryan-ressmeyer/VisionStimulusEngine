@@ -535,7 +535,7 @@ impl VSEContext {
                                     .present_expect()
                                     .buffered_pending_frames
                                     .front()
-                                    .is_some_and(|frame| frame.completion.is_complete());
+                                    .is_some_and(|frame| frame.submission.completion.is_complete());
 
                                 if oldest_complete {
                                     let pending = s
@@ -641,7 +641,7 @@ impl VSEContext {
         T: std::any::Any + serde::Serialize + Send + 'static,
         F: FnMut(FlipEvent<T>, &mut RenderContext<'_>) -> Result<(), VSEError>,
     {
-        pending.completion.wait_blocking();
+        pending.submission.completion.wait_blocking();
         let payload = *pending
             .payload
             .downcast::<T>()
@@ -650,7 +650,7 @@ impl VSEContext {
         let confirmed = state
             .target
             .present_expect_mut()
-            .build_confirmed_flip(clock, pending.estimated_flip);
+            .build_confirmed_flip(clock, pending.submission.estimated_flip);
         state.target.present_expect_mut().buffered_confirmed_flip = Some(confirmed.clone());
         if let Some(recording) = &mut state.recording {
             recording.on_flip(confirmed.clone());

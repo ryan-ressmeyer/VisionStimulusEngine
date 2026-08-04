@@ -140,10 +140,8 @@ pub(crate) trait InFlightFuture {
 /// A submitted frame awaiting confirmation in the buffered FIFO.
 pub(crate) struct PendingFrame<T> {
     pub payload: T,
-    /// Best available timing at submit time. Replaced by confirmed timing in `Presented`.
-    pub estimated_flip: FlipInfo,
-    /// Completion for this exact payload and timing estimate.
-    pub completion: Box<dyn InFlightFuture>,
+    /// Submission metadata and completion owned by this exact payload.
+    pub submission: crate::core::flip::Submission,
 }
 
 #[cfg(test)]
@@ -166,24 +164,27 @@ mod tests {
 
         let pending = PendingFrame {
             payload: 42_u32,
-            estimated_flip: FlipInfo {
-                frame_number: 3,
-                timing_source: TimingSource::CpuEstimate,
-                submit_time: Timestamp::from_micros(10),
-                present_time: Timestamp::from_micros(20),
-                present_id: 0,
-                target_time: None,
-                on_target: true,
-                missed: false,
-                missed_count: 0,
-                skipped: false,
+            submission: crate::core::flip::Submission {
+                estimated_flip: FlipInfo {
+                    frame_number: 3,
+                    timing_source: TimingSource::CpuEstimate,
+                    submit_time: Timestamp::from_micros(10),
+                    present_time: Timestamp::from_micros(20),
+                    present_id: 0,
+                    target_time: None,
+                    on_target: true,
+                    missed: false,
+                    missed_count: 0,
+                    skipped: false,
+                },
+                completion: Box::new(CompleteFuture),
+                backend: crate::core::flip::SubmissionBackend::Vulkano,
             },
-            completion: Box::new(CompleteFuture),
         };
 
         assert_eq!(pending.payload, 42);
-        assert_eq!(pending.estimated_flip.frame_number, 3);
-        assert!(pending.completion.is_complete());
+        assert_eq!(pending.submission.estimated_flip.frame_number, 3);
+        assert!(pending.submission.completion.is_complete());
     }
 
     #[test]

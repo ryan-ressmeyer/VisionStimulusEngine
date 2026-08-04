@@ -59,9 +59,9 @@ pub struct PresentOutcome {
     pub present_id: u64,
     /// Whether the swapchain reported itself suboptimal (needs recreation).
     pub suboptimal: bool,
-    /// The slot fence signalled by this frame's render submit. The synchronous path waits it via
-    /// [`PresentEngine::wait_frame`]; the buffered path wraps it as an [`InFlightFuture`] to
-    /// confirm the frame asynchronously. Valid until the slot is reused (`ring_len` frames later).
+    /// The slot fence signalled by this frame's render submit. Both synchronous and buffered
+    /// paths wrap it as an [`InFlightFuture`]; synchronous confirmation waits immediately while
+    /// buffered confirmation queues it. Valid until the slot is reused (`ring_len` frames later).
     pub fence: Arc<Fence>,
 }
 
@@ -270,16 +270,6 @@ impl PresentEngine {
             suboptimal,
             fence: self.ring[slot].fence.clone(),
         })
-    }
-
-    /// Block until the given slot's render submit has completed (its fence signalled).
-    ///
-    /// Used by the **synchronous** `flip()` path to keep it truly synchronous — capturing a
-    /// present time only after the frame's GPU work finished, so inter-frame deltas track the
-    /// vblank cadence rather than the free-running CPU loop. The buffered path does *not* call
-    /// this (it confirms asynchronously via the fence instead).
-    pub fn wait_frame(&self, slot: usize) {
-        let _ = self.ring[slot].fence.wait(None);
     }
 
     /// Wait for every in-flight frame to finish. Called before swapchain recreation so no pending

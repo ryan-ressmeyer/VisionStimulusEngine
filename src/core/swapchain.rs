@@ -645,24 +645,9 @@ impl SwapchainManager {
     where
         F: GpuFuture + 'static,
     {
-        let present_info =
-            SwapchainPresentInfo::swapchain_image_index(self.swapchain.clone(), image_index);
-
-        let result = wait_future
-            .then_swapchain_present(queue, present_info)
-            .then_signal_fence_and_flush();
-
-        match result {
-            Ok(future) => {
-                future.wait(None).ok();
-                Ok(())
-            }
-            Err(Validated::Error(VulkanError::OutOfDate)) => {
-                self.needs_recreation = true;
-                Err(SwapchainError::OutOfDate)
-            }
-            Err(e) => Err(SwapchainError::PresentFailed(e.to_string())),
-        }
+        let completion = self.submit_nonblocking(queue, image_index, wait_future)?;
+        completion.wait_blocking();
+        Ok(())
     }
 
     /// Submit a frame to the GPU without blocking on fence completion.
