@@ -610,10 +610,11 @@ impl PresentTarget {
         if !self.warned_sw_pacing {
             self.warned_sw_pacing = true;
             info!(
-                "Scheduled present requested: VSE paces it against the scanout clock (software). \
-                 Hardware targetTime enforcement is driver-dependent and NOT verified here — it is \
-                 ignored on Intel/ANV/Mesa 26.1. Characterize your driver with \
-                 `examples/13_direct_display_scanout` (reports absolute_scheduling_enforced)."
+                "Scheduled present requested: VSE paces it against the scanout clock (software) \
+                 in addition to sending the hardware targetTime, so scheduling is correct either \
+                 way. Whether this driver/display path enforces targetTime itself is not verified \
+                 at runtime — characterize it with `examples/13_direct_display_scanout` (reports \
+                 absolute_scheduling_enforced)."
             );
         }
     }

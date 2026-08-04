@@ -156,10 +156,15 @@ pub struct TimingCapabilities {
     pub scanout_feedback_populated: Option<bool>,
     /// **Behaviorally observed**: whether the driver enforces absolute present scheduling
     /// (`VkPresentTimingInfoEXT.targetTime`). `Some(false)` means it advertises
-    /// `presentAtAbsoluteTime` but ignores the target (measured on Intel/ANV/Mesa 26.1) — VSE then
-    /// software-paces scheduled flips against the scanout clock. `None` until characterized (the
-    /// check disrupts frames, so it is not auto-run; the direct-display example measures it). See
-    /// `docs/clock-synchronization.md`.
+    /// `presentAtAbsoluteTime` but ignores the target — VSE software-paces scheduled flips against
+    /// the scanout clock regardless, so scheduling is correct either way. `None` until
+    /// characterized (the check disrupts frames, so it is not auto-run;
+    /// `examples/13_direct_display_scanout` measures it with software pacing disabled).
+    ///
+    /// **This is per display path, not per driver.** On Intel/ANV/Mesa 26.1 it measured `true` on
+    /// direct display (14/14 gaps held) but *intermittent* windowed, where the compositor mediates
+    /// presentation. Characterize the path you actually record on. See
+    /// `docs/clock-synchronization.md` §6.
     #[serde(default)]
     pub absolute_scheduling_enforced: Option<bool>,
     /// **Advertised, per surface**: what `VkPresentTimingSurfaceCapabilitiesEXT` reported for the
@@ -386,7 +391,7 @@ impl std::fmt::Display for HostInfo {
             observed(
                 t.absolute_scheduling_enforced,
                 "enforced by driver",
-                "NOT enforced — advertised, not implemented; VSE software-paces scheduled flips"
+                "NOT enforced on this display path; VSE software-paces scheduled flips"
             )
         )?;
         if let Some(dev) = t.cpu_gpu_max_deviation_ns {

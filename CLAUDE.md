@@ -130,13 +130,18 @@ sub-features it has not *implemented*, so VSE verifies behaviorally, falls back 
 records what actually happened in `HostInfo.timing`. Never assume an advertised present-timing
 feature works — check `scanout_feedback_populated` / `absolute_scheduling_enforced`.
 
-**But check your own opt-ins first.** This project spent real time blaming Mesa/ANV for stubbing
-`vkGetPastPresentationTimingEXT` stage timestamps to 0. The actual cause was VSE creating its
-swapchain without `VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT`, so the swapchain had never opted
-into timing (fixed 2026-08-03; `IMAGE_FIRST_PIXEL_OUT` went 0/200 → 200/200). Vulkan validation had
-been reporting the exact VUIDs for it the whole time. Each Vulkan 1.4 present feature needs its own
-`VkSwapchainCreateInfoKHR` flag — see `pt::SwapchainOptIns`. The `targetTime` scheduling row of §6
-was characterized under the same bug and is now **unverified**, not a known driver defect.
+**But check your own opt-ins first.** This project spent real time blaming Mesa/ANV for two
+present-timing "defects" — stubbed `IMAGE_FIRST_PIXEL_OUT` and unenforced `targetTime`. **Both were
+VSE's own bug:** the swapchain was created without `VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT`, so
+it had never opted into present timing. Fixed 2026-08-03 — feedback went 0/200 → 200/200, and
+`targetTime` went 14/14 ignored → 14/14 enforced on direct display. Vulkan validation had been
+reporting the exact VUIDs the whole time; they were dismissed as spec pedantry because it "worked
+anyway." Each Vulkan 1.4 present feature needs its own `VkSwapchainCreateInfoKHR` flag — see
+`pt::SwapchainOptIns`. **This driver now has no known present-timing conformance gap.**
+
+**Timing facts are per display path, not per driver.** The same machine enforces `targetTime` on
+direct display but only intermittently windowed, and advertises `presentAtRelativeTime` on direct
+display but not windowed. Characterize the path you actually record on.
 
 See `docs/clock-synchronization.md` for the full model, error budget, the drift measurement, and the
 driver-conformance table (§6).
