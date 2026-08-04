@@ -6,7 +6,6 @@ use winit::event_loop::EventLoop;
 
 use super::{
     device::{DeviceError, GPUPreference},
-    frame::FrameError,
     input::{AcquisitionMethod, MonitorSelection, WindowMode},
     swapchain::{PresentMode, SwapchainError},
 };
@@ -15,6 +14,14 @@ use crate::drawing::renderer::RendererError;
 use crate::drawing::{ModelError, PipelineError, PipelineSuite};
 
 use super::context::VSEContext;
+
+/// Errors that can occur while submitting or completing a frame.
+#[derive(Error, Debug)]
+pub enum FrameError {
+    /// Failed to execute commands.
+    #[error("Failed to execute commands: {0}")]
+    ExecutionFailed(String),
+}
 
 /// Errors that can occur in VSEContext
 #[derive(Error, Debug)]

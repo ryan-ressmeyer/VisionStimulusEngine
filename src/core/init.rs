@@ -13,7 +13,6 @@ use winit::{
 use super::config::{VSEConfig, VSEError};
 use super::context::VSEContext;
 use super::device::DeviceSelector;
-use super::frame::FrameBuilder;
 use super::input::{InputState, MonitorSelection, WindowMode};
 use super::present_timing_ext as pt;
 use super::state::{
@@ -165,7 +164,6 @@ impl VSEContext {
             .unwrap_or_default();
         let swapchain =
             SwapchainManager::new_with_opt_ins(device.clone(), surface, swapchain_config, opt_ins)?;
-        let frame_builder = FrameBuilder::new(device.clone(), queue.clone());
         let renderer = Renderer::new(
             device.clone(),
             queue.clone(),
@@ -208,7 +206,6 @@ impl VSEContext {
             target: RenderTarget::Present(Box::new(PresentTarget {
                 window: Some(window),
                 swapchain,
-                frame_builder,
                 minimized: false,
                 cursor_visible,
                 window_mode: config.window_mode,
@@ -293,7 +290,6 @@ impl VSEContext {
             .unwrap_or_default();
         let swapchain =
             SwapchainManager::new_with_opt_ins(device.clone(), surface, swapchain_config, opt_ins)?;
-        let frame_builder = FrameBuilder::new(device.clone(), queue.clone());
         let renderer = Renderer::new(
             device.clone(),
             queue.clone(),
@@ -344,7 +340,6 @@ impl VSEContext {
             target: RenderTarget::Present(Box::new(PresentTarget {
                 window: None,
                 swapchain,
-                frame_builder,
                 minimized: false,
                 cursor_visible: false,
                 window_mode: WindowMode::DirectDisplay,

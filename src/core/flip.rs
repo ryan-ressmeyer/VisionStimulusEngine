@@ -6,8 +6,7 @@ use tracing::debug;
 
 use vulkano::sync::GpuFuture;
 
-use super::config::VSEError;
-use super::frame::FrameError;
+use super::config::{FrameError, VSEError};
 use super::render_context::RenderContext;
 use super::state::missed_frame_status;
 use super::swapchain::SwapchainError;

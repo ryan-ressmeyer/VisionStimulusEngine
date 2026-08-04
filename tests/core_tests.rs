@@ -94,8 +94,24 @@ fn test_host_info_in_prelude() {
 }
 
 use vision_stimulus_engine::core::{
-    KeyCode, MonitorInfo, MonitorSelection, MouseButton, VideoModeInfo, WindowMode,
+    FrameError, KeyCode, MonitorInfo, MonitorSelection, MouseButton, VSEError, VideoModeInfo,
+    WindowMode,
 };
+
+#[test]
+fn frame_execution_error_converts_to_vse_error_without_changing_display_text() {
+    let error: VSEError = FrameError::ExecutionFailed("queue submission failed".into()).into();
+
+    assert!(matches!(
+        error,
+        VSEError::Frame(FrameError::ExecutionFailed(ref message))
+            if message == "queue submission failed"
+    ));
+    assert_eq!(
+        error.to_string(),
+        "Frame error: Failed to execute commands: queue submission failed"
+    );
+}
 
 #[test]
 fn test_window_mode_default() {

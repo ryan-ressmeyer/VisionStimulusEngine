@@ -12,7 +12,6 @@ use winit::{
 
 use super::config::{VSEConfig, VSEError};
 use super::device::DeviceSelector;
-use super::frame::FrameBuilder;
 use super::input::{AcquisitionMethod, InputState, WindowMode};
 use super::present_engine::{PresentEngine, ScheduledTarget};
 use super::present_timing_ext::ScanoutFeedback;
@@ -160,8 +159,6 @@ impl RenderTarget {
 pub(super) struct PresentTarget {
     pub(super) window: Option<Arc<Window>>, // None in DirectDisplay mode
     pub(super) swapchain: SwapchainManager,
-    #[allow(dead_code)]
-    pub(super) frame_builder: FrameBuilder,
     pub(super) minimized: bool,
     pub(super) cursor_visible: bool,
     pub(super) window_mode: WindowMode,

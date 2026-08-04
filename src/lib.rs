@@ -33,7 +33,7 @@ pub use vse_external_frame as external_frame;
 pub mod prelude {
     pub use crate::core::{
         absolute_scheduling_verdict, AcquisitionMethod, BufferedConfig, DeviceSelector,
-        DisplayBackend, ExternalFramePolicy, FlipEvent, Frame, GPUPreference, InputEvent, KeyCode,
+        DisplayBackend, ExternalFramePolicy, FlipEvent, GPUPreference, InputEvent, KeyCode,
         MonitorInfo, MonitorSelection, MouseButton, NamedKey, PresentMode, RenderContext,
         ScanoutFeedback, SchedulingTrial, SwapchainConfig, SwapchainManager, VSEContext,
         VSEContextBuilder, VSEError, VideoModeInfo, WindowMode,

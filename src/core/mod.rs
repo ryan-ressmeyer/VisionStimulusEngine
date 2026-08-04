@@ -17,7 +17,6 @@ pub(crate) mod evdev_input;
 mod event_loop;
 pub(crate) mod external_frame;
 mod flip;
-mod frame;
 mod headless;
 mod init;
 pub(crate) mod input;
@@ -29,11 +28,10 @@ mod swapchain;
 
 // Public API exports
 pub use buffered::{BufferedConfig, FlipEvent};
-pub use config::{VSEConfig, VSEContextBuilder, VSEError};
+pub use config::{FrameError, VSEConfig, VSEContextBuilder, VSEError};
 pub use context::VSEContext;
 pub use device::{DeviceError, DeviceSelector, GPUPreference};
 pub use external_frame::{ExternalFrameError, ExternalFramePolicy, ExternalFrameRing};
-pub use frame::{Frame, FrameError};
 pub use headless::{CapturedFrame, HeadlessContext};
 pub use input::{
     AcquisitionMethod, DisplayBackend, InputEvent, Key, KeyCode, MonitorInfo, MonitorSelection,
