@@ -94,6 +94,23 @@ pub const PRESENT_TIMING_INFO_PRESENT_AT_NEAREST_REFRESH_CYCLE_BIT: u32 = 0x0000
 pub const SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR: u32 = 0x0000_0040;
 pub const SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR: u32 = 0x0000_0080;
 
+/// `VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT` — the per-swapchain opt-in for
+/// `VK_EXT_present_timing`, the third flag in the same family as the two above.
+///
+/// Value is `bitpos="9"` in `vk.xml` (`VK_HEADER_VERSION` 358), i.e. `0x200`. Without it the
+/// swapchain has not opted into present timing, and the timing entry points
+/// (`vkSetSwapchainPresentTimingQueueSizeEXT`, and attaching a `VkPresentTimingsInfoEXT` pNext
+/// chain to `vkQueuePresentKHR`) are invalid usage on it —
+/// `VUID-vkSetSwapchainPresentTimingQueueSizeEXT-swapchain-12229` and
+/// `VUID-VkPresentTimingsInfoEXT-pSwapchains-12234` respectively.
+///
+/// Setting it is legal only when a device feature backs it — the spec VU reads: *"If none of the
+/// presentTiming, presentAtAbsoluteTime, or presentAtRelativeTime features are enabled, flags must
+/// not contain VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT"*. [`create_device_with_present_timing`]
+/// hard-requires `presentTiming`, so the EXT path always satisfies that. Note the gate is on
+/// *device features*, not on `VkPresentTimingSurfaceCapabilitiesEXT::presentTimingSupported`.
+pub const SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT: u32 = 0x0000_0200;
+
 // ─── Feature structs (chained into VkDeviceCreateInfo.pNext) ────────────────
 
 #[repr(C)]
@@ -561,6 +578,65 @@ pub fn probe_support(
     }
 }
 
+/// Ask the surface what present-timing it can actually do, via
+/// `VkPresentTimingSurfaceCapabilitiesEXT` chained onto `vkGetPhysicalDeviceSurfaceCapabilities2KHR`.
+///
+/// Diagnostic, not a gate: the spec conditions
+/// [`SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT`] on *device features*, not on this struct. It is
+/// queried and recorded because it is the one place the driver states, per surface (so per
+/// compositor path), whether timing is real here and which present stages it will timestamp —
+/// exactly the claim VSE's driver-conformance posture says to record rather than assume.
+///
+/// Returns `None` if the entry point is unavailable or the query fails.
+// `p_next` must be assigned after `default()`: ash 0.38 predates this extension, so
+// `PresentTimingSurfaceCapabilitiesEXT` does not implement ash's `Extends` marker traits and
+// cannot go through the type-safe `push_next` builder.
+#[allow(clippy::field_reassign_with_default)]
+pub fn query_present_timing_surface_caps(
+    physical_device: &Arc<vulkano::device::physical::PhysicalDevice>,
+    surface: &Arc<vulkano::swapchain::Surface>,
+) -> Option<PresentTimingSurfaceCapabilitiesEXT> {
+    use vulkano::VulkanObject;
+
+    type PfnGetSurfaceCapabilities2 = unsafe extern "system" fn(
+        vk::PhysicalDevice,
+        *const vk::PhysicalDeviceSurfaceInfo2KHR<'_>,
+        *mut vk::SurfaceCapabilities2KHR<'_>,
+    ) -> vk::Result;
+
+    let instance = physical_device.instance();
+    // SAFETY: the name is a valid NUL-terminated Vulkan entry-point name; the returned pointer is
+    // transmuted to its declared signature from the registry.
+    let get_caps2: PfnGetSurfaceCapabilities2 = unsafe {
+        let p = instance.library().get_instance_proc_addr(
+            instance.handle(),
+            b"vkGetPhysicalDeviceSurfaceCapabilities2KHR\0".as_ptr() as *const c_char,
+        )?;
+        std::mem::transmute::<_, PfnGetSurfaceCapabilities2>(p)
+    };
+
+    let mut timing_caps = PresentTimingSurfaceCapabilitiesEXT {
+        s_type: STYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT,
+        p_next: std::ptr::null_mut(),
+        present_timing_supported: 0,
+        present_at_absolute_time_supported: 0,
+        present_at_relative_time_supported: 0,
+        present_stage_queries: 0,
+    };
+    let surface_info = vk::PhysicalDeviceSurfaceInfo2KHR::default().surface(surface.handle());
+    let mut caps2 = vk::SurfaceCapabilities2KHR::default();
+    caps2.p_next = &mut timing_caps as *mut _ as *mut c_void;
+
+    // SAFETY: `surface` belongs to `instance`; both structs outlive the call and are correctly
+    // chained (`timing_caps` structextends `VkSurfaceCapabilities2KHR` per the registry).
+    let r = unsafe { get_caps2(physical_device.handle(), &surface_info, &mut caps2) };
+    if r != vk::Result::SUCCESS {
+        warn!("vkGetPhysicalDeviceSurfaceCapabilities2KHR failed: {r:?}");
+        return None;
+    }
+    Some(timing_caps)
+}
+
 // ─── Raw device creation + vulkano adoption ─────────────────────────────────
 
 /// Outcome of requesting elevated queue global priority (`VK_KHR_global_priority`)
@@ -611,6 +687,56 @@ pub struct EnabledPresentTimingFeatures {
     /// required to import an external renderer's image ring (see
     /// `crate::core::external_frame`).
     pub external_handles: bool,
+}
+
+/// The per-swapchain opt-in flags a raw `vkCreateSwapchainKHR` should request, derived from what
+/// the device actually enabled.
+///
+/// Each of the three Vulkan 1.4 present-family features needs its own bit in
+/// `VkSwapchainCreateInfoKHR::flags`, and calling that feature's entry points on a swapchain
+/// without its bit is invalid usage. vulkano 0.35 cannot express any of them, so they are only
+/// reachable through the raw create path — which is why [`needs_raw_path`](Self::needs_raw_path)
+/// exists: the raw path must be taken whenever *any* opt-in is wanted, not just for one of them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SwapchainOptIns {
+    /// `VkPresentId2KHR` may be chained onto presents.
+    pub present_id2: bool,
+    /// `vkWaitForPresent2KHR` is legal on the swapchain.
+    pub present_wait2: bool,
+    /// `VK_EXT_present_timing` entry points are legal on the swapchain.
+    pub present_timing: bool,
+}
+
+impl SwapchainOptIns {
+    /// Mirror the opt-ins from the sub-features the device actually enabled.
+    pub fn from_features(features: &EnabledPresentTimingFeatures) -> Self {
+        Self {
+            present_id2: features.present_id2,
+            present_wait2: features.present_wait2,
+            present_timing: features.present_timing,
+        }
+    }
+
+    /// Compose the enabled opt-ins into a `VkSwapchainCreateFlagsKHR` bitmask.
+    pub fn create_flags(&self) -> u32 {
+        let mut flags = 0;
+        if self.present_id2 {
+            flags |= SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR;
+        }
+        if self.present_wait2 {
+            flags |= SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
+        }
+        if self.present_timing {
+            flags |= SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+        }
+        flags
+    }
+
+    /// Whether any opt-in is requested, i.e. whether the swapchain must be created through the raw
+    /// path rather than vulkano's.
+    pub fn needs_raw_path(&self) -> bool {
+        self.create_flags() != 0
+    }
 }
 
 /// Create a logical device with the present-timing extension family enabled, then adopt it
@@ -908,6 +1034,9 @@ mod tests {
         // present-wait2 opt-in and re-introduces the driver segfault, so pin the exact values.
         assert_eq!(SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR, 0x40);
         assert_eq!(SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR, 0x80);
+        // bitpos="9" in vk.xml (VK_HEADER_VERSION 358). A wrong value here would silently set some
+        // other swapchain flag and would not be caught by validation.
+        assert_eq!(SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT, 0x200);
     }
 
     #[test]
@@ -1049,5 +1178,89 @@ mod tests {
         let fb = feedback_from_record(&rec, &[]);
         assert_eq!(fb.first_pixel_out_ns, None);
         assert_eq!(fb.first_pixel_visible_ns, None);
+    }
+
+    // ─── Swapchain opt-in composition ───────────────────────────────────────
+
+    #[test]
+    fn opt_ins_compose_every_enabled_bit_into_create_flags() {
+        let flags = SwapchainOptIns {
+            present_id2: true,
+            present_wait2: true,
+            present_timing: true,
+        }
+        .create_flags();
+
+        assert_eq!(
+            flags,
+            SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR
+                | SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR
+                | SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT
+        );
+    }
+
+    #[test]
+    fn opt_ins_omit_bits_for_disabled_features() {
+        // presentWait2 unavailable, but present timing still needs its own opt-in: the timing bit
+        // must not ride on the wait2 flag (the pre-fix coupling this guards against).
+        let flags = SwapchainOptIns {
+            present_id2: true,
+            present_wait2: false,
+            present_timing: true,
+        }
+        .create_flags();
+
+        assert_eq!(
+            flags,
+            SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR | SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT
+        );
+        assert_eq!(flags & SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR, 0);
+    }
+
+    #[test]
+    fn opt_ins_none_enabled_is_empty_flags() {
+        assert_eq!(SwapchainOptIns::default().create_flags(), 0);
+    }
+
+    #[test]
+    fn raw_path_is_required_when_only_present_timing_is_enabled() {
+        // The raw vkCreateSwapchainKHR path is the only way to set any of these flags, so it must
+        // be taken whenever *any* opt-in is wanted — not only when presentWait2 happens to be on.
+        let timing_only = SwapchainOptIns {
+            present_id2: false,
+            present_wait2: false,
+            present_timing: true,
+        };
+        assert!(timing_only.needs_raw_path());
+
+        let wait2_only = SwapchainOptIns {
+            present_id2: false,
+            present_wait2: true,
+            present_timing: false,
+        };
+        assert!(wait2_only.needs_raw_path());
+
+        assert!(!SwapchainOptIns::default().needs_raw_path());
+    }
+
+    #[test]
+    fn opt_ins_from_enabled_features_mirror_the_device() {
+        let features = EnabledPresentTimingFeatures {
+            present_timing: true,
+            present_at_absolute_time: true,
+            present_id2: true,
+            present_wait2: false,
+            queue_priority: QueuePriorityOutcome::NotAttempted,
+            external_handles: false,
+        };
+
+        assert_eq!(
+            SwapchainOptIns::from_features(&features),
+            SwapchainOptIns {
+                present_id2: true,
+                present_wait2: false,
+                present_timing: true,
+            }
+        );
     }
 }

@@ -161,6 +161,24 @@ fn build_ash_swapchain_device(device: &Arc<Device>) -> ash::khr::swapchain::Devi
     }
 }
 
+/// Log what the surface reports about present timing, so a session's log records the driver's own
+/// claim rather than VSE's assumption (see CLAUDE.md "Driver conformance caveat").
+fn log_present_timing_surface_caps(device: &Arc<Device>, surface: &Arc<Surface>) {
+    let Some(caps) = pt::query_present_timing_surface_caps(device.physical_device(), surface)
+    else {
+        return;
+    };
+    info!(
+        "VK_EXT_present_timing surface caps: presentTimingSupported={}, \
+         presentAtAbsoluteTimeSupported={}, presentAtRelativeTimeSupported={}, \
+         presentStageQueries=0x{:04x}",
+        caps.present_timing_supported != 0,
+        caps.present_at_absolute_time_supported != 0,
+        caps.present_at_relative_time_supported != 0,
+        caps.present_stage_queries,
+    );
+}
+
 /// Manages swapchain and associated resources
 ///
 /// The SwapchainManager handles the lifecycle of the Vulkan swapchain,
@@ -174,11 +192,14 @@ pub struct SwapchainManager {
     config: SwapchainConfig,
     needs_recreation: bool,
     /// When `Some`, swapchains are created through raw `vkCreateSwapchainKHR` with the
-    /// present-id2 / present-wait2 opt-in flags set (see [`pt::SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR`]),
-    /// then adopted via [`Swapchain::from_handle`]. vulkano's `Swapchain::new` predates Vulkan 1.4
-    /// and cannot set these flags, so `vkWaitForPresent2KHR` would be UB (a driver crash) on a
-    /// vulkano-created swapchain. `None` on the CPU-estimate path, which keeps the vulkano path.
+    /// present-family opt-in flags in [`Self::opt_ins`] set, then adopted via
+    /// [`Swapchain::from_handle`]. vulkano's `Swapchain::new` predates Vulkan 1.4 and cannot set
+    /// any of these flags, so the matching entry points would be invalid usage (for present-wait2,
+    /// outright UB — a driver crash) on a vulkano-created swapchain. `None` on the CPU-estimate
+    /// path, which keeps the vulkano path.
     raw_present: Option<ash::khr::swapchain::Device>,
+    /// Which per-swapchain opt-ins the current swapchain was created with.
+    opt_ins: pt::SwapchainOptIns,
 }
 
 impl SwapchainManager {
@@ -198,37 +219,50 @@ impl SwapchainManager {
         surface: Arc<Surface>,
         config: SwapchainConfig,
     ) -> Result<Self, SwapchainError> {
-        Self::new_with_present_opt_in(device, surface, config, false)
+        Self::new_with_opt_ins(device, surface, config, pt::SwapchainOptIns::default())
     }
 
-    /// Create a swapchain manager, optionally opting swapchains into present-id2 / present-wait2.
+    /// Create a swapchain manager, opting swapchains into the Vulkan 1.4 present-family features
+    /// the device actually enabled (`VkPresentId2` / present-wait2 / present-timing).
     ///
-    /// When `present_opt_in` is `true` (the EXT present-timing backend with `presentWait2`
-    /// enabled), every swapchain is created through a raw `vkCreateSwapchainKHR` with the
-    /// [`SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR`](pt::SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR)
-    /// opt-in so `vkWaitForPresent2KHR` is legal on it. Otherwise the vulkano path is used.
-    pub fn new_with_present_opt_in(
+    /// Each opt-in is a separate bit in `VkSwapchainCreateInfoKHR::flags` and each is required
+    /// before its entry points may be used on the swapchain, so whenever `opt_ins` requests
+    /// anything at all, every swapchain is created through raw `vkCreateSwapchainKHR`. With no
+    /// opt-ins the vulkano path is used.
+    pub fn new_with_opt_ins(
         device: Arc<Device>,
         surface: Arc<Surface>,
         config: SwapchainConfig,
-        present_opt_in: bool,
+        opt_ins: pt::SwapchainOptIns,
     ) -> Result<Self, SwapchainError> {
-        let raw_present = if present_opt_in {
+        log_present_timing_surface_caps(&device, &surface);
+
+        let raw_present = if opt_ins.needs_raw_path() {
             Some(build_ash_swapchain_device(&device))
         } else {
             None
         };
 
-        let (swapchain, images) =
-            Self::create_swapchain(&device, &surface, &config, None, raw_present.as_ref())?;
+        let (swapchain, images) = Self::create_swapchain(
+            &device,
+            &surface,
+            &config,
+            None,
+            raw_present.as_ref(),
+            opt_ins,
+        )?;
 
         info!(
-            "Swapchain created: {}x{}, {} images, {:?}, present_wait2_opt_in={}",
+            "Swapchain created: {}x{}, {} images, {:?}, opt_ins=[id2={} wait2={} timing={}] \
+             (flags=0x{:04x})",
             config.width,
             config.height,
             images.len(),
             config.present_mode,
-            raw_present.is_some(),
+            opt_ins.present_id2,
+            opt_ins.present_wait2,
+            opt_ins.present_timing,
+            opt_ins.create_flags(),
         );
 
         Ok(Self {
@@ -239,6 +273,7 @@ impl SwapchainManager {
             config,
             needs_recreation: false,
             raw_present,
+            opt_ins,
         })
     }
 
@@ -247,7 +282,15 @@ impl SwapchainManager {
     /// calling `wait_for_present` — the call is UB (a driver crash) on a swapchain created without
     /// the flag.
     pub fn present_wait2_enabled(&self) -> bool {
-        self.raw_present.is_some()
+        self.opt_ins.present_wait2
+    }
+
+    /// Whether the current swapchain was created with
+    /// [`SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT`](pt::SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT),
+    /// i.e. whether the `VK_EXT_present_timing` entry points are legal on it. Calling them without
+    /// it is invalid usage even where it happens not to crash.
+    pub fn present_timing_enabled(&self) -> bool {
+        self.opt_ins.present_timing
     }
 
     /// Resolve the surface-dependent swapchain parameters shared by the vulkano and raw paths
@@ -320,6 +363,7 @@ impl SwapchainManager {
         config: &SwapchainConfig,
         old_swapchain: Option<&Arc<Swapchain>>,
         raw_present: Option<&ash::khr::swapchain::Device>,
+        opt_ins: pt::SwapchainOptIns,
     ) -> Result<(Arc<Swapchain>, Vec<Arc<Image>>), SwapchainError> {
         let params = Self::resolve_params(device, surface, config)?;
 
@@ -333,7 +377,14 @@ impl SwapchainManager {
         );
 
         if let Some(raw) = raw_present {
-            return Self::create_swapchain_raw(device, surface, old_swapchain, raw, &params);
+            return Self::create_swapchain_raw(
+                device,
+                surface,
+                old_swapchain,
+                raw,
+                &params,
+                opt_ins,
+            );
         }
 
         let create_info = SwapchainCreateInfo {
@@ -356,8 +407,8 @@ impl SwapchainManager {
         result.map_err(|e| SwapchainError::CreationFailed(e.to_string()))
     }
 
-    /// Create the swapchain through raw `vkCreateSwapchainKHR` with the present-id2 / present-wait2
-    /// opt-in flags, then adopt the handle + its images into a vulkano [`Swapchain`] via
+    /// Create the swapchain through raw `vkCreateSwapchainKHR` with the present-family opt-in
+    /// flags, then adopt the handle + its images into a vulkano [`Swapchain`] via
     /// [`Swapchain::from_handle`] (which takes ownership and destroys the handle on drop).
     ///
     /// The vulkano `SwapchainCreateInfo` passed to `from_handle` is metadata only (it is not
@@ -369,10 +420,9 @@ impl SwapchainManager {
         old_swapchain: Option<&Arc<Swapchain>>,
         raw: &ash::khr::swapchain::Device,
         params: &ResolvedParams,
+        opt_ins: pt::SwapchainOptIns,
     ) -> Result<(Arc<Swapchain>, Vec<Arc<Image>>), SwapchainError> {
-        let create_flags = vk::SwapchainCreateFlagsKHR::from_raw(
-            pt::SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR | pt::SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR,
-        );
+        let create_flags = vk::SwapchainCreateFlagsKHR::from_raw(opt_ins.create_flags());
         let old_handle = old_swapchain
             .map(|s| s.handle())
             .unwrap_or_else(vk::SwapchainKHR::null);
@@ -516,6 +566,7 @@ impl SwapchainManager {
             &new_config,
             Some(&self.swapchain),
             self.raw_present.as_ref(),
+            self.opt_ins,
         )?;
 
         self.swapchain = new_swapchain;

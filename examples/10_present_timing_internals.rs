@@ -71,6 +71,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Accumulated `IMAGE_FIRST_PIXEL_OUT` evidence across a run's feedback records.
+///
+/// Two facts that are easy to conflate and must be reported apart:
+///
+/// * **reported** — the driver put an `IMAGE_FIRST_PIXEL_OUT` entry in the record's stage array.
+/// * **populated** — that entry carries a *nonzero* timestamp.
+///
+/// A driver that advertises `VK_EXT_present_timing` but stubs the stage clocks reports the stage
+/// with `time == 0`, so a plain `Option::is_some()` test says "true" on exactly the driver the
+/// check exists to catch. `VSEState::observe_feedback_conformance` uses the nonzero test; this
+/// mirrors it so the example and the library cannot disagree.
+#[derive(Default)]
+struct FirstPixelOut {
+    /// Records whose stage array contained `IMAGE_FIRST_PIXEL_OUT` at all.
+    reported: u64,
+    /// Records whose `IMAGE_FIRST_PIXEL_OUT` timestamp was nonzero.
+    populated: u64,
+    /// First nonzero timestamp observed — the proof value.
+    sample_ns: Option<u64>,
+}
+
+impl FirstPixelOut {
+    fn observe(&mut self, first_pixel_out_ns: Option<u64>) {
+        let Some(ns) = first_pixel_out_ns else { return };
+        self.reported += 1;
+        if ns != 0 {
+            self.populated += 1;
+            self.sample_ns.get_or_insert(ns);
+        }
+    }
+
+    /// The experiment's actual quantity: did the driver ever give us a real scanout time?
+    fn is_populated(&self) -> bool {
+        self.populated > 0
+    }
+
+    fn print(&self, records: u64) {
+        println!(
+            "IMAGE_FIRST_PIXEL_OUT    : stage reported {}/{} records, timestamps populated {}/{}",
+            self.reported, records, self.populated, records
+        );
+        match self.sample_ns {
+            Some(ns) => println!("  first nonzero sample   : {ns} ns (present-stage-local)"),
+            None if self.reported > 0 => println!(
+                "  → driver STUBS the stage clock (every reported time == 0): advertised, \
+                 not implemented"
+            ),
+            None => println!("  → driver never reported the stage at all"),
+        }
+    }
+}
+
 // ───────────────────────────── drift ─────────────────────────────
 
 fn mode_drift(secs: f64) -> Result<(), Box<dyn std::error::Error>> {
@@ -216,7 +268,7 @@ fn mode_feedback(frames: u64) -> Result<(), Box<dyn std::error::Error>> {
     let mut monotonic_ok = true;
     let mut feedback_present_ids: HashSet<u64> = HashSet::new();
     let mut feedback_records: u64 = 0;
-    let mut first_pixel_out_seen = false;
+    let mut first_pixel_out = FirstPixelOut::default();
     let mut last_present_us: Option<u64> = None;
     let mut present_time_monotonic = true;
     let mut present_deltas_us: Vec<u64> = Vec::new();
@@ -256,9 +308,7 @@ fn mode_feedback(frames: u64) -> Result<(), Box<dyn std::error::Error>> {
         for fb in ctx.scanout_feedback() {
             feedback_records += 1;
             feedback_present_ids.insert(fb.present_id);
-            if fb.first_pixel_out_ns.is_some() {
-                first_pixel_out_seen = true;
-            }
+            first_pixel_out.observe(fb.first_pixel_out_ns);
         }
 
         n += 1;
@@ -269,7 +319,7 @@ fn mode_feedback(frames: u64) -> Result<(), Box<dyn std::error::Error>> {
                 monotonic_ok,
                 feedback_records,
                 &feedback_present_ids,
-                first_pixel_out_seen,
+                &first_pixel_out,
             );
             present_deltas_us.sort_unstable();
             let med = present_deltas_us
@@ -303,7 +353,7 @@ fn report_feedback(
     monotonic_ok: bool,
     feedback_records: u64,
     feedback_present_ids: &HashSet<u64>,
-    first_pixel_out_seen: bool,
+    first_pixel_out: &FirstPixelOut,
 ) {
     println!("\n──────── Raw Present + Feedback (B1) ────────");
     println!("timing source           : {source:?}");
@@ -318,10 +368,13 @@ fn report_feedback(
     println!("present_id monotonic     : {monotonic_ok}");
     println!("feedback records read    : {feedback_records}");
     println!("distinct feedback ids    : {}", feedback_present_ids.len());
-    println!("IMAGE_FIRST_PIXEL_OUT    : {first_pixel_out_seen}");
+    first_pixel_out.print(feedback_records);
 
     let is_ext = source == Some(TimingSource::ExtPresentTiming);
-    let pass = is_ext && nonzero && monotonic_ok && feedback_records > 0 && first_pixel_out_seen;
+    // PASS covers the present-id/feedback *machinery*, which works independently of whether the
+    // driver populates the stage clock; a stubbed clock is called out separately below so the two
+    // are never conflated into one verdict.
+    let pass = is_ext && nonzero && monotonic_ok && feedback_records > 0;
 
     let flip_id_set: HashSet<u64> = present_ids.iter().copied().collect();
     let correlated = feedback_present_ids
@@ -336,7 +389,13 @@ fn report_feedback(
              inactive on this machine/driver."
         );
     } else if pass && correlated {
-        println!("PASS ✔  raw present + present-id + scanout feedback all working");
+        println!("PASS ✔  raw present + present-id + feedback correlation all working");
+        if !first_pixel_out.is_populated() {
+            println!(
+                "        …but scanout stage timestamps are stubbed — present_time falls back to \
+                 the calibrated PRESENT_STAGE_LOCAL clock"
+            );
+        }
     } else {
         println!("FAIL x  see fields above");
     }
@@ -401,10 +460,9 @@ fn mode_buffered(frames: u32, depth: usize) -> Result<(), Box<dyn std::error::Er
                 }
 
                 for fb in vse.scanout_feedback() {
+                    s.feedback_records += 1;
                     s.feedback_ids.insert(fb.present_id);
-                    if fb.first_pixel_out_ns.is_some() {
-                        s.first_pixel_out_seen = true;
-                    }
+                    s.first_pixel_out.observe(fb.first_pixel_out_ns);
                 }
             }
             _ => {}
@@ -427,7 +485,8 @@ struct Verify {
     presented: u32,
     missed: u32,
     feedback_ids: HashSet<u64>,
-    first_pixel_out_seen: bool,
+    feedback_records: u64,
+    first_pixel_out: FirstPixelOut,
 }
 
 fn report_buffered(s: &Verify, rendered: u32, depth: usize) {
@@ -440,7 +499,7 @@ fn report_buffered(s: &Verify, rendered: u32, depth: usize) {
     println!("payload FIFO order       : {}", !s.payload_out_of_order);
     println!("missed frames            : {}", s.missed);
     println!("distinct feedback ids    : {}", s.feedback_ids.len());
-    println!("IMAGE_FIRST_PIXEL_OUT    : {}", s.first_pixel_out_seen);
+    s.first_pixel_out.print(s.feedback_records);
 
     let is_ext = s.source == Some(TimingSource::ExtPresentTiming);
     let counts_ok = s.presented <= rendered && rendered.saturating_sub(s.presented) <= 3;
@@ -451,16 +510,16 @@ fn report_buffered(s: &Verify, rendered: u32, depth: usize) {
         && !s.present_id_non_monotonic
         && !s.payload_out_of_order
         && counts_ok
-        && !s.feedback_ids.is_empty()
-        && s.first_pixel_out_seen;
+        && !s.feedback_ids.is_empty();
 
     println!("──────────────────────────────────────────");
     if !is_ext {
         println!("SKIP: backend is {:?}, not ExtPresentTiming.", s.source);
     } else if pass {
-        println!(
-            "PASS ✔  buffered raw present + present-id correlation + scanout feedback working"
-        );
+        println!("PASS ✔  buffered raw present + present-id correlation + feedback working");
+        if !s.first_pixel_out.is_populated() {
+            println!("        …but scanout stage timestamps are stubbed (see above)");
+        }
     } else {
         println!("FAIL x  see fields above");
     }

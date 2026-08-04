@@ -72,18 +72,38 @@ then read code to understand it.
 
 ## Currently outstanding
 
-A clean run still reports two VUIDs, both from one cause — VSE creates its swapchain without
-`VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT` (`src/core/swapchain.rs:373`) while calling
-present-timing entry points on it:
+**None.** A clean run of `10_present_timing_internals` (both `feedback` and `buffered`) reports
+zero validation errors. **Anything appearing is new and worth chasing.**
+
+### Resolved: the missing present-timing swapchain bit (2026-08-03)
+
+Two VUIDs used to fire from one cause — VSE created its swapchain without
+`VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT` while calling present-timing entry points on it:
 
 ```
-10 × VUID-VkPresentTimingsInfoEXT-pSwapchains-12234
- 2 × VUID-vkSetSwapchainPresentTimingQueueSizeEXT-swapchain-12229
+20 × VUID-VkPresentTimingsInfoEXT-pSwapchains-12234
+ 4 × VUID-vkSetSwapchainPresentTimingQueueSizeEXT-swapchain-12229
 ```
 
-Under investigation — this may also explain the driver-conformance gaps documented in
-`docs/clock-synchronization.md` §6. Until it is resolved, these two are the known baseline;
-**anything else appearing is new and worth chasing.**
+Fixed by setting the bit (`pt::SwapchainOptIns`, composed in `src/core/swapchain.rs`). Three things
+worth keeping from that investigation:
+
+- **These VUIDs were the root cause of a documented "driver bug."** `docs/clock-synchronization.md`
+  §6 had recorded ANV as stubbing `IMAGE_FIRST_PIXEL_OUT` to 0. It wasn't: the swapchain had never
+  opted into timing, so there was nothing to report. With the bit set, `IMAGE_FIRST_PIXEL_OUT` goes
+  **0/200 → 200/200**, deterministically, across nine alternating paired runs. A validation error
+  dismissed as "spec pedantry, it works anyway" was the whole explanation.
+- **The example's own summary line was actively misleading.** It reported
+  `IMAGE_FIRST_PIXEL_OUT: true` off an `Option::is_some()` test, which is `true` for a reported
+  stage carrying `time == 0` — it read "true" on exactly the condition it existed to detect, and
+  printed `PASS ✔ scanout feedback all working` while the library simultaneously warned the
+  timestamps were stubbed. Validation layers find *API misuse*; they cannot tell you your instrument
+  asserts the wrong predicate. Check what a diagnostic actually measures before trusting a run —
+  and when a diagnostic and the library disagree, that contradiction is the bug.
+- **Establish the control before changing anything.** The fix looked like it had failed at first:
+  the fixed build read 0/200 for several minutes because *the screen had blanked on the idle timer*,
+  and a dark panel produces no scanout to timestamp. Only back-to-back alternating A/B runs of both
+  binaries separated the signal from the environment. See `docs/clock-synchronization.md` §6.
 
 ## The timing caveat — read this before recording anything
 

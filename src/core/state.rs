@@ -481,12 +481,14 @@ impl PresentTarget {
             if !self.warned_feedback_stub {
                 self.warned_feedback_stub = true;
                 warn!(
-                    "VK_EXT_present_timing: the driver returns present-timing feedback that \
-                     correlates by present_id but stubs the scanout stage timestamps \
-                     (IMAGE_FIRST_PIXEL_OUT = 0) — advertised but not implemented (seen on \
-                     Intel/ANV/Mesa 26.1). present_time is derived from the calibrated \
-                     PRESENT_STAGE_LOCAL clock instead; scanout timing stays valid. See \
-                     docs/clock-synchronization.md."
+                    "VK_EXT_present_timing: present-timing feedback correlates by present_id but \
+                     every scanout stage timestamp is 0 (IMAGE_FIRST_PIXEL_OUT). present_time is \
+                     derived from the calibrated PRESENT_STAGE_LOCAL clock instead; scanout \
+                     timing stays valid. Historically this was VSE's own bug — a swapchain \
+                     created without VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT has not opted \
+                     into timing and the driver correctly reports nothing — so check the \
+                     swapchain create flags before concluding the driver is at fault. See \
+                     docs/clock-synchronization.md §6."
                 );
             }
         }

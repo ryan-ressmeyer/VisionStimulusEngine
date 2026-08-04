@@ -126,14 +126,17 @@ and takes the same posture as Psychtoolbox. Three roles, and they must not be co
    linear fit, not a single offset. It is off the hot path and must be explicitly requested.
 
 **Driver conformance caveat.** `VK_EXT_present_timing` is new enough that a driver may *advertise*
-sub-features it has not *implemented*. Measured on the reference hardware (Intel MTL / ANV / Mesa
-26.1), the driver stubs the `vkGetPastPresentationTimingEXT` scanout stage timestamps to 0 and does
-not enforce `targetTime` scheduling — while advertising both. VSE verifies behaviorally and falls
-back correctly: `present_time` comes from sampling the calibrated scanout clock after
-`wait_for_present` (not the stubbed feedback), and scheduled flips are software-paced against the
-scanout clock. It records what the driver actually did in `HostInfo.timing` and warns once. Never
-assume an advertised present-timing feature works — check `scanout_feedback_populated` /
-`absolute_scheduling_enforced`.
+sub-features it has not *implemented*, so VSE verifies behaviorally, falls back correctly, and
+records what actually happened in `HostInfo.timing`. Never assume an advertised present-timing
+feature works — check `scanout_feedback_populated` / `absolute_scheduling_enforced`.
+
+**But check your own opt-ins first.** This project spent real time blaming Mesa/ANV for stubbing
+`vkGetPastPresentationTimingEXT` stage timestamps to 0. The actual cause was VSE creating its
+swapchain without `VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT`, so the swapchain had never opted
+into timing (fixed 2026-08-03; `IMAGE_FIRST_PIXEL_OUT` went 0/200 → 200/200). Vulkan validation had
+been reporting the exact VUIDs for it the whole time. Each Vulkan 1.4 present feature needs its own
+`VkSwapchainCreateInfoKHR` flag — see `pt::SwapchainOptIns`. The `targetTime` scheduling row of §6
+was characterized under the same bug and is now **unverified**, not a known driver defect.
 
 See `docs/clock-synchronization.md` for the full model, error budget, the drift measurement, and the
 driver-conformance table (§6).

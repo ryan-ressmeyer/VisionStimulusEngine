@@ -15,6 +15,7 @@ use super::context::VSEContext;
 use super::device::DeviceSelector;
 use super::frame::FrameBuilder;
 use super::input::{InputState, MonitorSelection, WindowMode};
+use super::present_timing_ext as pt;
 use super::state::{
     build_host_bridge, build_present_engine, build_timing_provider, InputSource, PresentTarget,
     RenderTarget, VSEState,
@@ -156,16 +157,14 @@ impl VSEContext {
             image_count: 2,
         };
 
-        // Opt the swapchain into present-id2 / present-wait2 (raw create) when the device enabled
-        // presentWait2, so the synchronous flip() can block on vkWaitForPresent2KHR for this
-        // frame's real scanout time.
-        let present_opt_in = ext_features.map(|f| f.present_wait2).unwrap_or(false);
-        let swapchain = SwapchainManager::new_with_present_opt_in(
-            device.clone(),
-            surface,
-            swapchain_config,
-            present_opt_in,
-        )?;
+        // Mirror every present-family opt-in the device enabled onto the swapchain (raw create).
+        // Each feature needs its own VkSwapchainCreateInfoKHR flag before its entry points are
+        // legal on the swapchain, so this must track all of them, not just presentWait2.
+        let opt_ins = ext_features
+            .map(|f| pt::SwapchainOptIns::from_features(&f))
+            .unwrap_or_default();
+        let swapchain =
+            SwapchainManager::new_with_opt_ins(device.clone(), surface, swapchain_config, opt_ins)?;
         let frame_builder = FrameBuilder::new(device.clone(), queue.clone());
         let renderer = Renderer::new(
             device.clone(),
@@ -288,14 +287,12 @@ impl VSEContext {
             image_count: 2,
         };
 
-        // Opt into present-id2 / present-wait2 (raw swapchain) when presentWait2 was enabled.
-        let present_opt_in = ext_features.map(|f| f.present_wait2).unwrap_or(false);
-        let swapchain = SwapchainManager::new_with_present_opt_in(
-            device.clone(),
-            surface,
-            swapchain_config,
-            present_opt_in,
-        )?;
+        // Mirror every present-family opt-in the device enabled onto the swapchain (see above).
+        let opt_ins = ext_features
+            .map(|f| pt::SwapchainOptIns::from_features(&f))
+            .unwrap_or_default();
+        let swapchain =
+            SwapchainManager::new_with_opt_ins(device.clone(), surface, swapchain_config, opt_ins)?;
         let frame_builder = FrameBuilder::new(device.clone(), queue.clone());
         let renderer = Renderer::new(
             device.clone(),

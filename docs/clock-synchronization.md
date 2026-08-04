@@ -169,29 +169,91 @@ advertised support as a claim to be *behaviorally verified*, falls back to a cor
 sub-feature is missing, and **records what the driver actually did** in the host snapshot so a run's
 timing pedigree is never silently wrong.
 
-**Measured on this project's reference machine (Intel Meteor Lake / ANV / Mesa 26.1, 2026-07),
-direct-display and windowed:** two sub-features are advertised but not functional:
+> ### ⚠ Correction (2026-08-03): the first gap below was VSE's bug, not the driver's
+>
+> This section previously recorded `vkGetPastPresentationTimingEXT` stage timestamps as
+> "advertised but not implemented" on ANV. **That was wrong.** VSE was creating its swapchain
+> *without* `VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT` — the extension's per-swapchain opt-in —
+> while calling present-timing entry points on it. The swapchain had never opted into timing, so
+> the driver had nothing to report, and it dutifully reported zeros.
+>
+> Setting the bit fixes it completely. Nine alternating back-to-back paired runs, same machine,
+> minutes apart:
+>
+> | Build | `IMAGE_FIRST_PIXEL_OUT` populated |
+> |---|---|
+> | without the bit (old) | **0/200**, every run |
+> | with the bit (fixed) | **200/200**, every run |
+>
+> Real values, e.g. `37321783999000 ns` present-stage-local. `present_time` median dt is 16.67 ms
+> either way (the calibrated-clock fallback was accurate), so this was never a data-quality bug —
+> but the mechanism VSE reported for its own timestamps was wrong, which is worse.
+>
+> The lesson is the one this section already preaches, turned inward: **"advertised ≠ implemented"
+> cuts both ways.** Before charging a driver with non-conformance, verify that every opt-in the
+> feature requires has actually been requested. Two Vulkan validation VUIDs were pointing straight
+> at this the whole time.
+
+**Measured on this project's reference machine (Intel Meteor Lake / ANV / Mesa 26.1),
+direct-display and windowed:**
 
 | Sub-feature | Advertised | Actually works | VSE's response |
 |---|---|---|---|
 | `present_id2` correlation | ✓ | ✓ | Used directly (`FlipInfo.present_id`). |
 | `present_wait2` | ✓ | ✓ | Paces the sync `flip()` to the vblank. |
 | Calibrated `PRESENT_STAGE_LOCAL` clock | ✓ | ✓ | The real scanout-time source (see below). |
-| **`vkGetPastPresentationTimingEXT` stage timestamps** | ✓ | **✗ — returns `IMAGE_FIRST_PIXEL_OUT = 0`** in *complete* records | Sync `flip()` samples the calibrated scanout clock right after `wait_for_present` (which returns at the frame's scanout) → real scanout `present_time`, **7 µs** from the clock. |
-| **Absolute scheduling `VkPresentTimingInfoEXT.targetTime`** | ✓ (`presentAtAbsoluteTime`) | **✗ — target accepted and echoed in feedback, but the present is not held** | VSE **software-paces** scheduled flips against the scanout clock (still sends the hardware target, which a conformant driver would honor). |
+| `vkGetPastPresentationTimingEXT` stage timestamps | ✓ | ✓ **(since 2026-08-03)** | Real per-present `IMAGE_FIRST_PIXEL_OUT` is used when populated; the calibrated-clock path remains as fallback. |
+| **Absolute scheduling `VkPresentTimingInfoEXT.targetTime`** | ✓ (`presentAtAbsoluteTime`) | **? — not re-measured since the opt-in fix** | VSE **software-paces** scheduled flips against the scanout clock (still sends the hardware target). |
 
-Both gaps are the *timing-report* and *scheduling* halves of the extension; the driver implemented
-the *correlation* and *wait* halves first. On a driver that fully implements the extension, VSE
-automatically prefers the true per-present feedback timestamp and (harmlessly) the hardware target —
-no code change needed.
+The scheduling row was characterized *before* the swapchain opt-in was fixed and has **not** been
+re-measured since. Because the same missing bit explained the feedback row entirely, this row is now
+suspect for the same reason and should be treated as unknown, not as a driver defect. Re-run
+`examples/13_direct_display_scanout` (needs a TTY + direct display) to settle it.
+
+The driver also states its claims **per surface**. `VkPresentTimingSurfaceCapabilitiesEXT` on this
+machine returns:
+
+```
+presentTimingSupported=true  presentAtAbsoluteTimeSupported=true
+presentAtRelativeTimeSupported=false  presentStageQueries=0x0005
+```
+
+`0x0005` is `QUEUE_OPERATIONS_END | IMAGE_FIRST_PIXEL_OUT` — the surface advertises exactly the
+stage that now works once the swapchain opts in, which in hindsight was evidence the driver was
+telling the truth. This is queried and logged at swapchain creation so each session's log records
+the driver's claim next to the behavior. (`presentAtRelativeTimeSupported=false` matches what VSE
+requests: it enables `presentAtAbsoluteTime` only.)
+
+### A blanked display reports no scanout — never measure timing through one
+
+While developing this fix, the *fixed* build read `0/200` across four consecutive runs and looked
+like a failure. The screen had blanked on GNOME's 10-minute idle timer. With the panel off there is
+no scanout, so there is no `IMAGE_FIRST_PIXEL_OUT` to report — the driver correctly returned
+nothing, exactly as it does for a swapchain that never opted in. `present_time` degraded in the same
+window (median **18.8 ms**, non-monotonic, vs 16.67 ms awake), on *both* builds, which is the tell.
+
+The journal pins it: touchpad input, `Cursor update failed: drmModeAtomicCommit`, `fprintd`
+activation and a desktop relaunch at the moment the readings recovered — a blank/unlock cycle. It
+matches `org.gnome.desktop.session idle-delay = 600`.
+
+Two consequences worth carrying:
+
+- **A `0`-valued scanout feedback read has at least three causes** — missing swapchain opt-in,
+  genuine driver stub, and *display asleep*. Do not attribute it to the driver without excluding the
+  other two. This is why `scanout_feedback_populated` is recorded per session rather than assumed,
+  and why the calibrated-clock fallback stays in place.
+- **Disable screen blanking on any machine used for real sessions.** A stimulus run started before
+  the idle timer can have the panel blank mid-experiment. Nothing in Vulkan errors; timing quietly
+  degrades and scanout feedback silently stops.
 
 ### How VSE detects and reports it
 
 - **Passive feedback check (automatic, every session):** VSE watches present-timing feedback and,
-  once a ring's worth of records has arrived all-zero, concludes the stage timestamps are stubbed,
-  emits a **one-time `WARN`** naming the fallback in use, and records
-  `HostInfo.timing.scanout_feedback_populated = Some(false)`. `ctx.scanout_feedback_populated()`
-  exposes it. No extra presents, no startup cost.
+  once a ring's worth of records has arrived all-zero, emits a **one-time `WARN`** naming the
+  fallback in use and records `HostInfo.timing.scanout_feedback_populated = Some(false)`.
+  `ctx.scanout_feedback_populated()` exposes it. No extra presents, no startup cost. The warning
+  names the missing swapchain opt-in as the first thing to check, because that is what it turned out
+  to be last time — an all-zero read is *not* by itself evidence of a driver defect.
 - **Scheduling provenance:** the first scheduled `flip(Some(t))` logs a one-time note that presents
   are software-paced and that hardware `targetTime` enforcement is driver-dependent and unverified.
 - **Enforcement characterization (on demand):** actively testing scheduling enforcement requires
