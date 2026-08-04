@@ -227,6 +227,22 @@ pub struct RuntimeEnv {
     pub env_wayland_display: Option<String>,
     pub env_vk_icd_filenames: Option<String>,
     pub env_vk_layer_path: Option<String>,
+    /// `VK_LOADER_LAYERS_ENABLE` — the Vulkan loader's force-enable list, if set.
+    ///
+    /// **Timing provenance, not diagnostics.** A layer forced on through the loader is injected
+    /// *below* the application, so VSE cannot see it in `Instance::enabled_layers()` (vulkano
+    /// returns what was requested, and VSE requests none). Recording the variable is the only
+    /// way a session's data can show it ran under one.
+    ///
+    /// This matters because the Khronos validation layer intercepts every Vulkan call and
+    /// measurably degrades frame timing — a run captured with it active is **not valid timing
+    /// data**. Treat a non-`None` value here as disqualifying for any timing analysis. See
+    /// `docs/debugging/vulkan_validation.md`.
+    pub env_vk_loader_layers_enable: Option<String>,
+    /// `VK_INSTANCE_LAYERS` — the older loader force-enable list. Same provenance caveat as
+    /// [`env_vk_loader_layers_enable`](Self::env_vk_loader_layers_enable); which variable a
+    /// given loader honors varies by version, so both are recorded.
+    pub env_vk_instance_layers: Option<String>,
     pub process_nice_value: Option<i32>,
 }
 
@@ -347,6 +363,22 @@ impl std::fmt::Display for HostInfo {
         )?;
         writeln!(f, "User: {}", self.runtime.username)?;
         writeln!(f, "Display server: {}", self.runtime.display_server)?;
+        // Loud, because a layer-instrumented run's timing is not analysable and the numbers
+        // above it otherwise look perfectly ordinary.
+        for (var, value) in [
+            (
+                "VK_LOADER_LAYERS_ENABLE",
+                &self.runtime.env_vk_loader_layers_enable,
+            ),
+            ("VK_INSTANCE_LAYERS", &self.runtime.env_vk_instance_layers),
+        ] {
+            if let Some(v) = value {
+                writeln!(
+                    f,
+                    "!! Vulkan layers forced via {var}={v} — timing data from this run is not valid"
+                )?;
+            }
+        }
         if let Some(edid) = &self.edid {
             writeln!(f)?;
             writeln!(
@@ -370,6 +402,35 @@ mod tests {
         assert!(!build.vse_version.is_empty());
         assert!(!build.rustc_version.is_empty());
         assert_eq!(build.build_profile, "debug");
+    }
+
+    /// A `RuntimeEnv` recorded before the layer-provenance fields existed must still load.
+    ///
+    /// Sessions are replayed from their recorded `HostInfo` (the headless regeneration path
+    /// deserializes it), so a schema change that rejects old recordings is a reproducibility
+    /// regression, not a compatibility nit. Serde already maps a missing `Option` field to
+    /// `None`, so this passes as written — the test exists to *pin* that, since the guarantee
+    /// would silently break if these fields ever became non-`Option` or the struct gained
+    /// `#[serde(deny_unknown_fields)]`.
+    #[test]
+    fn runtime_env_recorded_before_the_layer_fields_existed_still_deserializes() {
+        let legacy = r#"{
+            "username": "researcher",
+            "display_server": "wayland",
+            "env_display": null,
+            "env_wayland_display": "wayland-0",
+            "env_vk_icd_filenames": null,
+            "env_vk_layer_path": null,
+            "process_nice_value": -5
+        }"#;
+
+        let env: RuntimeEnv = serde_json::from_str(legacy).expect("legacy RuntimeEnv must load");
+
+        assert_eq!(env.username, "researcher");
+        assert_eq!(env.process_nice_value, Some(-5));
+        // Absent in the old schema — "we don't know", never "no layers were forced".
+        assert_eq!(env.env_vk_loader_layers_enable, None);
+        assert_eq!(env.env_vk_instance_layers, None);
     }
 
     #[test]

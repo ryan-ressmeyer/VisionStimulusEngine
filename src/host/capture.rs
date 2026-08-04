@@ -82,6 +82,10 @@ pub fn capture_runtime_env() -> RuntimeEnv {
         env_wayland_display: std::env::var("WAYLAND_DISPLAY").ok(),
         env_vk_icd_filenames: std::env::var("VK_ICD_FILENAMES").ok(),
         env_vk_layer_path: std::env::var("VK_LAYER_PATH").ok(),
+        // Loader-forced layers are invisible to `Instance::enabled_layers()`, so the environment
+        // is the only record that a run was instrumented. See the field docs on `RuntimeEnv`.
+        env_vk_loader_layers_enable: std::env::var("VK_LOADER_LAYERS_ENABLE").ok(),
+        env_vk_instance_layers: std::env::var("VK_INSTANCE_LAYERS").ok(),
         process_nice_value: nice_value,
     }
 }

@@ -25,10 +25,12 @@ A single call to `capture_host_info()` returns a `HostInfo` struct containing:
 | **Timing** | Present-timing extension support, present-id2, present-wait2, calibrated timestamp domains, measured CPU↔GPU deviation, observed scanout-feedback and scheduling behavior, queue-priority outcome | Vulkan capability probes and runtime observations |
 | **Pipeline** | Window size, clear color, GPU preference, present mode, expected refresh rate, flip logging settings | VSE builder configuration |
 | **Build** | VSE version, git commit hash, build profile (debug/release), rustc version | Compile-time `build.rs` + `env!()` |
-| **Runtime** | Username, display server (X11/Wayland), relevant environment variables (`DISPLAY`, `WAYLAND_DISPLAY`, `VK_ICD_FILENAMES`, `VK_LAYER_PATH`), process nice value | Environment variables, `/proc/self/stat` |
+| **Runtime** | Username, display server (X11/Wayland), relevant environment variables (`DISPLAY`, `WAYLAND_DISPLAY`, `VK_ICD_FILENAMES`, `VK_LAYER_PATH`, `VK_LOADER_LAYERS_ENABLE`, `VK_INSTANCE_LAYERS`), process nice value | Environment variables, `/proc/self/stat` |
 | **EDID** | Raw hex, manufacturer code, model name, serial number, manufacture year, gamma | `xrandr --verbose` (optional, graceful fallback) |
 
 The **Swapchain** section is particularly important: it records the *actually negotiated* state, which may differ from what was requested. For example, you may request `Mailbox` present mode but the driver may fall back to `Fifo`.
+
+The two Vulkan **layer** variables under Runtime are timing provenance, not diagnostics. A loader-forced layer — the Khronos validation layer above all — is injected beneath the application and cannot be detected from inside the process, yet it intercepts every Vulkan call and degrades frame timing. A run with either variable set is **not valid timing data**; `HostInfo`'s `Display` prints a warning line when either is present. See `docs/debugging/vulkan_validation.md`.
 
 ## Usage
 
