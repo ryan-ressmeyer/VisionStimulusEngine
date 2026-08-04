@@ -14,6 +14,24 @@ use super::swapchain::SwapchainError;
 use crate::timing::{FlipInfo, Timestamp};
 
 impl<'a> RenderContext<'a> {
+    /// The live `VkSwapchainKHR` handle of the present target.
+    ///
+    /// Read this immediately before each use and **never cache it across a call that can
+    /// recreate the swapchain**. [`recreate_swapchain`] replaces the `Arc<Swapchain>`,
+    /// dropping the last reference and destroying the object, so a handle captured before a
+    /// recreation dangles — passing it to `vkAcquireNextImageKHR` is a use-after-free.
+    ///
+    /// [`recreate_swapchain`]: super::state::VSEState::recreate_swapchain
+    fn swapchain_handle(&mut self) -> ash::vk::SwapchainKHR {
+        use vulkano::VulkanObject;
+        self.state
+            .target
+            .present_expect_mut()
+            .swapchain
+            .swapchain()
+            .handle()
+    }
+
     /// Present the current frame to the screen
     ///
     /// Optionally accepts a target presentation time. When provided:
@@ -295,16 +313,11 @@ impl<'a> RenderContext<'a> {
     /// still CPU fence time in B1 (B3 makes it a scanout-native timestamp). The CPU-estimate
     /// path stays on vulkano's present in [`flip()`](Self::flip).
     fn flip_ext(&mut self, target_time: Option<Timestamp>) -> Result<FlipInfo, VSEError> {
-        use vulkano::VulkanObject;
-
         let clear_color = self.config.clear_color;
-        let swapchain_handle = self
-            .state
-            .target
-            .present_expect_mut()
-            .swapchain
-            .swapchain()
-            .handle();
+        // Safe to hold across this whole function: unlike the buffered path there is no
+        // pre-acquire recreation here — the only recreation is in the `OUT_OF_DATE` arm below,
+        // which returns immediately without touching the handle again.
+        let swapchain_handle = self.swapchain_handle();
         let (dsw, dsh) = self.state.target.present_expect_mut().display_size;
         let win_size_arr = [dsw, dsh];
 
@@ -771,16 +784,8 @@ impl<'a> RenderContext<'a> {
         payload: T,
     ) -> Result<(), VSEError> {
         use super::present_engine::EngineInFlight;
-        use vulkano::VulkanObject;
 
         let clear_color = self.config.clear_color;
-        let swapchain_handle = self
-            .state
-            .target
-            .present_expect_mut()
-            .swapchain
-            .swapchain()
-            .handle();
         let (dsw, dsh) = self.state.target.present_expect_mut().display_size;
         let win_size_arr = [dsw, dsh];
 
@@ -798,6 +803,10 @@ impl<'a> RenderContext<'a> {
         }
 
         // --- Acquire (raw) ---
+        // Read the handle *after* the recreation above, not before it: the old swapchain is
+        // destroyed there, and this path — unlike the synchronous one — reaches the acquire
+        // with the recreation already done. See `swapchain_handle`.
+        let swapchain_handle = self.swapchain_handle();
         let (image_index, acquire_suboptimal, slot) = match self
             .state
             .target
@@ -890,6 +899,10 @@ impl<'a> RenderContext<'a> {
             .expect("flip_with_payload_ext called without a present engine")
             .submit_and_present(
                 &queue,
+                // Deliberately the *same* handle the acquire used, not a fresh read: acquire and
+                // present are a matched pair, and `image_index` indexes that swapchain's images.
+                // A re-read here would paper over a mismatch rather than guard against one —
+                // nothing between the acquire above and this submit can recreate the swapchain.
                 swapchain_handle,
                 image_index,
                 slot,
