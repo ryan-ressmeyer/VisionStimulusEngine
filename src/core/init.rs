@@ -4,10 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::{info, warn};
+use vulkano::swapchain::Surface;
 use winit::{
     dpi::PhysicalSize,
     event_loop::EventLoopWindowTarget,
-    window::{Fullscreen, WindowBuilder},
+    window::{Fullscreen, Window, WindowBuilder},
 };
 
 use super::config::{VSEConfig, VSEError};
@@ -22,6 +23,28 @@ use super::state::{
 use super::swapchain::{SwapchainConfig, SwapchainManager};
 use crate::drawing::renderer::Renderer;
 use crate::timing::{Clock, TimingProvider};
+
+/// A presentation-capable surface plus the path-specific state needed to drive it.
+///
+/// Window and direct-display acquisition stay separate; everything after this
+/// point must be initialized identically for both display paths.
+struct DisplayEndpoint {
+    device_selector: DeviceSelector,
+    surface: Arc<Surface>,
+    swapchain_extent: [u32; 2],
+    display_size: (u32, u32),
+    window: Option<Arc<Window>>,
+    cursor_visible: bool,
+    window_mode: WindowMode,
+    input: DisplayInput,
+    acquired_display: Option<super::input::AcquisitionMethod>,
+}
+
+enum DisplayInput {
+    Winit,
+    #[cfg(target_os = "linux")]
+    Evdev,
+}
 
 impl VSEContext {
     /// Initialize Vulkan state from an event loop window target
@@ -139,112 +162,30 @@ impl VSEContext {
             actual_size.width, actual_size.height, config.window_mode, cursor_visible
         );
 
-        // Initialize Vulkan
         let (device_selector, surface) =
             DeviceSelector::with_surface(config.gpu_preference, window.clone())?;
+        let swapchain_size = window.inner_size();
 
-        let (device, queue, ext_features) = device_selector.create_device()?;
-
-        // Use the actual window size, not the configured size. In fullscreen
-        // modes the OS/compositor will have already sized the window to the
-        // monitor before Vulkan initialization runs.
-        let win_size = window.inner_size();
-        let swapchain_config = SwapchainConfig {
-            width: win_size.width,
-            height: win_size.height,
-            present_mode: config.present_mode,
-            image_count: 2,
-        };
-
-        // Mirror every present-family opt-in the device enabled onto the swapchain (raw create).
-        // Each feature needs its own VkSwapchainCreateInfoKHR flag before its entry points are
-        // legal on the swapchain, so this must track all of them, not just presentWait2.
-        let opt_ins = ext_features
-            .map(|f| pt::SwapchainOptIns::from_features(&f))
-            .unwrap_or_default();
-        let swapchain =
-            SwapchainManager::new_with_opt_ins(device.clone(), surface, swapchain_config, opt_ins)?;
-        let renderer = Renderer::new(
-            device.clone(),
-            queue.clone(),
-            swapchain.format(),
-            swapchain.images().len(),
-            swapchain.extent(),
-            &config.pipeline_suite,
-        )?;
-
-        // Initialize timing
-        let clock = Clock::new();
-
-        let timing_provider: Box<dyn TimingProvider> =
-            build_timing_provider(&device, swapchain.swapchain(), ext_features);
-        let host_bridge = build_host_bridge(config, timing_provider.as_ref());
-        let present_engine = build_present_engine(
-            &device,
-            swapchain.images().len() as u32,
-            timing_provider.as_ref(),
-        );
-
-        let expected_frame_duration = config
-            .expected_refresh_rate
-            .map(|hz| Duration::from_micros((1_000_000.0 / hz) as u64));
-
-        info!("Vulkan initialization complete");
-
-        let win_size = (actual_size.width, actual_size.height);
-
-        Ok(VSEState {
-            device_selector,
-            device,
-            queue,
-            renderer,
-            clock,
-            frame_number: 0,
-            should_close: false,
-            input: InputState::new(),
-            recording: None,
-            target: RenderTarget::Present(Box::new(PresentTarget {
+        Self::initialize_present_target(
+            config,
+            DisplayEndpoint {
+                device_selector,
+                surface,
+                swapchain_extent: [swapchain_size.width, swapchain_size.height],
+                display_size: (actual_size.width, actual_size.height),
                 window: Some(window),
-                swapchain,
-                minimized: false,
                 cursor_visible,
                 window_mode: config.window_mode,
-                timing_provider,
-                present_engine,
-                recent_scanouts: Vec::new(),
-                scanout_by_present_id: std::collections::HashMap::new(),
-                last_present_time: None,
-                last_scanout_ns: None,
-                last_scanout_present_id: None,
-                expected_frame_duration,
-                refresh_detect_samples: Vec::with_capacity(10),
-                scanout_clock: None,
-                scanout_feedback_populated: None,
-                absolute_scheduling_enforced: None,
-                software_present_pacing: true,
-                scanout_feedback_probe_count: 0,
-                warned_feedback_stub: false,
-                warned_sw_pacing: false,
-                host_bridge,
-                last_bridge_sample_ts: None,
-                input_source: InputSource::Winit,
-                display_size: win_size,
+                input: DisplayInput::Winit,
                 acquired_display: None,
-                buffered_confirmed_flip: None,
-                in_buffered_mode: false,
-                buffered_pending_frames: std::collections::VecDeque::new(),
-                ext_features,
-                external_source: None,
-                external_readback: None,
-            })),
-        })
+            },
+        )
     }
 
     /// Initialize Vulkan state for direct display mode (no winit, no compositor).
     #[cfg(target_os = "linux")]
     pub(super) fn initialize_direct(config: &VSEConfig) -> Result<VSEState, VSEError> {
         use crate::core::direct_display::{acquire_display, default_acquisition_order};
-        use crate::core::evdev_input::EvdevReader;
         use vulkano::VulkanObject;
 
         let target_name = match &config.monitor_selection {
@@ -270,21 +211,48 @@ impl VSEContext {
             &order,
         )?;
 
-        let (width, height) = (direct_surface.width, direct_surface.height);
-        let method = direct_surface.method;
-        let surface = direct_surface.surface;
+        Self::initialize_present_target(
+            config,
+            DisplayEndpoint {
+                device_selector,
+                surface: direct_surface.surface,
+                swapchain_extent: [direct_surface.width, direct_surface.height],
+                display_size: (direct_surface.width, direct_surface.height),
+                window: None,
+                cursor_visible: false,
+                window_mode: WindowMode::DirectDisplay,
+                input: DisplayInput::Evdev,
+                acquired_display: Some(direct_surface.method),
+            },
+        )
+    }
 
-        let (device, queue, ext_features) =
-            device_selector.create_device().map_err(VSEError::Device)?;
+    /// Initialize the Vulkan and runtime state shared by every displayed session.
+    fn initialize_present_target(
+        config: &VSEConfig,
+        endpoint: DisplayEndpoint,
+    ) -> Result<VSEState, VSEError> {
+        let DisplayEndpoint {
+            device_selector,
+            surface,
+            swapchain_extent,
+            display_size,
+            window,
+            cursor_visible,
+            window_mode,
+            input,
+            acquired_display,
+        } = endpoint;
 
+        let (device, queue, ext_features) = device_selector.create_device()?;
         let swapchain_config = SwapchainConfig {
-            width,
-            height,
+            width: swapchain_extent[0],
+            height: swapchain_extent[1],
             present_mode: config.present_mode,
             image_count: 2,
         };
 
-        // Mirror every present-family opt-in the device enabled onto the swapchain (see above).
+        // Every present-family device opt-in needs its matching swapchain flag.
         let opt_ins = ext_features
             .map(|f| pt::SwapchainOptIns::from_features(&f))
             .unwrap_or_default();
@@ -300,7 +268,6 @@ impl VSEContext {
         )?;
 
         let clock = Clock::new();
-
         let timing_provider: Box<dyn TimingProvider> =
             build_timing_provider(&device, swapchain.swapchain(), ext_features);
         let host_bridge = build_host_bridge(config, timing_provider.as_ref());
@@ -309,23 +276,32 @@ impl VSEContext {
             swapchain.images().len() as u32,
             timing_provider.as_ref(),
         );
-
         let expected_frame_duration = config
             .expected_refresh_rate
             .map(|hz| Duration::from_micros((1_000_000.0 / hz) as u64));
 
-        let evdev_reader = match EvdevReader::open() {
-            Ok(mut r) => {
-                r.set_display_size(width, height);
-                r
+        let input_source = match input {
+            DisplayInput::Winit => {
+                info!("Vulkan initialization complete");
+                InputSource::Winit
             }
-            Err(msg) => {
-                warn!("evdev input unavailable: {}", msg);
-                EvdevReader::empty()
+            #[cfg(target_os = "linux")]
+            DisplayInput::Evdev => {
+                use crate::core::evdev_input::EvdevReader;
+                let reader = match EvdevReader::open() {
+                    Ok(mut reader) => {
+                        reader.set_display_size(display_size.0, display_size.1);
+                        reader
+                    }
+                    Err(msg) => {
+                        warn!("evdev input unavailable: {}", msg);
+                        EvdevReader::empty()
+                    }
+                };
+                info!("Direct display initialization complete");
+                InputSource::Evdev(reader)
             }
         };
-
-        info!("Direct display initialization complete");
 
         Ok(VSEState {
             device_selector,
@@ -338,11 +314,11 @@ impl VSEContext {
             input: InputState::new(),
             recording: None,
             target: RenderTarget::Present(Box::new(PresentTarget {
-                window: None,
+                window,
                 swapchain,
                 minimized: false,
-                cursor_visible: false,
-                window_mode: WindowMode::DirectDisplay,
+                cursor_visible,
+                window_mode,
                 timing_provider,
                 present_engine,
                 recent_scanouts: Vec::new(),
@@ -361,9 +337,9 @@ impl VSEContext {
                 warned_sw_pacing: false,
                 host_bridge,
                 last_bridge_sample_ts: None,
-                input_source: InputSource::Evdev(evdev_reader),
-                display_size: (width, height),
-                acquired_display: Some(method),
+                input_source,
+                display_size,
+                acquired_display,
                 buffered_confirmed_flip: None,
                 in_buffered_mode: false,
                 buffered_pending_frames: std::collections::VecDeque::new(),
