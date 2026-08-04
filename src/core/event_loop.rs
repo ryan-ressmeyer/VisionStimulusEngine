@@ -407,9 +407,6 @@ impl VSEContext {
         T: std::any::Any + serde::Serialize + Send + 'static,
         F: FnMut(FlipEvent<T>, &mut RenderContext<'_>) -> Result<(), VSEError> + 'static,
     {
-        use crate::core::buffered::PendingFrame;
-        use std::collections::VecDeque;
-
         // Branch for direct display mode
         #[cfg(target_os = "linux")]
         if self.config.window_mode == WindowMode::DirectDisplay {
@@ -426,10 +423,6 @@ impl VSEContext {
         let mut vse_config = self.config;
         let mut session = self.session;
         let mut state: Option<VSEState> = None;
-
-        // pending_frames lives alongside in_flight fences; same FIFO order.
-        let pending_frames: Rc<RefCell<VecDeque<PendingFrame<T>>>> =
-            Rc::new(RefCell::new(VecDeque::with_capacity(config.depth + 1)));
 
         let error: Rc<RefCell<Option<VSEError>>> = Rc::new(RefCell::new(None));
         let error_clone = error.clone();
@@ -540,60 +533,36 @@ impl VSEContext {
                                 let oldest_complete = s
                                     .target
                                     .present_expect()
-                                    .buffered_in_flight
+                                    .buffered_pending_frames
                                     .front()
-                                    .map(|(_, fence)| fence.is_complete())
-                                    .unwrap_or(false);
+                                    .is_some_and(|frame| frame.completion.is_complete());
 
                                 if oldest_complete {
-                                    let (estimated_flip, fence) = s
+                                    let pending = s
                                         .target
                                         .present_expect_mut()
-                                        .buffered_in_flight
+                                        .buffered_pending_frames
                                         .pop_front()
-                                        .unwrap();
-                                    fence.wait_blocking();
-
-                                    if let Some(pf) = pending_frames.borrow_mut().pop_front() {
-                                        debug_assert_eq!(
-                                            pf.frame_number, pf.estimated_flip.frame_number,
-                                            "PendingFrame FIFO mismatch"
-                                        );
-                                        let clock = &s.clock;
-                                        let present = s.target.present_expect_mut();
-                                        let confirmed =
-                                            present.build_confirmed_flip(clock, estimated_flip);
-                                        present.buffered_confirmed_flip = Some(confirmed.clone());
-                                        present.buffered_record_called_this_presented = false;
-
-                                        let mut render_ctx = RenderContext {
-                                            state: s,
-                                            config: &mut vse_config,
-                                        };
-                                        if let Err(e) = callback(
-                                            FlipEvent::Presented {
-                                                flip_info: confirmed,
-                                                payload: pf.payload,
-                                            },
-                                            &mut render_ctx,
-                                        ) {
-                                            *error_clone.borrow_mut() = Some(e);
-                                            elwt.exit();
-                                            return;
-                                        }
-                                        s.target.present_expect_mut().buffered_confirmed_flip =
-                                            None;
+                                        .expect("oldest buffered frame was just observed");
+                                    if let Err(e) = Self::deliver_buffered_frame(
+                                        s,
+                                        &mut vse_config,
+                                        pending,
+                                        &mut callback,
+                                    ) {
+                                        *error_clone.borrow_mut() = Some(e);
+                                        elwt.exit();
+                                        return;
                                     }
                                 }
 
                                 // Early exit if callback requested close during Presented
                                 if s.should_close {
-                                    Self::drain_buffered(
-                                        s,
-                                        &mut vse_config,
-                                        &pending_frames,
-                                        &mut callback,
-                                    );
+                                    if let Err(e) =
+                                        Self::drain_buffered(s, &mut vse_config, &mut callback)
+                                    {
+                                        *error_clone.borrow_mut() = Some(e);
+                                    }
                                     if let Some(recording) = &mut s.recording {
                                         recording.on_shutdown();
                                     }
@@ -613,39 +582,16 @@ impl VSEContext {
                                         elwt.exit();
                                         return;
                                     }
-
-                                    // Pick up payload stored by flip_with_payload()
-                                    if let Some(raw) = s
-                                        .target
-                                        .present_expect_mut()
-                                        .buffered_pending_payload
-                                        .take()
-                                    {
-                                        let payload = *raw
-                                            .downcast::<T>()
-                                            .expect("buffered payload type mismatch");
-                                        if let Some((estimated_flip, _)) =
-                                            s.target.present_expect().buffered_in_flight.back()
-                                        {
-                                            let ef = estimated_flip.clone();
-                                            pending_frames.borrow_mut().push_back(PendingFrame {
-                                                frame_number: ef.frame_number,
-                                                payload,
-                                                estimated_flip: ef,
-                                            });
-                                        }
-                                    }
                                 }
 
                                 s.input.begin_frame();
 
                                 if s.should_close {
-                                    Self::drain_buffered(
-                                        s,
-                                        &mut vse_config,
-                                        &pending_frames,
-                                        &mut callback,
-                                    );
+                                    if let Err(e) =
+                                        Self::drain_buffered(s, &mut vse_config, &mut callback)
+                                    {
+                                        *error_clone.borrow_mut() = Some(e);
+                                    }
                                     if let Some(recording) = &mut s.recording {
                                         recording.on_shutdown();
                                     }
@@ -684,47 +630,83 @@ impl VSEContext {
         Ok(())
     }
 
-    /// Drain all remaining in-flight fences and fire Presented events.
-    ///
-    /// Called on clean shutdown from within `run_buffered()`.
-    fn drain_buffered<T, F>(
+    /// Confirm one submitted frame, dispatch its `Presented` event, and finalize recording.
+    fn deliver_buffered_frame<T, F>(
         state: &mut VSEState,
         config: &mut VSEConfig,
-        pending_frames: &Rc<
-            RefCell<std::collections::VecDeque<crate::core::buffered::PendingFrame<T>>>,
-        >,
+        pending: crate::core::buffered::PendingFrame<Box<dyn std::any::Any + Send + 'static>>,
         callback: &mut F,
-    ) where
+    ) -> Result<(), VSEError>
+    where
         T: std::any::Any + serde::Serialize + Send + 'static,
         F: FnMut(FlipEvent<T>, &mut RenderContext<'_>) -> Result<(), VSEError>,
     {
-        while let Some((estimated_flip, fence)) = state
+        pending.completion.wait_blocking();
+        let payload = *pending
+            .payload
+            .downcast::<T>()
+            .expect("buffered payload type mismatch");
+        let clock = &state.clock;
+        let confirmed = state
             .target
             .present_expect_mut()
-            .buffered_in_flight
+            .build_confirmed_flip(clock, pending.estimated_flip);
+        state.target.present_expect_mut().buffered_confirmed_flip = Some(confirmed.clone());
+        if let Some(recording) = &mut state.recording {
+            recording.on_flip(confirmed.clone());
+        }
+
+        let callback_result = {
+            let mut render_ctx = RenderContext { state, config };
+            callback(
+                FlipEvent::Presented {
+                    flip_info: confirmed,
+                    payload,
+                },
+                &mut render_ctx,
+            )
+        };
+
+        state.target.present_expect_mut().buffered_confirmed_flip = None;
+        let recording_result = state
+            .recording
+            .as_mut()
+            .map(|recording| recording.finish_flip())
+            .transpose()
+            .map_err(|e| VSEError::DataRecording(e.to_string()));
+
+        callback_result?;
+        recording_result?;
+        Ok(())
+    }
+
+    /// Drain all remaining in-flight frames and fire `Presented` events.
+    ///
+    /// Called on clean shutdown from within `run_buffered()`. All frames are
+    /// retired even if a callback fails; the first error is returned afterward.
+    fn drain_buffered<T, F>(
+        state: &mut VSEState,
+        config: &mut VSEConfig,
+        callback: &mut F,
+    ) -> Result<(), VSEError>
+    where
+        T: std::any::Any + serde::Serialize + Send + 'static,
+        F: FnMut(FlipEvent<T>, &mut RenderContext<'_>) -> Result<(), VSEError>,
+    {
+        let mut first_error = None;
+        while let Some(pending) = state
+            .target
+            .present_expect_mut()
+            .buffered_pending_frames
             .pop_front()
         {
-            fence.wait_blocking();
-            if let Some(pf) = pending_frames.borrow_mut().pop_front() {
-                debug_assert_eq!(
-                    pf.frame_number, pf.estimated_flip.frame_number,
-                    "PendingFrame FIFO mismatch"
-                );
-                let clock = &state.clock;
-                let present = state.target.present_expect_mut();
-                let confirmed = present.build_confirmed_flip(clock, estimated_flip);
-                present.buffered_confirmed_flip = Some(confirmed.clone());
-                present.buffered_record_called_this_presented = false;
-                let mut render_ctx = RenderContext { state, config };
-                let _ = callback(
-                    FlipEvent::Presented {
-                        flip_info: confirmed,
-                        payload: pf.payload,
-                    },
-                    &mut render_ctx,
-                );
-                state.target.present_expect_mut().buffered_confirmed_flip = None;
+            if let Err(e) = Self::deliver_buffered_frame(state, config, pending, callback) {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
             }
         }
+
+        first_error.map_or(Ok(()), Err)
     }
 }

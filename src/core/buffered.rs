@@ -1,13 +1,12 @@
 //! Buffered flip types — `BufferedConfig`, `FlipEvent<T>`, and internal fence abstraction.
 
-use crate::data::OverflowBehavior;
 use crate::timing::FlipInfo;
 
 /// Configuration for [`crate::core::VSEContext::run_buffered`].
 ///
-/// Controls the pipeline depth and overflow policy of the buffered flip loop.
-/// [`Default`] provides `depth = 1` with blocking overflow — the right choice
-/// for the vast majority of closed-loop experiments.
+/// Controls the pipeline depth of the buffered flip loop.
+/// [`Default`] provides `depth = 1`, the right choice for the vast majority of
+/// closed-loop experiments.
 ///
 /// # Example
 ///
@@ -17,11 +16,8 @@ use crate::timing::FlipInfo;
 /// let cfg = BufferedConfig::default();
 /// assert_eq!(cfg.depth, 1);
 ///
-/// // High-throughput rendering where occasional data loss is acceptable:
-/// let cfg2 = BufferedConfig {
-///     depth: 2,
-///     overflow: OverflowBehavior::DropWithWarning,
-/// };
+/// // More pipelining for a GPU-bound workload:
+/// let cfg2 = BufferedConfig { depth: 2 };
 /// ```
 #[derive(Debug, Clone)]
 pub struct BufferedConfig {
@@ -41,23 +37,11 @@ pub struct BufferedConfig {
     /// stability, but each additional level adds one frame (~16 ms at 60 Hz)
     /// of closed-loop reaction latency.
     pub depth: usize,
-
-    /// What to do when the pending-confirmation queue is full.
-    ///
-    /// - [`OverflowBehavior::Block`]: stall the render loop until space is available.
-    ///   No data loss. **Default.**
-    /// - [`OverflowBehavior::DropWithWarning`]: discard the oldest unconfirmed frame
-    ///   and emit `tracing::warn!`. Never stalls; risk of data loss if the writer
-    ///   falls behind the render loop.
-    pub overflow: OverflowBehavior,
 }
 
 impl Default for BufferedConfig {
     fn default() -> Self {
-        Self {
-            depth: 1,
-            overflow: OverflowBehavior::Block,
-        }
+        Self { depth: 1 }
     }
 }
 
@@ -153,17 +137,54 @@ pub(crate) trait InFlightFuture {
     fn wait_blocking(&self);
 }
 
-/// A pending frame in the confirmation queue (local to `run_buffered()`).
+/// A submitted frame awaiting confirmation in the buffered FIFO.
 pub(crate) struct PendingFrame<T> {
-    pub frame_number: u64,
     pub payload: T,
     /// Best available timing at submit time. Replaced by confirmed timing in `Presented`.
     pub estimated_flip: FlipInfo,
+    /// Completion for this exact payload and timing estimate.
+    pub completion: Box<dyn InFlightFuture>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CompleteFuture;
+
+    impl InFlightFuture for CompleteFuture {
+        fn is_complete(&self) -> bool {
+            true
+        }
+
+        fn wait_blocking(&self) {}
+    }
+
+    #[test]
+    fn pending_frame_owns_payload_timing_and_completion() {
+        use crate::timing::{Timestamp, TimingSource};
+
+        let pending = PendingFrame {
+            payload: 42_u32,
+            estimated_flip: FlipInfo {
+                frame_number: 3,
+                timing_source: TimingSource::CpuEstimate,
+                submit_time: Timestamp::from_micros(10),
+                present_time: Timestamp::from_micros(20),
+                present_id: 0,
+                target_time: None,
+                on_target: true,
+                missed: false,
+                missed_count: 0,
+                skipped: false,
+            },
+            completion: Box::new(CompleteFuture),
+        };
+
+        assert_eq!(pending.payload, 42);
+        assert_eq!(pending.estimated_flip.frame_number, 3);
+        assert!(pending.completion.is_complete());
+    }
 
     #[test]
     fn buffered_config_default() {

@@ -91,8 +91,12 @@ Configure depth via [`BufferedConfig`](../../src/core/buffered.rs):
 ```rust
 use vision_stimulus_engine::prelude::*;
 
-let cfg = BufferedConfig { depth: 1, overflow: OverflowBehavior::Block };
+let cfg = BufferedConfig { depth: 1 };
 ```
+
+Swapchain image acquisition provides backpressure when all images are in use. Buffered
+presentation never drops an already-submitted frame. Configure writer-channel overflow
+separately with `ExperimentSessionBuilder::with_overflow()`.
 
 ---
 

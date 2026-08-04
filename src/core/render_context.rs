@@ -91,6 +91,7 @@ impl<'a> RenderContext<'a> {
             let payload =
                 serde_json::to_vec(&data).map_err(|e| VSEError::DataRecording(e.to_string()))?;
 
+            let frame_number = flip.frame_number;
             recording
                 .session
                 .send_frame(FrameMessage {
@@ -99,11 +100,7 @@ impl<'a> RenderContext<'a> {
                     schema_name: std::any::type_name::<F>(),
                 })
                 .map_err(|e| VSEError::DataRecording(e.to_string()))?;
-
-            self.state
-                .target
-                .present_expect_mut()
-                .buffered_record_called_this_presented = true;
+            recording.last_claimed_frame = Some(frame_number);
             return Ok(());
         }
 

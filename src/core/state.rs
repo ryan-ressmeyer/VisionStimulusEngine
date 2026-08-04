@@ -60,18 +60,24 @@ impl RecordingState {
         self.pending_flip = Some(new_flip);
     }
 
-    /// Called on session shutdown — flushes final pending flip as timing-only if unclaimed.
-    pub(crate) fn on_shutdown(&mut self) {
+    /// Finalize the current flip, emitting one timing-only row if it was not claimed.
+    pub(crate) fn finish_flip(&mut self) -> Result<(), crate::data::DataError> {
         if let Some(flip) = self.pending_flip.take() {
             let claimed = self.last_claimed_frame == Some(flip.frame_number);
             if !claimed {
-                let _ = self.session.send_frame(FrameMessage {
+                self.session.send_frame(FrameMessage {
                     flip,
                     payload: None,
                     schema_name: "",
-                });
+                })?;
             }
         }
+        Ok(())
+    }
+
+    /// Called on session shutdown — flushes final pending flip as timing-only if unclaimed.
+    pub(crate) fn on_shutdown(&mut self) {
+        let _ = self.finish_flip();
     }
 }
 
@@ -221,11 +227,6 @@ pub(super) struct PresentTarget {
     pub(super) acquired_display: Option<AcquisitionMethod>,
 
     // --- Buffered flip state (None/false when using synchronous run()) ---
-    /// Transit slot: flip_with_payload() stores the payload here as a type-erased
-    /// Box<dyn Any>. run_buffered() takes it out after the Render callback returns
-    /// and downcasts it back to T. Always None outside the Render callback.
-    pub(super) buffered_pending_payload: Option<Box<dyn std::any::Any + Send + 'static>>,
-
     /// The confirmed FlipInfo for the frame being delivered in a Presented callback.
     /// Set by run_buffered() before invoking the Presented arm; cleared after.
     /// record_frame() reads this field instead of pending_flip when Some.
@@ -235,15 +236,12 @@ pub(super) struct PresentTarget {
     /// prevents flip() from being called in that context.
     pub(super) in_buffered_mode: bool,
 
-    /// In-flight fences paired with estimated FlipInfo. Populated by flip_with_payload(),
-    /// drained by run_buffered() when GPU confirmation arrives.
-    /// VecDeque because we always drain from the front (FIFO confirmation order).
-    pub(super) buffered_in_flight:
-        std::collections::VecDeque<(FlipInfo, Box<dyn crate::core::buffered::InFlightFuture>)>,
-
-    /// Tracks whether record_frame() was called during the current Presented callback.
-    /// Reset to false before each Presented callback by run_buffered().
-    pub(super) buffered_record_called_this_presented: bool,
+    /// Submitted buffered frames awaiting confirmation, in presentation order.
+    /// Each entry owns its timing estimate, payload, and completion so correlation
+    /// cannot drift across parallel queues.
+    pub(super) buffered_pending_frames: std::collections::VecDeque<
+        crate::core::buffered::PendingFrame<Box<dyn std::any::Any + Send + 'static>>,
+    >,
 
     /// Present-timing sub-features enabled at device creation (`Some` on the EXT backend).
     /// Carries the queue global-priority outcome into host-info snapshots.
@@ -857,6 +855,57 @@ mod tests {
             lines.len() >= 2,
             "expected at least header + 1 row, got: {:?}",
             lines
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn confirmed_flip_without_payload_is_finalized_as_timing_only() {
+        use crate::data::{CsvDataWriter, ExperimentSession};
+        use crate::timing::{FlipInfo, Timestamp, TimingSource};
+
+        let dir = std::env::temp_dir().join(format!(
+            "vse_buffered_timing_only_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let session = ExperimentSession::builder()
+            .with_writer(CsvDataWriter::new(&dir))
+            .build()
+            .unwrap();
+        let mut state = RecordingState {
+            session,
+            pending_flip: None,
+            last_claimed_frame: None,
+        };
+        let flip = FlipInfo {
+            frame_number: 7,
+            timing_source: TimingSource::CpuEstimate,
+            submit_time: Timestamp::from_micros(100),
+            present_time: Timestamp::from_micros(200),
+            present_id: 0,
+            target_time: None,
+            on_target: true,
+            missed: false,
+            missed_count: 0,
+            skipped: false,
+        };
+
+        state.on_flip(flip);
+        state.finish_flip().unwrap();
+        drop(state);
+
+        let frames = std::fs::read_to_string(dir.join("frames.csv")).unwrap();
+        let rows: Vec<_> = frames.lines().collect();
+        assert_eq!(rows.len(), 2, "expected header plus one timing-only row");
+        assert!(
+            rows[1].starts_with("7,"),
+            "unexpected frame row: {}",
+            rows[1]
         );
         std::fs::remove_dir_all(&dir).ok();
     }

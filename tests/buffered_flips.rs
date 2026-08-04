@@ -42,8 +42,8 @@ fn run_buffered_fires_render_events() {
         .expect("run_buffered");
 
     assert_eq!(*render_count.borrow(), 5);
-    // With depth=1, first frame has no Presented; remaining 4 do
-    assert_eq!(*presented_count.borrow(), 4);
+    // Clean shutdown drains every submitted frame, including the final one.
+    assert_eq!(*presented_count.borrow(), 5);
 }
 
 /// Payload arrives in the correct order (FIFO).

@@ -759,18 +759,15 @@ impl<'a> RenderContext<'a> {
             skipped: false,
         };
 
-        // Store payload for run_buffered() to pick up after callback returns
         self.state
             .target
             .present_expect_mut()
-            .buffered_pending_payload = Some(Box::new(payload));
-
-        // Store (estimated_flip, fence) — correlated with pending_frames by FIFO order
-        self.state
-            .target
-            .present_expect_mut()
-            .buffered_in_flight
-            .push_back((estimated_flip, in_flight));
+            .buffered_pending_frames
+            .push_back(crate::core::buffered::PendingFrame {
+                payload: Box::new(payload),
+                estimated_flip,
+                completion: in_flight,
+            });
 
         self.state.frame_number += 1;
         self.state.input.clear_events();
@@ -984,12 +981,12 @@ impl<'a> RenderContext<'a> {
         self.state
             .target
             .present_expect_mut()
-            .buffered_pending_payload = Some(Box::new(payload));
-        self.state
-            .target
-            .present_expect_mut()
-            .buffered_in_flight
-            .push_back((estimated_flip, in_flight));
+            .buffered_pending_frames
+            .push_back(crate::core::buffered::PendingFrame {
+                payload: Box::new(payload),
+                estimated_flip,
+                completion: in_flight,
+            });
 
         self.state.frame_number += 1;
         self.state.input.clear_events();
