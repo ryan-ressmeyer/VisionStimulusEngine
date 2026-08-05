@@ -88,8 +88,7 @@ Two VUIDs used to fire from one cause — VSE created its swapchain without
 Fixed by setting the bit (`pt::SwapchainOptIns`, composed in `src/core/swapchain.rs`). Three things
 worth keeping from that investigation:
 
-- **These VUIDs were the root cause of a documented "driver bug."** `docs/clock-synchronization.md`
-  §6 had recorded ANV as stubbing `IMAGE_FIRST_PIXEL_OUT` to 0. It wasn't: the swapchain had never
+- **These VUIDs were the root cause of a documented "driver bug."** The earlier clock documentation had recorded ANV as stubbing `IMAGE_FIRST_PIXEL_OUT` to 0. It wasn't: the swapchain had never
   opted into timing, so there was nothing to report. With the bit set, `IMAGE_FIRST_PIXEL_OUT` goes
   **0/200 → 200/200**, deterministically, across nine alternating paired runs. A validation error
   dismissed as "spec pedantry, it works anyway" was the whole explanation.
@@ -103,7 +102,7 @@ worth keeping from that investigation:
 - **Establish the control before changing anything.** The fix looked like it had failed at first:
   the fixed build read 0/200 for several minutes because *the screen had blanked on the idle timer*,
   and a dark panel produces no scanout to timestamp. Only back-to-back alternating A/B runs of both
-  binaries separated the signal from the environment. See `docs/clock-synchronization.md` §6.
+  binaries separated the signal from the environment. See `docs/timing-conformance.md#reference-path-measurements`.
 
 ## The timing caveat — read this before recording anything
 
@@ -130,4 +129,4 @@ recording only means the fields did not exist yet — it is not proof of a clean
 The layer checks conformance to the spec. It will not find logic errors that are perfectly
 legal Vulkan: the wrong pixels, a stimulus drawn at the wrong coordinates, a flip scheduled
 against the wrong deadline. For those, see `tests/headless_pixels.rs` (pixel-exact rendering
-assertions) and `docs/clock-synchronization.md` (timing).
+assertions) and `docs/timing-conformance.md` (timing evidence and characterization).

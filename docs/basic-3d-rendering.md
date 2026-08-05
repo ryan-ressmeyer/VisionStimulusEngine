@@ -19,7 +19,7 @@ Materials, lighting, animation, scene graphs, and runtime asset streaming remain
 
 `vse-3d` creates a second Vulkan logical device on the same physical GPU. It renders into a ring of exportable color images and owns its depth images, model buffers, command buffers, and graphics pipelines. Base VSE imports the color ring through `vse-external-frame`, blits each completed 3D frame into its target, draws its 2D overlays, and presents.
 
-This boundary keeps depth and future multipass work out of base VSE. VSE remains the only code that acquires swapchain images, submits presentation work, queries scanout feedback, and constructs `FlipInfo`.
+This boundary keeps depth and future multipass work out of base VSE. VSE remains the only code that acquires swapchain images, submits presentation work, queries scanout feedback, and constructs `FlipInfo`. The resulting evidence follows [Timing conformance](timing-conformance.md); the external renderer does not strengthen it.
 
 The initial integration requires Linux Vulkan external-memory and external-semaphore file descriptors. Displayed sessions also require VSE's EXT present backend, which owns the cross-device semaphore waits in the displayed submit. Headless sessions wait through their separate offscreen submit. Ordinary base-VSE rendering remains available without those extensions.
 
@@ -57,7 +57,7 @@ context.run_with_setup(
 
 `draw_normals` validates parameters and queues a small command. It performs no file I/O, pipeline creation, GPU allocation, or GPU wait. `render_frame` records and submits one complete 3D frame on the producer device, signals the selected ring slot, and queues that slot for the next VSE flip. The GPU semaphore wait occurs in VSE's submission. Displayed code does not wait for the producer on the CPU.
 
-The initial API is frame-locked. Scene state `n` produces the external image consumed by VSE frame `n`. A slow 3D renderer can therefore cause a measured missed presentation rather than silently repeating a prior scene state.
+The initial API is frame-locked. Scene state `n` produces the external image consumed by VSE frame `n`. A slow 3D renderer can therefore delay VSE's submission rather than silently repeating a prior scene state. The resulting `FlipInfo` supplies the best available missed-interval diagnostic and timestamp provenance.
 
 `Vse3d` can live in the state returned by `run_buffered_with_state`. Set `Vse3dConfig::ring_len` to at least `BufferedConfig::depth + 2`; the default three-slot ring matches buffered depth one. Slot exhaustion returns an error rather than waiting or reallocating during frame production.
 

@@ -10,8 +10,8 @@ use crate::data::writer::{DataError, DataWriter};
 /// Controls render-loop behavior when the writer channel is full.
 ///
 /// The default channel capacity of 4096 messages provides ~68 seconds of
-/// buffering at 60 Hz. Choose `Block` (default) to guarantee no data loss;
-/// choose `DropWithWarning` to guarantee no frame-timing impact.
+/// buffering at 60 Hz. Choose `Block` (default) to avoid intentional data loss;
+/// choose `DropWithWarning` to avoid blocking on a full writer channel, accepting lost records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverflowBehavior {
     /// Block the render loop until channel space is available. **Default.**

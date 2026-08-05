@@ -146,14 +146,15 @@ impl DataWriter for MyWriter {
 }
 ```
 
-## Timing Notes
+## Timing notes
 
 Every row in `frames.csv` / `frames.parquet` includes a `timing_source` column:
 
-- `ExtPresentTiming`: scanout-clock timestamp for `IMAGE_FIRST_PIXEL_OUT`, reported by driver feedback when available or sampled from the calibrated scanout clock after `wait_for_present` when the driver returns zero-valued feedback.
-- `CpuEstimate`: host-clock timestamp taken after the GPU fence signals. This confirms render completion, not display scanout.
+- `ExtPresentTiming`: scanout-domain evidence for this frame, from per-present feedback or the synchronous calibrated-clock fallback after a successful present wait;
+- `CpuEstimate`: host-clock observation that does not prove display scanout;
+- `Offscreen`: synthesized regeneration time with no presentation.
 
-`present_id`, `target_time_us`, and `on_target` record present-id correlation and scheduled-flip provenance on the EXT path. See [the schema reference](experiment_data_schema.md) for exact columns.
+The selected session backend can differ from an individual frame's source. `present_id`, `target_time_us`, and `on_target` record correlation and target provenance, but `on_target` is evidentiary only for a comparable scanout-domain receipt. See [the schema reference](experiment_data_schema.md) for exact columns and [Timing conformance](../timing-conformance.md) for interpretation.
 
 ## Buffered Flip
 

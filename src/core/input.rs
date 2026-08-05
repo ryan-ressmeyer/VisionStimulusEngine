@@ -18,10 +18,9 @@ pub enum AcquisitionMethod {
 
 /// The display backend (windowing system) used for this session.
 ///
-/// Detected at runtime from the window handle type. Important for understanding
-/// timing characteristics: compositor-mediated backends (Wayland, X11) add latency
-/// between your `flip()` call and the actual scanout. Direct display mode bypasses
-/// all compositors for true frame-accurate presentation.
+/// Detected at runtime from the window handle type. Window-system backends are treated as
+/// compositor-mediated; direct display removes the compositor from VSE's swapchain path. Neither
+/// classification establishes frame or photon timing without measurement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DisplayBackend {
     /// Native Wayland — the Wayland compositor mediates presentation.
@@ -44,11 +43,7 @@ pub enum DisplayBackend {
 impl DisplayBackend {
     /// Whether this backend routes frames through an OS compositor.
     pub fn has_compositor(&self) -> bool {
-        matches!(
-            self,
-            DisplayBackend::Wayland | DisplayBackend::X11 | DisplayBackend::Unknown
-        )
-        // DirectDisplay, Windows, MacOS return false
+        !matches!(self, DisplayBackend::DirectDisplay { .. })
     }
 
     /// Human-readable name and description of this backend.
@@ -84,12 +79,10 @@ pub enum WindowMode {
     /// Standard resizable window (default).
     #[default]
     Windowed,
-    /// Borderless window covering the entire monitor.
-    /// The OS compositor remains active — adds latency.
+    /// Borderless window covering the entire monitor; compositor policy is platform-dependent.
     BorderlessFullscreen,
-    /// Exclusive fullscreen — bypasses the OS compositor.
-    /// Lowest latency, guaranteed vsync ownership.
-    /// Falls back to `BorderlessFullscreen` on Wayland.
+    /// Window-system exclusive fullscreen request. This is not VSE direct display and does not
+    /// prove compositor bypass. Falls back to `BorderlessFullscreen` on Wayland.
     ExclusiveFullscreen,
     /// Bypass the OS compositor entirely via VK_KHR_display.
     ///
@@ -437,6 +430,8 @@ mod tests {
         assert!(!backend.has_compositor());
         assert!(DisplayBackend::Wayland.has_compositor());
         assert!(DisplayBackend::X11.has_compositor());
+        assert!(DisplayBackend::Windows.has_compositor());
+        assert!(DisplayBackend::MacOS.has_compositor());
     }
 
     #[test]

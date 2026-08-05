@@ -1,316 +1,100 @@
-# Clock Synchronization: CPU, GPU, and Present Clocks
+# Clock synchronization
 
-For vision science we need to know **when photons left the display**. VSE takes the Psychtoolbox
-posture and is **intentionally agnostic about the experiment's ultimate clock**, with a strict
-hierarchy among the clocks a modern graphics stack exposes:
+VSE keeps displayed timing in the display's present-stage-local clock. The normative presentation and fallback contract is [Timing conformance](timing-conformance.md). This document describes the optional bridge between scanout time and the host clock.
 
-- **The scanout clock is primary.** Hardware scanout time is reported by `VK_EXT_present_timing`
-  in the **present-stage-local** domain, and VSE *lives in that domain* for all display timing:
-  anchor a scanout `t=0` at session start, schedule onsets as `t0 + k·T`, and record actual
-  scanout times, natively. The core presentation loop does **no** cross-clock conversion.
-- **Alignment to neural-recording hardware is physical, not software.** A DAQ/ephys box runs its
-  own clock, usually on another machine. The canonical tie is a **photodiode on a stimulus patch
-  feeding the acquisition ADC** — one physical event, recorded in the acquisition clock. VSE never
-  needs to know or estimate that clock; it only guarantees onsets that are *deterministic and
-  known in scanout time*, which the photodiode then ties to acquisition time.
-- **The host CPU clock is secondary and opt-in.** Bridging scanout ↔ `CLOCK_MONOTONIC` is a
-  *convenience tool*, not the backbone — needed only to place host-originated events (key presses,
-  network messages) into scanout time, or for host-only behavioral experiments where the CPU clock
-  is the response clock.
+## Clock roles
 
-This document explains the clocks, how VSE relates them when the opt-in bridge is used, and —
-critically — the **error** involved, with links to primary sources. The rest of the document
-concerns that opt-in bridge; the primary (scanout-native) path needs none of it.
+| Clock | Role |
+|---|---|
+| Present-stage-local | Native domain for scanout timing and EXT target requests. |
+| `CLOCK_MONOTONIC` | Host input, network, and process event timestamps. |
+| GPU device clock | GPU timestamp-query domain; useful for diagnostics but not a scanout timestamp. |
+| Acquisition clock | Ephys or DAQ timebase, usually on separate hardware. |
 
-## 1. The clocks in play
+VSE establishes a session-relative scanout epoch from the present-stage-local clock. `FlipInfo.present_time` is in that domain only when `FlipInfo.timing_source == TimingSource::ExtPresentTiming`.
 
-| Clock | Where it lives | How VSE reads it |
-|---|---|---|
-| **CPU monotonic** (`CLOCK_MONOTONIC`) | Host CPU / OS | `std::time::Instant`; VSE's [`Clock`] is anchored to it |
-| **GPU device clock** (`VK_TIME_DOMAIN_DEVICE`) | GPU, ticks at `timestampPeriod` ns | `vkGetCalibratedTimestampsKHR` |
-| **Present-stage-local** (`VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT`) | The display/scanout hardware | `VK_EXT_present_timing` reports scanout times here |
-| **External acquisition clock** | Ephys / DAQ hardware | Recorded alongside stimulus events; often `CLOCK_MONOTONIC`-derived |
+CPU estimates remain in the host-clock domain. Do not subtract them from scanout timestamps.
 
-The scientifically meaningful timestamp — hardware scanout — is reported by
-`VK_EXT_present_timing` in the **present-stage-local** domain. VSE treats that domain as
-primary and times relative to it. It is *not* directly comparable to the CPU clock; the
-sections below cover the **opt-in** bridge for when host events must be expressed in scanout
-time. When only display timing and a photodiode matter, no bridge is needed at all.
+## Acquisition alignment
 
-## 2. Why present times are not just `CLOCK_MONOTONIC`
+The acquisition system should observe a physical event. Place a photodiode over a stimulus patch and feed it to the acquisition ADC. The diode records panel output in the acquisition clock without requiring VSE to estimate that clock.
 
-`VK_EXT_present_timing` defines two swapchain-relative time domains,
-`VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT` and `VK_TIME_DOMAIN_SWAPCHAIN_LOCAL_EXT`.
-`PRESENT_STAGE_LOCAL` is **required to always be supported**. From the extension proposal:
+`IMAGE_FIRST_PIXEL_OUT` identifies scanout begin, not emitted light. Pixel response, display processing, rolling scanout, and backlight timing remain outside the software timestamp.
 
-> This time domain … allows platforms where different presentation stages are handled by
-> independent hardware to report timings in their own time domain.
+## Why a bridge is optional
 
-In other words, the designers assumed the general case is that presentation hardware runs on
-its *own* clock, and the intended mechanism for relating it to a CPU clock is **calibration**,
-via `VkSwapchainCalibratedTimestampInfoEXT` and `vkGetCalibratedTimestampsKHR`. Exposing
-`CLOCK_MONOTONIC` directly in a swapchain's time-domain list is an *optional convenience* a
-driver may offer; the spec neither requires it nor describes when it would appear.
+Host events arrive in `CLOCK_MONOTONIC`. Experiments that need to compare a key press or network event with scanout can enable the bridge:
 
-**Empirically (this project, 2026-07):** Intel Meteor Lake / ANV / Mesa 26.1.4 (i915) offers
-only `PRESENT_STAGE_LOCAL` from `vkGetSwapchainTimeDomainPropertiesEXT`, in both windowed and
-direct-display modes. So VSE does **not** rely on a native `CLOCK_MONOTONIC` swapchain domain.
-Calibration is the primary path — as the extension intended — with a native-domain fast path
-used only if a driver happens to offer one.
-
-## 3. How calibration works
-
-`VK_KHR_calibrated_timestamps` (`vkGetCalibratedTimestampsKHR`) samples **several clocks as
-close together as the hardware allows** and returns, for each, a timestamp plus a single
-`maxDeviation`:
-
-```
-(timestamps[], maxDeviation) = vkGetCalibratedTimestamps([
-    { timeDomain: PRESENT_STAGE_LOCAL, pNext: VkSwapchainCalibratedTimestampInfoEXT{
-        swapchain, presentStage = IMAGE_FIRST_PIXEL_OUT, timeDomainId } },
-    { timeDomain: CLOCK_MONOTONIC },
-])
+```rust,ignore
+let context = VSEContext::builder()
+    .with_host_clock_bridge()
+    .build()?;
 ```
 
-From one such sample you get an **offset**: `offset = monotonic_ns − present_stage_ns`. A
-scanout time `S` (present-stage-local) then maps to the CPU clock as `S + offset`, and finally
-into VSE's [`Clock`] via its `CLOCK_MONOTONIC` epoch anchor. Because the two clocks can drift
-relative to each other, VSE **re-samples periodically** rather than trusting one offset
-forever.
+The bridge is not required when display timing stays in scanout time and a photodiode provides acquisition alignment. It is not part of presentation scheduling.
 
-For a general GPU↔CPU sanity check that needs no swapchain, the same call with `{ DEVICE,
-CLOCK_MONOTONIC }` characterizes how well the GPU and host clocks correlate on a given machine
-— this is what the capabilities probe reports (§5).
+## Calibration samples
 
-Primary references: [`vkGetCalibratedTimestampsKHR`](https://registry.khronos.org/vulkan/specs/latest/man/html/vkGetCalibratedTimestampsKHR.html),
-[VK_EXT_calibrated_timestamps proposal](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_calibrated_timestamps.html).
+`VK_KHR_calibrated_timestamps` can sample the present-stage-local clock and `CLOCK_MONOTONIC` close together. One sample contains:
 
-## 4. The error budget
+- `stage_ns`, an absolute present-stage-local reading;
+- `mono_ns`, an absolute host-clock reading;
+- `max_deviation_ns`, the driver's bound on the separation between those reads.
 
-Three distinct error terms, smallest to largest in typical impact:
+The instantaneous offset is:
 
-1. **Sampling deviation (`maxDeviation`).** The bound, in nanoseconds, on how far apart the
-   two clock reads were. This is the *irreducible read error* of a single calibration. It
-   depends heavily on hardware: a GPU-`DEVICE`-clock read requires a register round-trip that
-   can be slow on integrated parts, and any single read is sensitive to OS scheduling.
-   **Measured on this machine (Intel MTL, iGPU): best-of-8 ≈ 12–40 µs for
-   `Device↔CLOCK_MONOTONIC`, with individual samples spiking to ~340 µs.** The probe reports
-   the best-of-N read as the representative figure. A discrete GPU, or the
-   `PRESENT_STAGE_LOCAL↔CLOCK_MONOTONIC` pair (which is derived from kernel KMS vblank
-   timestamps rather than a GPU register read), is typically far tighter. Do not read the
-   Device↔Monotonic number as "the scanout timing error" — it is an upper-bound proxy for
-   general clock-sync quality.
-
-2. **Inter-sample drift.** The GPU/present clock and the CPU clock run off different
-   crystals, drifting at up to tens of ppm. At 20 ppm, 1 second between calibrations = 20 µs
-   of accumulated error. Mitigation: re-calibrate on a short cadence (VSE re-samples; the
-   exact interval is a tuning parameter of the calibration subsystem).
-
-3. **Display panel latency — the real floor.** `IMAGE_FIRST_PIXEL_OUT` is *scanout begin*, not
-   photon emission. Pixel response and backlight strobing add their own delay and smear,
-   which the API only *estimates* via `IMAGE_FIRST_PIXEL_VISIBLE`. This term dominates the
-   others and **cannot be measured by software** — it requires a **photodiode**. For any
-   experiment where onset timing to the eye matters, a photodiode on a corner patch, logged on
-   the acquisition clock, remains the ground truth, matching the Psychtoolbox timing model.
-
-**Takeaway:** the software calibration (terms 1–2) gets stimulus onset onto the CPU/ephys
-timeline to well within a frame — good enough that the display panel (term 3), not the clock
-math, is the accuracy floor.
-
-## 5. What VSE does
-
-- **VSE `Clock`** is a `std::time::Instant` anchored, at construction, to an absolute
-  `CLOCK_MONOTONIC` reading (`clock_gettime`), so any `CLOCK_MONOTONIC` nanosecond value —
-  including calibrated GPU/present timestamps and `CLOCK_MONOTONIC`-based ephys hardware —
-  converts directly into VSE timestamps.
-- **Capabilities probe** (`HostInfo.timing`, `TimingCapabilities`): captured into every
-  experiment's host snapshot. Reports whether present timing / present-id2 / present-wait2 /
-  calibrated timestamps are supported, which CPU clock domains are calibrateable, and a
-  measured `Device↔CLOCK_MONOTONIC` `maxDeviation` — a per-machine indicator of clock-sync
-  quality. Run `examples/12_host_and_display_info` to dump it.
-- **Scanout is the native domain.** `FlipInfo.present_time` is a **scanout-clock** timestamp
-  (present-stage-local, referenced to the session's scanout `t=0`). It is *not* converted to CPU
-  time by default; the presentation loop stays entirely in the scanout domain.
-- **Opt-in host-clock bridge** (calibration subsystem): samples `PRESENT_STAGE_LOCAL ↔
-  CLOCK_MONOTONIC` together via `VkSwapchainCalibratedTimestampInfoEXT` +
-  `vkGetCalibratedTimestampsKHR`, and maintains a **lower-envelope, drift-tracked** offset
-  (offset + rate). Its purpose is to place host-originated events (key presses, network) into
-  scanout time, and to expose an optional CPU-clock value alongside `present_time` when a user
-  asks for it. It is never on the presentation hot path.
-- **Loud provenance:** `FlipInfo.timing_source` records whether a frame's `present_time` is a
-  hardware scanout (`ExtPresentTiming`) or a CPU estimate (`CpuEstimate`), so hardware-verified
-  and estimated runs are never confused in the data.
-
-### Measured drift (Intel MTL / ANV / Mesa 26.1.4, windowed, 2026-07)
-
-`examples/10_present_timing_internals` in `drift` mode samples the bridge every frame and fits it. On this hardware:
-
-- `PRESENT_STAGE_LOCAL` is a **genuinely separate clock** — a fixed ~29,714 s epoch offset from
-  `CLOCK_MONOTONIC`, i.e. *not* a re-based `CLOCK_MONOTONIC`. Calibration is genuinely required to
-  bridge.
-- **Relative drift is a stable ~1.97 ppm** over 120 s (per-window 1.93 ± 0.14 ppm across twelve
-  10 s windows; a visibly clean line). Left uncorrected that is ~3.55 ms over a 30-min session —
-  small but a real *systematic*, which is why the bridge models **offset + drift rate**, not a
-  single offset.
-- **Read noise is one-sided:** the true offset is the *lower envelope* of the samples; jitter can
-  only make a read appear later (median `maxDeviation` ~18 µs, tail to ~425 µs). So the estimator
-  takes the **minimum / low quantile** over a sliding window (averaging would bias high), yielding
-  ~1–2 µs offset stability — far below the display-panel floor (§4, term 3).
-
-Caveat: 120 s cannot observe thermal wander of the *rate* itself over a long recording — another
-reason the bridge **tracks** (sliding window) rather than freezing a slope. Re-confirm on the
-direct-display path when the raw-present subsystem lands.
-
-## 6. Driver conformance: advertised ≠ implemented
-
-`VK_EXT_present_timing` is very new (finalized 2024–2025), and a driver can **advertise** the
-extension and its feature bits while only **partially implementing** them. VSE therefore treats
-advertised support as a claim to be *behaviorally verified*, falls back to a correct path when a
-sub-feature is missing, and **records what the driver actually did** in the host snapshot so a run's
-timing pedigree is never silently wrong.
-
-> ### ⚠ Correction (2026-08-03): the first gap below was VSE's bug, not the driver's
->
-> This section previously recorded `vkGetPastPresentationTimingEXT` stage timestamps as
-> "advertised but not implemented" on ANV. **That was wrong.** VSE was creating its swapchain
-> *without* `VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT` — the extension's per-swapchain opt-in —
-> while calling present-timing entry points on it. The swapchain had never opted into timing, so
-> the driver had nothing to report, and it dutifully reported zeros.
->
-> Setting the bit fixes it completely. Nine alternating back-to-back paired runs, same machine,
-> minutes apart:
->
-> | Build | `IMAGE_FIRST_PIXEL_OUT` populated |
-> |---|---|
-> | without the bit (old) | **0/200**, every run |
-> | with the bit (fixed) | **200/200**, every run |
->
-> Real values, e.g. `37321783999000 ns` present-stage-local. `present_time` median dt is 16.67 ms
-> either way (the calibrated-clock fallback was accurate), so this was never a data-quality bug —
-> but the mechanism VSE reported for its own timestamps was wrong, which is worse.
->
-> **Both** rows this section once recorded as driver defects were this same bug. See the scheduling
-> row below.
->
-> The lesson is the one this section already preaches, turned inward: **"advertised ≠ implemented"
-> cuts both ways.** Before charging a driver with non-conformance, verify that every opt-in the
-> feature requires has actually been requested. Two Vulkan validation VUIDs were pointing straight
-> at this the whole time, and were dismissed as spec pedantry because the code "worked anyway."
-
-**Measured on this project's reference machine (Intel Meteor Lake / ANV / Mesa 26.1):**
-
-| Sub-feature | Advertised | Actually works | VSE's response |
-|---|---|---|---|
-| `present_id2` correlation | ✓ | ✓ | Used directly (`FlipInfo.present_id`). |
-| `present_wait2` | ✓ | ✓ | Paces the sync `flip()` to the vblank. |
-| Calibrated `PRESENT_STAGE_LOCAL` clock | ✓ | ✓ | The real scanout-time source (see below). |
-| `vkGetPastPresentationTimingEXT` stage timestamps | ✓ | ✓ **(since 2026-08-03)** | Real per-present `IMAGE_FIRST_PIXEL_OUT` is used when populated; the calibrated-clock path remains as fallback. |
-| Absolute scheduling `VkPresentTimingInfoEXT.targetTime` | ✓ (`presentAtAbsoluteTime`) | ✓ **on direct display** / intermittent windowed | VSE **software-paces** scheduled flips against the scanout clock *and* sends the hardware target, so scheduling is correct either way. |
-
-**As of 2026-08-03 this driver has no known present-timing conformance gap.** The two rows this
-section previously recorded as "advertised but not implemented" were both VSE's missing swapchain
-opt-in.
-
-### The scheduling row, measured
-
-Characterizing this needs software pacing **off** — with VSE pacing the present itself, an on-target
-gap only proves VSE's pacing loop works, and the driver could be ignoring `targetTime` entirely with
-an identical result. With pacing off, requesting a 3-vblank gap:
-
-| Path | Observed vblank gaps | Verdict |
-|---|---|---|
-| windowed, **without** the timing bit | `[1,1,1,1,1,1,1,1,1,1,1,1,1,1]` | `targetTime` wholly ignored |
-| windowed, **with** the bit | `[3,3,3,3,3,1,1,1,1,1,2,1,3,3]` | intermittent — compositor mediates |
-| **direct display, with the bit** | `[3 × 14]`, 14/14 on target | **enforced** |
-
-So the original "not enforced" was measured on a swapchain that had never opted into present timing,
-exactly as the feedback row was.
-
-**Enforcement is a property of the display path, not just the driver.** The same driver enforces on
-direct display and only intermittently through a compositor — expected, since a compositor decides
-when the frame actually reaches the display. Characterize the path you record on. And note that
-*intermittent* enforcement is worse for an experiment than none, because it looks reliable; VSE's
-software pacing runs regardless, so stimulus onsets never depend on the answer.
-
-The direct-display surface also advertises **more** than the windowed one:
-`presentAtRelativeTimeSupported` is `true` on direct display and `false` windowed (stage queries are
-`0x0005` on both). Another reason `VkPresentTimingSurfaceCapabilitiesEXT` is recorded per session
-rather than treated as a fixed driver property.
-
-Note the failure mode this hints at: intermittent enforcement is worse for an experiment than none,
-because it looks like it works. VSE keeps software-pacing scheduled flips regardless, so stimulus
-onsets do not depend on the answer.
-
-The driver also states its claims **per surface**. `VkPresentTimingSurfaceCapabilitiesEXT` on this
-machine returns:
-
-```
-presentTimingSupported=true  presentAtAbsoluteTimeSupported=true
-presentAtRelativeTimeSupported=false  presentStageQueries=0x0005
+```text
+offset = mono_ns - stage_ns
 ```
 
-`0x0005` is `QUEUE_OPERATIONS_END | IMAGE_FIRST_PIXEL_OUT` — the surface advertises exactly the
-stage that now works once the swapchain opts in, which in hindsight was evidence the driver was
-telling the truth. This is queried and logged at swapchain creation so each session's log records
-the driver's claim next to the behavior. (`presentAtRelativeTimeSupported=false` matches what VSE
-requests: it enables `presentAtAbsoluteTime` only.)
+The clocks run from different oscillators, so a fixed offset accumulates error. VSE's `HostClockBridge` fits offset and relative drift over a sliding window. Sampling is rate-limited and occurs outside the presentation hot path.
 
-### A blanked display reports no scanout — never measure timing through one
+## Public conversions
 
-While developing this fix, the *fixed* build read `0/200` across four consecutive runs and looked
-like a failure. The screen had blanked on GNOME's 10-minute idle timer. With the panel off there is
-no scanout, so there is no `IMAGE_FIRST_PIXEL_OUT` to report — the driver correctly returned
-nothing, exactly as it does for a swapchain that never opted in. `present_time` degraded in the same
-window (median **18.8 ms**, non-monotonic, vs 16.67 ms awake), on *both* builds, which is the tell.
+After the bridge has warmed up and the scanout epoch exists:
 
-The journal pins it: touchpad input, `Cursor update failed: drmModeAtomicCommit`, `fprintd`
-activation and a desktop relaunch at the moment the readings recovered — a blank/unlock cycle. It
-matches `org.gnome.desktop.session idle-delay = 600`.
+- `host_to_scanout(timestamp)` maps a host event into session-relative scanout time;
+- `scanout_to_host(timestamp)` maps scanout time into VSE's host-clock timeline;
+- `host_clock_bridge_drift_ppm()` reports the current fitted drift;
+- `sample_present_calibration()` exposes raw paired samples for diagnostics.
 
-Two consequences worth carrying:
+These methods return `None` when the EXT backend, calibrated timestamp support, scanout epoch, or warmed bridge is unavailable. Headless sessions always return `None` for scanout-clock operations.
 
-- **A `0`-valued scanout feedback read has at least three causes** — missing swapchain opt-in,
-  genuine driver stub, and *display asleep*. Do not attribute it to the driver without excluding the
-  other two. This is why `scanout_feedback_populated` is recorded per session rather than assumed,
-  and why the calibrated-clock fallback stays in place.
-- **Disable screen blanking on any machine used for real sessions.** A stimulus run started before
-  the idle timer can have the panel blank mid-experiment. Nothing in Vulkan errors; timing quietly
-  degrades and scanout feedback silently stops.
+## Error terms
 
-### How VSE detects and reports it
+### Calibration read deviation
 
-- **Passive feedback check (automatic, every session):** VSE watches present-timing feedback and,
-  once a ring's worth of records has arrived all-zero, emits a **one-time `WARN`** naming the
-  fallback in use and records `HostInfo.timing.scanout_feedback_populated = Some(false)`.
-  `ctx.scanout_feedback_populated()` exposes it. No extra presents, no startup cost. The warning
-  names the missing swapchain opt-in as the first thing to check, because that is what it turned out
-  to be last time — an all-zero read is *not* by itself evidence of a driver defect.
-- **Scheduling provenance:** the first scheduled `flip(Some(t))` logs a one-time note that presents
-  are software-paced and that hardware `targetTime` enforcement is driver-dependent and unverified.
-- **Enforcement characterization (on demand):** actively testing scheduling enforcement requires
-  presenting deliberate multi-vblank gaps, which disrupts frames, so it is **not** auto-run.
-  `examples/13_direct_display_scanout` measures it in an appended phase that **disables VSE's
-  software pacing** (`RenderContext::set_software_present_pacing(false)`), leaving
-  `VkPresentTimingInfoEXT.targetTime` as the only thing that could hold a present back. It then
-  schedules multi-vblank gaps from a fixed `t0 + k·T` anchor and measures where scanout lands: a
-  non-enforcing driver presents at the *next* vblank regardless of the target.
-  `absolute_scheduling_verdict()` turns the trials into a verdict, which the example records via
-  `record_absolute_scheduling_enforced()` so it reaches `HostInfo`. **This distinction matters:**
-  with pacing left on, a gap landing on target only proves VSE's own pacing loop works — the driver
-  could be ignoring `targetTime` entirely and the result would look identical. Run it once per
-  hardware/driver config; `examples/12_host_and_display_info` prints the advertised-vs-observed table.
+`max_deviation_ns` bounds how far apart the paired clock reads may have occurred. It is a sampling bound, not a panel-timing error and not necessarily the error of a scanout feedback timestamp.
 
-The guiding rule: **VSE's behavior stays correct via fallbacks, and provenance
-(`FlipInfo.timing_source`, `HostInfo.timing.*`, the one-time warnings) reports the mechanism that was
-actually used** — so hardware-verified and worked-around runs are never confused in the data.
+### Inter-sample drift
 
-## 7. Primary sources
+Relative oscillator drift accumulates between samples. The sliding fit tracks it rather than freezing a single offset.
 
-- [VkTimeDomainKHR — reference](https://docs.vulkan.org/refpages/latest/refpages/source/VkTimeDomainKHR.html)
-- [VK_EXT_present_timing — proposal](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_present_timing.html)
-- [VK_EXT_present_timing — reference](https://docs.vulkan.org/refpages/latest/refpages/source/VK_EXT_present_timing.html)
-- [VK_EXT_calibrated_timestamps — proposal](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_calibrated_timestamps.html)
-- [vkGetCalibratedTimestampsKHR — reference](https://registry.khronos.org/vulkan/specs/latest/man/html/vkGetCalibratedTimestampsKHR.html)
-- [Khronos blog: VK_EXT_present_timing — the journey to state-of-the-art frame pacing](https://www.khronos.org/blog/vk-ext-present-timing-the-journey-to-state-of-the-art-frame-pacing-in-vulkan)
+### Presentation evidence
 
-[`Clock`]: ../src/timing/clock.rs
+A successful present wait is not itself a scanout timestamp. The Vulkan specification permits implementation-dependent delay and replacement behavior. Per-present `IMAGE_FIRST_PIXEL_OUT` feedback provides stronger evidence. The synchronous fallback samples the present-stage clock after a successful wait and inherits that wait's uncertainty.
+
+### Panel behavior
+
+Panel light output dominates the end-to-end uncertainty that software cannot observe. Measure it with a photodiode.
+
+## Reference measurement
+
+On the Intel Meteor Lake / ANV / Mesa 26.1 reference system measured in 2026-07:
+
+- present-stage-local had a distinct epoch from `CLOCK_MONOTONIC`;
+- relative drift was approximately 1.97 ppm over 120 seconds;
+- paired-read noise was one-sided, so a lower-envelope fit was more stable than an average.
+
+These measurements motivated the sliding lower-envelope model. They are not portable performance guarantees. Repeat `examples/10_present_timing_internals drift` on the recording path after hardware or driver changes.
+
+## Driver and path characterization
+
+Advertised clock domains and timing features are claims. Record the surface capabilities, observe nonzero feedback, and run disruptive scheduling characterization separately when required. The corrected reference-path history and current measurement policy are in [Timing conformance](timing-conformance.md#capability-and-conformance-evidence).
+
+Primary references:
+
+- [VK_EXT_present_timing](https://docs.vulkan.org/refpages/latest/refpages/source/VK_EXT_present_timing.html)
+- [VkPresentTimingInfoEXT](https://docs.vulkan.org/refpages/latest/refpages/source/VkPresentTimingInfoEXT.html)
+- [VK_KHR_present_wait2](https://docs.vulkan.org/refpages/latest/refpages/source/VK_KHR_present_wait2.html)
+- [vkGetCalibratedTimestampsKHR](https://registry.khronos.org/vulkan/specs/latest/man/html/vkGetCalibratedTimestampsKHR.html)

@@ -1,14 +1,14 @@
 //! Timing source classification for flip timing data.
 
-/// Identifies which Vulkan extension (or fallback) provided the timing data.
+/// Identifies the source and clock domain of one frame's `present_time`.
 ///
-/// This is written into every FlipInfo and CSV log so researchers always
-/// know the precision tier of their timing data.
+/// This is written into every `FlipInfo` and frame record. It is per-frame provenance, not the
+/// selected session backend; `RenderContext::timing_source()` reports backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum TimingSource {
-    /// VK_EXT_present_timing — hardware scanout timestamps + scheduled presents.
+    /// Scanout-domain evidence obtained through the EXT timing path.
     ExtPresentTiming,
-    /// CPU estimation via std::time::Instant around fence wait.
+    /// Host-clock observation after GPU completion or an unavailable scanout observation.
     CpuEstimate,
     /// No display at all — headless (offscreen) rendering. Frame times are
     /// synthesized from a nominal refresh interval, never measured. Data

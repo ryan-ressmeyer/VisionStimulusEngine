@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 /// Complete snapshot of host machine state at capture time.
 ///
-/// Returned by [`RenderContext::capture_host_info()`].
+/// Returned by [`RenderContext::capture_host_info()`](crate::core::RenderContext::capture_host_info).
 /// Serialize to JSON, TOML, or any serde-supported format.
 ///
 /// # Example
@@ -104,7 +104,7 @@ pub struct GpuInfo {
 /// behaviorally-observed fields on [`TimingCapabilities`], because the two disagreeing is exactly
 /// the situation VSE's driver-conformance posture exists to record. (It has also been the other
 /// way round: VSE once read `image_first_pixel_out` as unimplemented when the real cause was its
-/// own missing swapchain opt-in. See `docs/clock-synchronization.md` §6.)
+/// own missing swapchain opt-in. See `docs/timing-conformance.md`.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresentTimingSurface {
     /// Surface reports present timing can be queried on it at all.
@@ -128,11 +128,11 @@ pub struct PresentTimingSurface {
 /// See `docs/clock-synchronization.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimingCapabilities {
-    /// `VK_EXT_present_timing` — hardware scanout timestamps + scheduled presents.
+    /// Whether the device advertised `VK_EXT_present_timing` support.
     pub present_timing: bool,
     /// `VK_KHR_present_id2` — monotonic present-id correlation (required by present timing).
     pub present_id2: bool,
-    /// `VK_KHR_present_wait2` — block until a present is confirmed on screen (pacing).
+    /// `VK_KHR_present_wait2` — wait for presentation-engine completion for a present id.
     pub present_wait2: bool,
     /// `VK_EXT_calibrated_timestamps` / `VK_KHR_calibrated_timestamps` — the mechanism that
     /// correlates the GPU/present clock to a CPU clock.
@@ -145,26 +145,26 @@ pub struct TimingCapabilities {
     /// the dominant error term when mapping GPU timestamps onto the CPU clock. `None` if the
     /// measurement could not be taken (extension not enabled or domains unavailable).
     pub cpu_gpu_max_deviation_ns: Option<u64>,
-    /// **Behaviorally observed** (not just advertised): whether the driver actually fills
-    /// `IMAGE_FIRST_PIXEL_OUT` in `vkGetPastPresentationTimingEXT` feedback. `Some(false)` means
-    /// the driver advertises `VK_EXT_present_timing` but returns *zero-valued* scanout stage
-    /// timestamps (measured on Intel/ANV/Mesa 26.1) — a brand-new extension advertised before it
-    /// is fully implemented. VSE then derives `present_time` by sampling the calibrated
-    /// `PRESENT_STAGE_LOCAL` clock after `wait_for_present`. `None` until observed (no flips yet,
-    /// or the CPU-estimate backend). Populated from runtime observation at capture time.
+    /// **Behaviorally observed** (not just advertised): whether nonzero
+    /// `IMAGE_FIRST_PIXEL_OUT` values appeared in past-presentation feedback. `Some(false)` means
+    /// a full probe window contained only missing or zero stage values; it does not identify the
+    /// cause. Missing swapchain opt-ins and a blanked display must be excluded before attributing
+    /// this to a driver. Synchronous frames may use the qualified calibrated-clock fallback after
+    /// a successful present wait; buffered frames without feedback report `CpuEstimate`. `None`
+    /// means the observation is incomplete or unavailable.
     #[serde(default)]
     pub scanout_feedback_populated: Option<bool>,
-    /// **Behaviorally observed**: whether the driver enforces absolute present scheduling
-    /// (`VkPresentTimingInfoEXT.targetTime`). `Some(false)` means it advertises
-    /// `presentAtAbsoluteTime` but ignores the target — VSE software-paces scheduled flips against
-    /// the scanout clock regardless, so scheduling is correct either way. `None` until
+    /// **Behaviorally observed**: whether the tested display path held absolute present requests
+    /// (`VkPresentTimingInfoEXT.targetTime`). `Some(false)` means the unpaced characterization did
+    /// not observe requested multi-vblank holds. Synchronous experiment flips normally add
+    /// software pacing; buffered flips do not use that synchronous wait. `None` until
     /// characterized (the check disrupts frames, so it is not auto-run;
     /// `examples/13_direct_display_scanout` measures it with software pacing disabled).
     ///
     /// **This is per display path, not per driver.** On Intel/ANV/Mesa 26.1 it measured `true` on
     /// direct display (14/14 gaps held) but *intermittent* windowed, where the compositor mediates
     /// presentation. Characterize the path you actually record on. See
-    /// `docs/clock-synchronization.md` §6.
+    /// `docs/timing-conformance.md`.
     #[serde(default)]
     pub absolute_scheduling_enforced: Option<bool>,
     /// **Advertised, per surface**: what `VkPresentTimingSurfaceCapabilitiesEXT` reported for the
@@ -380,8 +380,8 @@ impl std::fmt::Display for HostInfo {
             observed(
                 t.scanout_feedback_populated,
                 "real (IMAGE_FIRST_PIXEL_OUT populated)",
-                "all-zero — check the swapchain present-timing opt-in and whether the display was \
-                 blanked before blaming the driver; present_time uses the calibrated scanout clock"
+                "all-zero — check swapchain opt-ins and display state; synchronous receipts may \
+                 use the calibrated-clock fallback, buffered receipts use CPU estimates"
             )
         )?;
         writeln!(
@@ -389,8 +389,8 @@ impl std::fmt::Display for HostInfo {
             "              absolute scheduling (targetTime): {}",
             observed(
                 t.absolute_scheduling_enforced,
-                "enforced by driver",
-                "NOT enforced on this display path; VSE software-paces scheduled flips"
+                "held by the tested display path",
+                "NOT observed on this display path; synchronous VSE flips retain software pacing"
             )
         )?;
         if let Some(dev) = t.cpu_gpu_max_deviation_ns {

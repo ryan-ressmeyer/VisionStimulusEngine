@@ -220,7 +220,7 @@ impl VSEContextBuilder {
         self
     }
 
-    /// Set presentation mode (`Fifo` is recommended for timing precision).
+    /// Set presentation mode (`Fifo` is recommended for VSE timing workflows).
     pub fn with_present_mode(mut self, mode: PresentMode) -> Self {
         self.config.present_mode = mode;
         self

@@ -1,7 +1,7 @@
 //! VisionStimulusEngine (VSE)
 //!
 //! A vision science stimulus presentation system built on Vulkan,
-//! designed for millisecond-accurate timing precision.
+//! designed to request, measure, and record timing evidence for visual stimuli.
 //!
 //! # Quick Start
 //!

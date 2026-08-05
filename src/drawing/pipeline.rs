@@ -196,7 +196,7 @@ impl RecordCtx {
 /// A user-implemented rendering pipeline (Tier 1).
 ///
 /// Implement this to teach VSE a new stimulus: [`build`](Self::build) compiles
-/// your own [`GraphicsPipeline`]s once (never on the presentation path), and
+/// your own [`GraphicsPipeline`]s once per registration, and
 /// [`record`](Self::record) records draws for the commands you enqueued this
 /// frame. Register an instance with
 /// [`RenderContext::register_pipeline`](crate::prelude::RenderContext::register_pipeline)
@@ -219,8 +219,8 @@ pub trait StimulusPipeline: 'static {
     /// [`GraphicsPipeline`]: vulkano::pipeline::GraphicsPipeline
     type Resources: 'static;
 
-    /// Build GPU resources once, at registration. Never on the presentation
-    /// path. Called exactly once, by
+    /// Build GPU resources once per registration. Call registration from a setup or state
+    /// initializer to keep this work off the presentation path. Called exactly once, by
     /// [`register_pipeline`](crate::prelude::RenderContext::register_pipeline).
     ///
     /// `self` carries whatever configuration the pipeline was constructed with;

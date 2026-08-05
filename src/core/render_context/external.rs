@@ -8,8 +8,9 @@ impl<'a> RenderContext<'a> {
     /// underlay beneath VSE's own draw commands; VSE remains sole present
     /// authority and `FlipInfo` is computed exactly as without a source.
     ///
-    /// Requires the `ExtPresentTiming` backend (the CPU-estimate path has no
-    /// seam for cross-device semaphore waits).
+    /// Displayed sessions require the EXT present engine because the CPU-estimate present path has
+    /// no seam for cross-device semaphore waits. Headless sessions can attach a compatible ring
+    /// through the offscreen submit path when the device supports the required external handles.
     ///
     /// `release_tx` is the consumer→producer slot-release back-edge: pass the
     /// sender half of [`vse_external_frame::release_channel`] and give the
@@ -27,7 +28,7 @@ impl<'a> RenderContext<'a> {
     }
 
     /// Attach an external-renderer frame source with an explicit consumption
-    /// policy. Use [`ExternalFramePolicy::LatestReadyHoldLast`] when VSE should
+    /// policy. Use [`ExternalFramePolicy::LatestReadyHoldLast`](crate::core::ExternalFramePolicy::LatestReadyHoldLast) when VSE should
     /// repeat the last displayed external image instead of dropping to a clear
     /// underlay on frames where no new producer frame has been queued.
     pub fn attach_external_frame_source_with_policy(

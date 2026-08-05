@@ -268,7 +268,7 @@ impl VSEContext {
     ///
     /// `render` builds one frame and returns its target and payload. VSE submits
     /// that frame after the callback returns. `confirm` later receives the same
-    /// payload with confirmed presentation timing.
+    /// payload with the retired submission's best available timing receipt.
     pub fn run_buffered<T, R, C>(
         self,
         config: BufferedConfig,

@@ -28,7 +28,7 @@ A single call to `capture_host_info()` returns a `HostInfo` struct containing:
 | **Runtime** | Username, display server (X11/Wayland), relevant environment variables (`DISPLAY`, `WAYLAND_DISPLAY`, `VK_ICD_FILENAMES`, `VK_LAYER_PATH`, `VK_LOADER_LAYERS_ENABLE`, `VK_INSTANCE_LAYERS`), process nice value | Environment variables, `/proc/self/stat` |
 | **EDID** | Raw hex, manufacturer code, model name, serial number, manufacture year, gamma | `xrandr --verbose` (optional, graceful fallback) |
 
-The **Swapchain** section is particularly important: it records the *actually negotiated* state, which may differ from what was requested. For example, you may request `Mailbox` present mode but the driver may fall back to `Fifo`.
+The **Swapchain** section records the negotiated state, which may differ from what was requested. For example, a requested `Mailbox` present mode may fall back to `Fifo`. The **Timing** section also keeps advertised capabilities separate from runtime observations; interpret those fields with [Timing conformance](timing-conformance.md).
 
 The two Vulkan **layer** variables under Runtime are timing provenance, not diagnostics. A loader-forced layer — the Khronos validation layer above all — is injected beneath the application and cannot be detected from inside the process, yet it intercepts every Vulkan call and degrades frame timing. A run with either variable set is **not valid timing data**; `HostInfo`'s `Display` prints a warning line when either is present. See `docs/debugging/vulkan_validation.md`.
 
@@ -91,12 +91,11 @@ if let Some(rate) = info.display.refresh_rate_millihertz {
     println!("Refresh rate: {:.2} Hz", rate as f64 / 1000.0);
 }
 
-// Check whether advertised present-timing features worked in this run
-if let Some(timing) = &info.timing {
-    println!("EXT present timing available: {}", timing.present_timing);
-    println!("Scanout feedback populated: {:?}", timing.scanout_feedback_populated);
-    println!("Absolute scheduling enforced: {:?}", timing.absolute_scheduling_enforced);
-}
+// Compare advertised support with observations from this run.
+let timing = &info.timing;
+println!("EXT present timing available: {}", timing.present_timing);
+println!("Scanout feedback populated: {:?}", timing.scanout_feedback_populated);
+println!("Absolute scheduling enforced: {:?}", timing.absolute_scheduling_enforced);
 ```
 
 ### Running the Example

@@ -44,38 +44,13 @@ context.run(move |vse| {
 })?;
 ```
 
-## Fullscreen & Compositor Latency
+## Fullscreen and timing
 
-**This section is critical for understanding timing precision in vision science experiments.**
+Window modes describe window-system policy; they do not establish timing conformance. Windowed, borderless-fullscreen, and exclusive-fullscreen behavior depends on the operating system, compositor, driver, and current surface state. A compositor may remain involved even when a window is called exclusive.
 
-In **windowed** and **borderless fullscreen** modes, all rendering passes through the operating system's compositor:
+VSE's compositor-free path is the separate `WindowMode::DirectDisplay` backend based on `VK_KHR_display`. Use [Display backends and direct display](display_backends.md) for setup and [Timing conformance](../timing-conformance.md#display-paths) for interpretation.
 
-- **Windows**: Desktop Window Manager (DWM)
-- **Linux**: Mutter (GNOME), KWin (KDE), or other Wayland/X11 compositors
-- **macOS**: Quartz Compositor
-
-The compositor composites your application's framebuffer with other windows (desktop, taskbar, notifications) before presenting the final image to the display. This process adds **at least one frame of latency** (16.7ms at 60Hz, 6.9ms at 144Hz) and can introduce **variable jitter** when other applications compete for compositor time.
-
-In **exclusive fullscreen** mode, your application's Vulkan swapchain presents **directly to the display's scanout buffer**, bypassing the compositor entirely. This provides:
-
-- **Eliminated compositor latency** — no extra frame of delay
-- **Deterministic timing** — no jitter from compositor scheduling
-- **Guaranteed vsync ownership** — your application controls the display refresh
-
-### Platform Notes
-
-| Platform | Exclusive Fullscreen | Recommendation |
-|----------|---------------------|----------------|
-| Linux (X11) | Fully supported | Use for experiments |
-| Linux (Wayland) | Not supported — falls back to borderless | Use X11 for timing-critical work |
-| Windows | Fully supported | Use for experiments |
-| macOS | Supported (with caveats) | Test timing on your hardware |
-
-### Recommendation
-
-- **Data collection / neural recording**: Always use `ExclusiveFullscreen`
-- **Development and debugging**: Use `Windowed` or `BorderlessFullscreen`
-- **Linux timing-critical experiments**: Run under X11, not Wayland
+Use ordinary window modes for development. Characterize the exact path before data collection rather than treating a mode name as proof of latency or scanout ownership.
 
 ## Monitor Selection
 
@@ -202,7 +177,7 @@ context.run(move |vse| {
 
 ## Event Queue (Timing-Precise Input)
 
-For experiments requiring exact input timing (reaction time measurement), use the event queue instead of polling. Each event carries a `Timestamp` from the VSE `Clock`, making it directly comparable to `FlipInfo` timestamps.
+For experiments requiring timestamped input, use the event queue instead of polling. Each event carries a host-clock `Timestamp` from the VSE `Clock`. It is directly comparable with a `CpuEstimate` receipt, but an `ExtPresentTiming` receipt is in the scanout domain and requires the opt-in host-clock bridge before comparison.
 
 ```rust
 use vision_stimulus_engine::core::InputEvent;
@@ -215,8 +190,17 @@ let stimulus_flip = vse.flip(None)?;
 // On a subsequent frame, check for responses
 for event in vse.input_events() {
     if let InputEvent::KeyDown { key_code: KeyCode::Space, timestamp, .. } = event {
-        let rt = timestamp.duration_since(stimulus_flip.present_time);
-        println!("Reaction time: {:.1} ms", rt.as_secs_f64() * 1000.0);
+        let onset_host = match stimulus_flip.timing_source {
+            TimingSource::CpuEstimate => Some(stimulus_flip.present_time),
+            TimingSource::ExtPresentTiming => vse.scanout_to_host(
+                ScanoutTimestamp::from_nanos(stimulus_flip.present_time.as_micros() * 1_000),
+            ),
+            TimingSource::Offscreen => None,
+        };
+        if let Some(onset_host) = onset_host {
+            let rt = timestamp.duration_since(onset_host);
+            println!("Reaction time: {:.1} ms", rt.as_secs_f64() * 1000.0);
+        }
     }
 }
 ```

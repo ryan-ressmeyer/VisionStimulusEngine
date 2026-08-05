@@ -49,9 +49,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vse.clear()?;
         let info = vse.flip(None)?;
 
-        // Print timing source on first frame
+        // Print both session backend and this receipt's timestamp source.
         if info.frame_number == 0 {
-            println!("Timing source: {}", vse.timing_source());
+            println!("Selected backend: {}", vse.timing_source());
+            println!("First receipt source: {}", info.timing_source);
         }
 
         recent_presents.push_back(info.present_time.as_micros());

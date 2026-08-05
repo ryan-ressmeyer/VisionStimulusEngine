@@ -147,7 +147,7 @@ impl DeviceSelector {
     ///
     /// Enables VK_KHR_display and the acquisition extensions
     /// (VK_EXT_acquire_drm_display, VK_EXT_acquire_xlib_display).
-    /// Returns the selector plus the Arc<Instance> needed by the direct display
+    /// Returns the selector plus the `Arc<Instance>` needed by the direct display
     /// acquisition code.
     #[cfg(target_os = "linux")]
     pub fn with_direct_display(

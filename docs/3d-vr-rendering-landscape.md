@@ -7,38 +7,18 @@ GPU-integration topology, and recorded the external-frame spike now implemented 
 `crates/vse-bevy` and `crates/vse-external-frame`. Corrections are patched inline and tagged
 **[2026-07-11]** / **[2026-07-12]**; the substantive additions are §5.4 (integration topology),
 the renderling entry in §7.4, the revised de-risk list in §8, and the spike results in §8.
-**Status:** Historical landscape survey plus implemented spike record
-**Scope:** How to add 3D-scene and (eventually) VR-haploscope rendering to VSE **without
-surrendering the hardware-verified presentation-timing guarantee** that is the project's
-reason to exist. Surveys game-engine internals, VR compositor pipelines, the reusable-3D
-subsystem landscape and its Rust ecosystem, and prior art in scientific stimulus software.
+**Status:** Historical landscape survey plus implemented spike record. It does not define current timing guarantees or driver capabilities.
+**Scope:** How to add 3D-scene and eventual VR-haploscope rendering while keeping VSE as the presentation and timing authority. Surveys game-engine internals, VR compositor pipelines, the reusable-3D subsystem landscape and its Rust ecosystem, and prior art in scientific stimulus software.
 Ends with a recommended direction (**custom haploscope panels + Bevy-rendered content +
 VSE-owned direct present**) and fully-documented alternatives.
 
-> This document is a research synthesis, decision map, and spike record. It is not the current
-> implementation guide. Use it for the architectural rationale behind the Bevy/external-frame
-> path; use [`docs/guides/external_rendering_timing.md`](guides/external_rendering_timing.md)
-> for current external-frame timing policies.
+> This document is a research synthesis, decision map, and spike record. It is not the current implementation or timing-conformance guide. Use it for architectural rationale, use [`docs/guides/external_rendering_timing.md`](guides/external_rendering_timing.md) for current external-frame policies, and use [`docs/timing-conformance.md`](timing-conformance.md) for the normative timing contract.
 
 ---
 
 ## 0. Context: what VSE is today
 
-VSE is a Rust + Vulkan (vulkano 0.35.2) stimulus engine whose entire value proposition is
-**deterministic, hardware-verified frame timing**:
-
-- `VK_EXT_present_timing` on the present path (hardware-scheduled presents where the driver
-  enforces `targetTime`, per-present scanout timestamps, `VK_KHR_present_id2` correlation),
-  wired through hand-rolled minimal FFI because vulkano 0.35 predates the Vulkan 1.4
-  extensions.
-- Scanout-clock-native display timing. Host-clock conversion is an opt-in bridge for
-  host-originated events; acquisition alignment remains physical via photodiode and ADC.
-- A direct-display backend (`VK_KHR_display`) that takes exclusive control of a physical
-  display with no compositor in the path — the deterministic path for real experiments.
-- A "loud fallback" posture: `ExtPresentTiming` when available, else `CpuEstimate` with an
-  explicit warning written into every record. No silent degradation.
-- Per-frame verification artifacts in `FlipInfo` (`present_id`, `target_time`, `on_target`)
-  propagated into Parquet/CSV.
+VSE is a Rust + Vulkan stimulus engine that retains presentation authority when another renderer supplies pixels. Its displayed backend can request EXT present timing, correlate feedback by present id, and record per-frame timestamp provenance. Direct display removes compositor mediation from VSE's swapchain path. CPU estimates and offscreen timestamps remain explicit fallbacks. The exact guarantees and qualifications are maintained in [`docs/timing-conformance.md`](timing-conformance.md), not in this historical survey.
 
 Rendering today is **2D**: gabors, noise, textured primitives (`src/drawing/`). The question
 this document addresses is how to grow a **3D / VR** rendering capability on top of that
@@ -61,19 +41,11 @@ A game engine does two separable jobs:
 1. **Scene → pixels** — turn a 3D world (meshes, materials, lights, camera, animation,
    physics) into a finished image. This is the enormous, genuinely-hard body of work game
    engines have spent 25 years perfecting.
-2. **Pixels → photons** — get that finished image onto the panel at a specific moment and
-   report when it actually arrived. This is *exactly what VSE already does well* and what
-   game engines deliberately do badly.
+2. **Pixels → presentation evidence** — request presentation, retain frame identity, and report the strongest observed timing evidence. Panel light output remains a separate physical measurement.
 
-Game engines have no timing certainty because they **fuse** these jobs and let job #1's
-variability (shader-compile stutter, streaming hitches, dynamic resolution, temporal
-upscaling, GC stalls) leak into job #2. VSE's architecture inverts the priority: it owns
-job #2 with a hardware contract.
+General-purpose engines let scene-rendering variability such as shader compilation, streaming, dynamic resolution, and temporal processing affect frame readiness. VSE keeps the presentation request and receipt on its side of the external-frame boundary.
 
-**Therefore the merge is not "adopt a game engine and bolt timing on." It is: borrow job #1's
-machinery to render into an offscreen `VkImage`, and keep VSE's swapchain/present path as the
-*sole* owner of job #2.** The 3D renderer never touches the swapchain. It produces a finished
-frame; VSE decides when it scans out and timestamps when it did.
+The integration therefore borrows the scene renderer's machinery for an offscreen `VkImage` while keeping VSE as the sole swapchain and timing authority. The 3D renderer produces a finished frame; VSE submits it and records the resulting receipt.
 
 This is not a workaround — it is exactly how the industry wires VR. Bevy added
 `RenderTarget::TextureView` ([PR #8042](https://github.com/bevyengine/bevy/pull/8042))
@@ -167,8 +139,7 @@ abstraction: DXGI `GetFrameStatistics` (past-frame flip times, not photons-on-pa
 swapchain's present-at-timestamp API
 ([raphlinus: swapchain frame pacing](https://raphlinus.github.io/ui/graphics/gpu/2021/10/22/swapchain-frame-pacing.html),
 [MS: DXGI_FRAME_STATISTICS](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/ns-dxgi-dxgi_frame_statistics)).
-None is surfaced through Unity/Unreal, and all are request-not-guarantee. This is precisely
-the gap `VK_EXT_present_timing` closes — and it lives at the layer VSE owns, not the engine's.
+None is surfaced through Unity/Unreal. `VK_EXT_present_timing` gives the presentation layer explicit requests and feedback, while retaining implementation-dependent limits described by the Vulkan specification and VSE's conformance contract.
 
 ### 2.5 The philosophical difference, stated plainly
 
@@ -445,7 +416,7 @@ hook. Only the below-`Surface` HAL path preserves present control.
 ### Strategy C — Bevy rendering into *your* image (the recommended primary)
 
 This is the literal "merge": Bevy's mature scene graph, PBR, glTF pipeline, and culling render
-into a `VkImage` **you own and VSE presents with verified timing**. Mechanically it is
+into a `VkImage` **you own and VSE presents through its measured timing path**. Mechanically it is
 Strategy B's interop plus Bevy consuming the result:
 
 1. Create wgpu on VSE's `ash` device (Strategy B) — **[2026-07-11]** or, per §5.4 (now
@@ -463,7 +434,7 @@ Strategy B's interop plus Bevy consuming the result:
    not free-running). **[2026-07-11]** Also disable `PipelinedRenderingPlugin` (Bevy's detached
    render thread) so extract+render run inside `app.update()` on the calling thread — otherwise
    `update()` returns before the frame's GPU work has even been submitted.
-5. VSE presents the finished image on its own `VK_EXT_present_timing` path.
+5. VSE presents the finished image on its own timing backend and records per-frame evidence.
 
 - **Get for free:** the actual prize — Bevy 0.19's `bevy_pbr`, scene graph, `bevy_asset` glTF
   pipeline, culling, and the a-la-carte `bevy_ecs`/`bevy_math`/`bevy_asset` crates
@@ -781,8 +752,7 @@ design doc commits to C:
    the target hardware.
 3. **Queue QoS** — creating VSE's queue at `VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR` succeeds on the
    target driver and measurably protects the present deadline while the renderer is under load.
-4. **End-to-end verified timing** — one Bevy-rendered PBR scene presented by VSE with a
-   hardware scanout timestamp in `FlipInfo`.
+4. **End-to-end timing evidence** — one Bevy-rendered PBR scene presented by VSE, with the resulting `FlipInfo.timing_source` and display-path metadata recorded.
 
 Run the same spike against renderling (§7.4) for marginal extra cost — same wgpu seam, direct
 comparison. If the spike fails, the documented fallback is Strategy A pushed toward the rich end
@@ -814,8 +784,7 @@ pass slots in behind the same `ExternalFrameRing` API):
    `[LOW, MEDIUM]` global priorities — Mesa adds HIGH only with `CAP_SYS_NICE` (the reason
    SteamVR documents `setcap`). Outcome recorded as `queue_global_priority: "unavailable"` in
    `HostInfo.timing`; the deadline-protection measurement needs a privileged run or the AMD rig.
-4. **End-to-end verified timing: PASS.** The Bevy PBR scene presented under `run_buffered` on
-   the EXT present-timing backend; sustained-run stats in
+4. **Measured spike result.** The Bevy PBR scene presented under `run_buffered` on the EXT backend; this result characterized that dated windowed setup and did not create a portable timing guarantee. Sustained-run stats in
    `crates/vse-bevy/examples/01_bevy_ring_demo.rs` (header).
 
 Validation-layer runs (added later on 2026-07-12): no external-memory or semaphore lifecycle
@@ -866,8 +835,9 @@ remaining baseline: `VUID-StandaloneSpirv-None-10684` ×10 (shader layout pedant
 ## 10. References
 
 ### VSE internal
-- `docs/clock-synchronization.md` — scanout-clock model, host-clock bridge, and driver conformance notes.
-- `docs/timing.md` — timing philosophy and tiers.
+- `docs/timing-conformance.md` — normative timing contract and characterization requirements.
+- `docs/clock-synchronization.md` — scanout-clock model and host-clock bridge.
+- `docs/timing.md` — timing overview.
 - `docs/guides/display_backends.md` — direct-display (`VK_KHR_display`) architecture.
 - `docs/gpu-vendor-selection.md` — **[2026-07-11]** AMD vs. NVIDIA for the experiment rig
   (expands §3.5's "prefer Mesa AMD/Intel" note into full guidance).

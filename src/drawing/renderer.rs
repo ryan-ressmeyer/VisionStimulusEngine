@@ -457,7 +457,7 @@ struct TextureResources {
 /// The concrete command-buffer builder VSE records every frame into.
 ///
 /// This is the exact primary `AutoCommandBufferBuilder` used inside
-/// [`Renderer::render_with_underlay`]; a [`RenderContext::draw_custom`] closure
+/// `Renderer::render_with_underlay`; a [`RenderContext::draw_custom`] closure
 /// records into a `&mut FrameRecorder`. Exposing the concrete vulkano type
 /// intentionally couples VSE's public API to vulkano's version — the same
 /// accepted tradeoff as the [`device()`]/[`queue()`]/[`swapchain()`] escape

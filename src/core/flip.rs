@@ -10,7 +10,9 @@ use super::config::{FrameError, VSEError};
 use super::render_context::RenderContext;
 use super::state::missed_frame_status;
 use super::swapchain::SwapchainError;
-use crate::timing::{FlipInfo, Timestamp};
+use crate::timing::{
+    comparable_frame_duration, resolved_present_timing_source, FlipInfo, Timestamp,
+};
 
 /// Immutable metadata for one displayed-frame request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -417,12 +419,13 @@ impl<'a> RenderContext<'a> {
             (Some(target), Some(scanout)) => scanout.as_micros() >= target.as_micros(),
             _ => true,
         };
-        let frame_duration = self
-            .state
-            .target
-            .present_expect_mut()
-            .last_present_time
-            .map(|previous| present_time.duration_since(previous));
+        let timing_source =
+            resolved_present_timing_source(estimated.timing_source, scanout_present.is_some());
+        let frame_duration = comparable_frame_duration(
+            self.state.target.present_expect().last_present_time,
+            present_time,
+            timing_source,
+        );
         self.state
             .target
             .present_expect_mut()
@@ -437,7 +440,7 @@ impl<'a> RenderContext<'a> {
 
         FlipInfo {
             frame_number: estimated.frame_number,
-            timing_source: estimated.timing_source,
+            timing_source,
             submit_time: estimated.submit_time,
             present_time,
             present_id: estimated.present_id,
@@ -497,12 +500,15 @@ impl<'a> RenderContext<'a> {
             .present_expect_mut()
             .timing_provider
             .record_present_time(&self.state.clock);
-        let frame_duration = self
-            .state
-            .target
-            .present_expect_mut()
-            .last_present_time
-            .map(|prev| present_time.duration_since(prev));
+        let timing_source = resolved_present_timing_source(
+            self.state.target.present_expect().timing_provider.source(),
+            false,
+        );
+        let frame_duration = comparable_frame_duration(
+            self.state.target.present_expect().last_present_time,
+            present_time,
+            timing_source,
+        );
         self.state
             .target
             .present_expect_mut()
@@ -518,7 +524,7 @@ impl<'a> RenderContext<'a> {
 
         FlipInfo {
             frame_number: estimated.frame_number,
-            timing_source: estimated.timing_source,
+            timing_source,
             submit_time: estimated.submit_time,
             present_time,
             present_id: estimated.present_id,
@@ -535,7 +541,8 @@ impl<'a> RenderContext<'a> {
         if let Some(recording) = &mut self.state.recording {
             recording.on_flip(flip_info.clone());
         }
-        self.state.target.present_expect_mut().last_present_time = Some(flip_info.present_time);
+        self.state.target.present_expect_mut().last_present_time =
+            Some((flip_info.present_time, flip_info.timing_source));
         self.state.frame_number += 1;
         self.state.input.clear_events();
         flip_info

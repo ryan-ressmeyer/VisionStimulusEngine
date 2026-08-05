@@ -33,7 +33,8 @@ impl<'a> RenderContext<'a> {
     /// (`vkGetPastPresentationTimingEXT`).
     ///
     /// Each [`ScanoutFeedback`](crate::core::ScanoutFeedback) carries the correlating `present_id`
-    /// (matching [`FlipInfo::present_id`]) and the `IMAGE_FIRST_PIXEL_OUT` scanout time in the
+    /// (matching [`FlipInfo::present_id`](crate::timing::FlipInfo::present_id)) and the
+    /// `IMAGE_FIRST_PIXEL_OUT` scanout time in the
     /// driver's present-stage-local domain. Empty on the CPU-estimate path, and for a frame or two
     /// after a present while the driver has not yet recorded it. Rebasing these to a
     /// [`ScanoutTimestamp`](crate::timing::ScanoutTimestamp) is B3's job.
@@ -63,7 +64,8 @@ impl<'a> RenderContext<'a> {
     /// Convert a host-clock [`Timestamp`] (e.g. a key-press or network-event time) into scanout
     /// time, using the opt-in host-clock bridge.
     ///
-    /// Returns `None` unless the bridge is enabled ([`VSEContextBuilder::with_host_clock_bridge`]),
+    /// Returns `None` unless the bridge is enabled
+    /// ([`VSEContextBuilder::with_host_clock_bridge`](crate::core::VSEContextBuilder::with_host_clock_bridge)),
     /// warmed up, and the scanout epoch is established. This is the intended way to place
     /// host-originated events on the scanout timeline.
     pub fn host_to_scanout(&self, ts: Timestamp) -> Option<ScanoutTimestamp> {
@@ -101,16 +103,16 @@ impl<'a> RenderContext<'a> {
     /// Whether the driver was observed to actually populate `IMAGE_FIRST_PIXEL_OUT` in
     /// present-timing feedback, as opposed to merely advertising `VK_EXT_present_timing`.
     ///
-    /// `Some(true)` — real per-present scanout timestamps; `Some(false)` — feedback correlates by
-    /// present_id but carries zero-valued stage times (VSE falls back to sampling the calibrated
-    /// scanout clock; measured on Intel/ANV/Mesa 26.1); `None` — not yet determined (too few flips,
-    /// or the CPU-estimate backend). A guardrail against trusting an advertised-but-unimplemented
-    /// feature. See `docs/clock-synchronization.md`.
+    /// `Some(true)` means at least one nonzero per-present scanout timestamp was observed.
+    /// `Some(false)` means a full probe window contained only missing or zero stage values; this
+    /// does not identify whether the cause was configuration, display state, or driver behavior.
+    /// `None` means the observation is incomplete or unavailable. See
+    /// `docs/timing-conformance.md`.
     pub fn scanout_feedback_populated(&self) -> Option<bool> {
         self.state.target.present()?.scanout_feedback_populated
     }
 
-    /// Whether the driver was measured to enforce absolute `targetTime` scheduling.
+    /// Whether this display path was observed to hold absolute `targetTime` requests.
     ///
     /// `None` unless a characterization run called
     /// [`record_absolute_scheduling_enforced`](Self::record_absolute_scheduling_enforced) — the
@@ -122,8 +124,8 @@ impl<'a> RenderContext<'a> {
     /// **Driver characterization only.** Disable VSE's software pacing of scheduled presents, so
     /// `VkPresentTimingInfoEXT.targetTime` is the only thing that could hold a present back.
     ///
-    /// Experiments must not call this: with pacing off, scheduled flips land wherever the driver
-    /// decides, which on a non-enforcing driver is the next vblank regardless of the target. It
+    /// Experiments must not call this: with pacing off, synchronous scheduled flips depend on the
+    /// presentation path's handling of the target. It
     /// exists so [`record_absolute_scheduling_enforced`](Self::record_absolute_scheduling_enforced)
     /// can measure the hardware rather than measuring VSE's own pacing loop.
     pub fn set_software_present_pacing(&mut self, enabled: bool) {

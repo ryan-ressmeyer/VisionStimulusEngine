@@ -21,15 +21,15 @@ use crate::timing::FlipInfo;
 /// ```
 #[derive(Debug, Clone)]
 pub struct BufferedConfig {
-    /// Number of frames to pipeline ahead of confirmed GPU scanout.
+    /// Number of frames to pipeline ahead of the most recently retired submission.
     ///
     /// | `depth` | Swapchain images | Latency at 60 Hz | Recommended for |
     /// |---------|-----------------|------------------|-----------------|
     /// | `1`     | 2               | ~16 ms           | Most experiments (default) |
     /// | `2`     | 3               | ~33 ms           | High GPU utilization |
     ///
-    /// With `depth = 1`, the CPU is always one frame ahead of the last confirmed
-    /// scanout. When confirmation arrives for frame N, frame N+1 has already
+    /// With `depth = 1`, the CPU is one frame ahead of the last confirmation callback.
+    /// When confirmation arrives for frame N, frame N+1 has already
     /// been submitted to the GPU. Closed-loop updates in the confirmation callback
     /// take effect from frame N+2 onward.
     ///
@@ -75,10 +75,13 @@ impl<T> BufferedFrame<T> {
     }
 }
 
-/// One confirmed buffered presentation.
+/// One retired buffered submission paired with its payload and timing receipt.
+///
+/// “Confirmed” describes FIFO payload/submission correlation. Whether the receipt contains
+/// scanout evidence depends on `flip_info.timing_source`.
 #[derive(Debug)]
 pub struct ConfirmedFrame<T> {
-    /// Confirmed timing and presentation metadata.
+    /// Best available timing and presentation metadata for the retired submission.
     pub flip_info: FlipInfo,
     /// Payload returned by the render callback for this frame.
     pub payload: T,

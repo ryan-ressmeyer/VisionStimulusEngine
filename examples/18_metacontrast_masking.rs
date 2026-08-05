@@ -7,8 +7,9 @@
 //! mask (~2.6°) with a **star-shaped cutout** surrounds it — contours
 //! adjacent but non-overlapping — at a variable stimulus-onset asynchrony
 //! (SOA). Because the masking phenomenon is *driven by SOA*, this demo
-//! exercises VSE's millisecond-accurate flip scheduling, and the recorded
-//! scanout onset times validate it.
+//! exercises scheduled flips. Recorded receipts support scanout-domain analysis
+//! when their source is `ExtPresentTiming`; photon-onset validation still requires
+//! a photodiode.
 //!
 //! Task: 2AFC — report whether the target was a SQUARE (Left arrow) or a
 //! DIAMOND (Right arrow).
@@ -277,7 +278,7 @@ impl ExperimentState {
             .unwrap_or(REFRESH_HZ_FALLBACK);
         self.refresh_us = (1_000_000.0 / hz).round() as u64;
         println!(
-            "Display: {:.2} Hz (refresh {} µs) · timing source: {}",
+            "Display: {:.2} Hz (refresh {} µs) · selected backend: {}",
             hz,
             self.refresh_us,
             vse.timing_source()

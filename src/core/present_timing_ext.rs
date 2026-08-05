@@ -76,7 +76,7 @@ pub const TIME_DOMAIN_PRESENT_STAGE_LOCAL: i32 = 1000208000;
 // `VkPresentStageFlagBitsEXT`
 pub const PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT: u32 = 0x0000_0001;
 pub const PRESENT_STAGE_REQUEST_DEQUEUED_BIT: u32 = 0x0000_0002;
-/// First pixel of the image begins scanout — the "when photons start" timestamp for science.
+/// First pixel of the image begins scanout. Panel light output requires separate measurement.
 pub const PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT: u32 = 0x0000_0004;
 /// First pixel is visible on the panel (accounts for display latency).
 pub const PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT: u32 = 0x0000_0008;
@@ -253,10 +253,10 @@ impl PresentChain {
     }
 
     /// Build a **scheduled** present chain: request that the frame's `IMAGE_FIRST_PIXEL_OUT`
-    /// scanout hit at absolute time `target_time_ns` in the time domain `time_domain_id` (the
-    /// swapchain's `PRESENT_STAGE_LOCAL` domain). `flags = 0` selects **absolute** scheduling
-    /// (requires the `presentAtAbsoluteTime` feature); the driver presents at the first refresh
-    /// cycle whose scanout is at or after the target. Still requests all scanout stages for
+    /// stage align with absolute `target_time_ns` in `time_domain_id` (the swapchain's
+    /// `PRESENT_STAGE_LOCAL` domain). `flags = 0` selects an absolute target and requires the
+    /// `presentAtAbsoluteTime` feature. The request is not proof that the path will hold the
+    /// present until that time. The chain still requests all scanout stages for
     /// feedback. Tagged with `present_id` for correlation.
     pub fn scheduled(present_id: u64, target_time_ns: u64, time_domain_id: u64) -> Box<Self> {
         Self::build(
@@ -322,7 +322,7 @@ impl PresentChain {
 
 // ─── Feedback parsing (vkGetPastPresentationTimingEXT results) ───────────────
 
-/// Parsed scanout timing for one presented frame (one [`PastPresentationTimingEXT`] record).
+/// Parsed scanout timing for one presented frame (one `PastPresentationTimingEXT` record).
 ///
 /// Times are in the record's own `time_domain` (normally `PRESENT_STAGE_LOCAL`, driver-epoch
 /// nanoseconds); rebasing to a [`ScanoutTimestamp`](crate::timing::ScanoutTimestamp) via the
@@ -331,7 +331,7 @@ impl PresentChain {
 pub struct ScanoutFeedback {
     pub present_id: u64,
     pub target_time: u64,
-    /// `IMAGE_FIRST_PIXEL_OUT` scanout-begin time — the "when photons start" timestamp.
+    /// `IMAGE_FIRST_PIXEL_OUT` scanout-begin time. This is not a photon-onset measurement.
     pub first_pixel_out_ns: Option<u64>,
     /// `IMAGE_FIRST_PIXEL_VISIBLE` time (accounts for display latency), if reported.
     pub first_pixel_visible_ns: Option<u64>,
@@ -738,11 +738,12 @@ pub struct SchedulingTrial {
     pub observed_vblanks: u64,
 }
 
-/// Decide whether the driver enforces absolute `targetTime` scheduling, from unpaced trials.
+/// Decide whether the tested display path holds absolute `targetTime` requests, from unpaced trials.
 ///
-/// A driver that ignores `targetTime` presents at the **next** vblank no matter how far ahead the
-/// target was, so `observed < requested` on every gap trial. A conformant driver holds the present
-/// until the target, giving `observed >= requested`.
+/// A path that ignores `targetTime` presents at the next opportunity regardless of a multi-vblank
+/// target, producing `observed < requested`. A path that holds the tested requests produces
+/// `observed >= requested`. This behavioral verdict does not redefine Vulkan conformance, because
+/// the extension does not provide a strict physical-timing guarantee.
 ///
 /// Only trials requesting more than one vblank can discriminate — a 1-vblank request lands at one
 /// vblank either way — so a run without them returns `None` (inconclusive) rather than a guess.
@@ -1168,7 +1169,7 @@ mod tests {
         assert_eq!(ti.flags, 0);
         assert_eq!(ti.target_time, target_ns);
         assert_eq!(ti.time_domain_id, domain_id);
-        // The target refers to the scanout-begin stage — when photons should start.
+        // The target refers to scanout begin, not measured photon onset.
         assert_eq!(
             ti.target_time_domain_present_stage,
             PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT

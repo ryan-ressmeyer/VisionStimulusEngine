@@ -1,6 +1,6 @@
 # Design: Flexible & User-Defined Rendering Pipelines
 
-**Status:** Historical design record. Tiers 1 and 2 shipped with the call-order change in §4-5. Audit 7 removed Tier 0 suite subselection and made the seven base 2D pipelines unconditional. Audit 7b moved controlled 3D into the separate `vse-3d` external-frame producer. Sections 1 and 3-8 retain the original problem statement and design sequence. `docs/guides/pipelines.md` describes current behavior.
+**Status:** Historical design record. Tiers 1 and 2 shipped with the call-order change in §4-5. Audit 7 removed Tier 0 suite subselection and made the seven base 2D pipelines unconditional. Audit 7b moved controlled 3D into the separate `vse-3d` external-frame producer. Sections 1 and 3-8 retain the original problem statement and design sequence. `docs/guides/pipelines.md` describes current behavior, and `docs/timing-conformance.md` defines current timing obligations.
 
 **Goal at the time:** Let users subselect built-ins, register their own pipelines, and record raw Vulkan draws inside VSE's frame while preserving timing determinism and teaching the pipeline model.
 

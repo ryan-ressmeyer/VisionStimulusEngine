@@ -13,12 +13,12 @@ User columns (from `record_frame()`) are empty/null for frames where
 |---|---|---|---|
 | `frame_number` | u64 | — | Monotonically increasing from 0 |
 | `present_time_us` | u64 | µs | Frame present timestamp (see `timing_source` and note below) |
-| `submit_time_us` | u64 | µs | GPU command buffer submission timestamp |
-| `timing_source` | string | — | `ExtPresentTiming` or `CpuEstimate` |
+| `submit_time_us` | u64 | µs | Host-clock GPU submission timestamp; not directly comparable with scanout-domain `present_time_us` |
+| `timing_source` | string | — | Per-frame timestamp source: `ExtPresentTiming`, `CpuEstimate`, or `Offscreen` |
 | `present_id` | u64 | — | `VK_KHR_present_id2` id for hardware feedback correlation; `0` on the CPU path |
 | `target_time_us` | u64/null | µs | Requested scanout target for scheduled flips; null for immediate presents |
-| `on_target` | bool | — | True when the confirmed scanout was at or after `target_time_us`; true for unscheduled or unconfirmed CPU-path frames |
-| `missed` | bool | — | True if this frame was dropped |
+| `on_target` | bool | — | True when comparable scanout evidence was at or after the target; also true by convention for unscheduled or unconfirmed frames, where it is not evidentiary |
+| `missed` | bool | — | Interval-based late-frame diagnostic; does not by itself prove a displayed frame was dropped |
 | `missed_count` | u32 | — | Number of display intervals missed (0 = on time) |
 | `skipped` | bool | — | True if frame was skipped (minimized/swapchain recreation) |
 | *(user columns)* | varies | user-defined | Populated from first `record_frame()` payload |
@@ -36,13 +36,13 @@ share this file, distinguished by the `stream` column.
 
 ### Note on `present_time_us` accuracy
 
-When `timing_source = ExtPresentTiming`, `present_time_us` is in the session's scanout-clock
-domain. VSE derives it from `IMAGE_FIRST_PIXEL_OUT` feedback when the driver populates that
-record, or from a calibrated scanout-clock sample taken immediately after `wait_for_present`
-when the driver advertises the feature but returns zero-valued feedback.
+When `timing_source = ExtPresentTiming`, `present_time_us` is in the session's scanout-clock domain. VSE derives it from nonzero `IMAGE_FIRST_PIXEL_OUT` feedback or, on the synchronous path, from a calibrated present-stage clock sample after a successful present wait. The latter inherits the implementation-dependent relationship between wait completion and presentation.
 
-When `timing_source = CpuEstimate`, `present_time_us` is a host-clock timestamp taken after the
-GPU fence signals. It confirms that rendering completed, but it does not prove display scanout.
+When `timing_source = CpuEstimate`, `present_time_us` is a host-clock observation. It confirms completion processing, not display scanout. This value can occur for an individual frame even when the session selected the EXT backend.
+
+When `timing_source = Offscreen`, `present_time_us` is synthesized from frame number and nominal refresh interval. No display presentation occurred.
+
+See [Timing conformance](../timing-conformance.md#timestamp-provenance) before comparing timing columns.
 
 ## Null Handling
 

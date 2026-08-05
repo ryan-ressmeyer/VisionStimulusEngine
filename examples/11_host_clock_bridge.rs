@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else if wall > 5.0 && !warned {
             warned = true;
             eprintln!(
-                "bridge never warmed up (source={:?}) — cannot verify.",
+                "bridge never warmed up (backend={:?}) — cannot verify.",
                 ctx.timing_source()
             );
         }

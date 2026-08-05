@@ -8,8 +8,8 @@
 //!   * the full `HostInfo` snapshot (GPU, driver, OS, behaviorally-observed
 //!     present-timing conformance), also written to `host_info.json`.
 //!
-//! Capturing this alongside experimental data is what makes a run auditable and
-//! reproducible on other hardware. It runs a brief warm-up so the observed
+//! Capturing this alongside experimental data makes the run auditable and helps
+//! compare later hardware without implying identical behavior. It runs a brief warm-up so the observed
 //! present-timing fields are populated, then exits.
 //!
 //! # Running

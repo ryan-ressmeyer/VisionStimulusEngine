@@ -20,8 +20,9 @@ use crate::data::messages::FrameMessage;
 use crate::data::ExperimentSession;
 use crate::drawing::renderer::Renderer;
 use crate::timing::{
-    Clock, CpuTimingProvider, ExtPresentTimingProvider, FlipInfo, HostClockBridge, ScanoutClock,
-    Timestamp, TimingProvider, TimingSource,
+    comparable_frame_duration, resolved_present_timing_source, Clock, CpuTimingProvider,
+    ExtPresentTimingProvider, FlipInfo, HostClockBridge, ScanoutClock, Timestamp, TimingProvider,
+    TimingSource,
 };
 
 /// Source of input events for the current session.
@@ -178,7 +179,9 @@ pub(super) struct PresentTarget {
     /// and looks them up by the confirming frame's `present_id` (see `build_confirmed_flip`).
     /// Pruned on lookup to stay bounded (present ids are monotonic).
     pub(super) scanout_by_present_id: std::collections::HashMap<u64, ScanoutFeedback>,
-    pub(super) last_present_time: Option<Timestamp>,
+    /// Last best-available present timestamp and its provenance. Intervals are computed only
+    /// between receipts in the same clock domain.
+    pub(super) last_present_time: Option<(Timestamp, TimingSource)>,
     /// `IMAGE_FIRST_PIXEL_OUT` scanout time (present-stage-local ns) of the last frame confirmed
     /// with hardware feedback, for computing scanout-delta missed detection on the buffered path.
     /// `None` until the first confirmed scanout record arrives.
@@ -199,8 +202,9 @@ pub(super) struct PresentTarget {
     pub(super) scanout_feedback_populated: Option<bool>,
     /// Count of feedback records seen while `scanout_feedback_populated` is still undetermined.
     pub(super) scanout_feedback_probe_count: u32,
-    /// Whether the driver enforces absolute `targetTime` scheduling. Not auto-probed (measuring it
-    /// requires deliberately dropping frames), so `None` unless a characterization run set it via
+    /// Whether this display path was observed to hold absolute `targetTime` requests. This is not
+    /// auto-probed because measurement requires deliberate multi-vblank gaps, so `None` unless a
+    /// characterization run set it via
     /// `RenderContext::record_absolute_scheduling_enforced`. Recorded into `HostInfo`.
     pub(super) absolute_scheduling_enforced: Option<bool>,
     /// Diagnostic escape hatch: when `false`, the sync EXT flip path does **not** software-pace
@@ -474,13 +478,13 @@ impl PresentTarget {
                 self.warned_feedback_stub = true;
                 warn!(
                     "VK_EXT_present_timing: present-timing feedback correlates by present_id but \
-                     every scanout stage timestamp is 0 (IMAGE_FIRST_PIXEL_OUT). present_time is \
-                     derived from the calibrated PRESENT_STAGE_LOCAL clock instead; scanout \
-                     timing stays valid. Historically this was VSE's own bug — a swapchain \
+                     every scanout stage timestamp is 0 (IMAGE_FIRST_PIXEL_OUT). synchronous \
+                     receipts may use the qualified calibrated-clock fallback; buffered receipts \
+                     use CpuEstimate. Historically this was VSE's own bug — a swapchain \
                      created without VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT has not opted \
                      into timing and the driver correctly reports nothing — so check the \
                      swapchain create flags before concluding the driver is at fault. See \
-                     docs/clock-synchronization.md §6."
+                     docs/timing-conformance.md."
                 );
             }
         }
@@ -519,13 +523,11 @@ impl PresentTarget {
     /// [`Timestamp`] (µs since `t=0`). `None` before the scanout epoch is established or on the
     /// CPU backend.
     ///
-    /// Used by the synchronous `flip()` immediately after `wait_for_present` returns — i.e. right
-    /// at this frame's scanout — to obtain a real scanout `present_time`. This is the fallback for
-    /// the (measured) case where the driver stubs `vkGetPastPresentationTimingEXT`'s stage times
-    /// to zero (Intel/ANV/Mesa 26.1): the feedback still correlates by `present_id` but carries no
-    /// timestamp, whereas the calibrated `PRESENT_STAGE_LOCAL` clock reports real, vblank-cadence
-    /// values. The sampled value is scanout-begin plus the calibrated-read latency (tens of µs —
-    /// far below the display-panel latency floor that a photodiode measures anyway).
+    /// Used by synchronous `flip()` after a successful present wait when per-present feedback is
+    /// unavailable. The value is a calibrated present-stage-local sample taken at wait completion,
+    /// not an `IMAGE_FIRST_PIXEL_OUT` timestamp for that present. Vulkan leaves the relationship
+    /// between wait completion and presentation implementation-dependent, so callers must retain
+    /// that qualification.
     pub(super) fn sample_scanout_now(&self) -> Option<Timestamp> {
         let clock = self.scanout_clock?;
         let sample = self.timing_provider.sample_present_calibration()?;
@@ -587,14 +589,14 @@ impl PresentTarget {
     }
 
     /// One-time guardrail note (per session) that scheduled presents are being software-paced,
-    /// since hardware `targetTime` enforcement is driver-dependent and unverified at runtime.
+    /// since `targetTime` behavior is display-path-dependent and unverified at runtime.
     pub(super) fn note_scheduling_once(&mut self) {
         if !self.warned_sw_pacing {
             self.warned_sw_pacing = true;
             info!(
-                "Scheduled present requested: VSE paces it against the scanout clock (software) \
-                 in addition to sending the hardware targetTime, so scheduling is correct either \
-                 way. Whether this driver/display path enforces targetTime itself is not verified \
+                "Scheduled present requested: the synchronous path paces before submission and \
+                 also sends targetTime. This reduces dependence on driver enforcement but does not \
+                 confirm scanout. Whether this display path holds targetTime itself is not verified \
                  at runtime — characterize it with `examples/13_direct_display_scanout` (reports \
                  absolute_scheduling_enforced)."
             );
@@ -603,14 +605,15 @@ impl PresentTarget {
 
     /// Software scanout-domain pacing for a scheduled flip (sync path only).
     ///
-    /// Many drivers advertise `presentAtAbsoluteTime` but do **not** enforce
-    /// `VkPresentTimingInfoEXT.targetTime` (measured: Intel/ANV/Mesa 26.1 ignores it), so VSE paces
-    /// the present itself. FIFO quantizes every present to a vblank, so we need only issue the
+    /// Hardware target behavior is path-dependent and is not automatically characterized, so the
+    /// synchronous path also paces submission in software. FIFO quantizes every present to a vblank,
+    /// so VSE aims to issue the
     /// present within the target vblank's preceding refresh interval — sleep on the scanout clock
     /// until then. The wait is a scanout-domain *duration* (≈ real time to within the ~2 ppm
     /// scanout↔CPU drift), so no absolute cross-clock math enters the loop. Harmless on drivers that
-    /// *do* honor `targetTime` — they would present at the same vblank; we just avoid submitting
-    /// early. No-op when the scanout clock isn't established yet, or the target is already imminent.
+    /// that honor `targetTime`; VSE also sends the target. No-op when the scanout clock is not
+    /// established yet or the target is already imminent. This reduces early submission but does
+    /// not establish that scanout met the target.
     pub(super) fn pace_to_scanout_target(&self, target: Timestamp, refresh: Duration) {
         let Some(now) = self.sample_scanout_now() else {
             return;
@@ -630,9 +633,9 @@ impl PresentTarget {
     ///
     /// On the EXT backend, keys on the frame's `present_id`: if this frame's
     /// `IMAGE_FIRST_PIXEL_OUT` record has arrived (it was presented `depth+1` frames ago, so it
-    /// normally has), `present_time` is the real hardware scanout time (rebased to the scanout
-    /// epoch) and missed detection uses the scanout delta; otherwise it falls back to CPU fence
-    /// time. `timing_source` records which domain the value is in.
+    /// normally has), `present_time` is the reported scanout time rebased to the session epoch and
+    /// missed detection uses the scanout delta. Otherwise it falls back to a CPU observation and
+    /// `timing_source` reports `CpuEstimate` for that frame.
     pub(super) fn build_confirmed_flip(&mut self, clock: &Clock, estimated: FlipInfo) -> FlipInfo {
         // Look up this frame's confirmed scanout record by present_id, pruning consumed/past
         // entries (present ids are monotonic, so anything ≤ this id is no longer needed).
@@ -642,26 +645,28 @@ impl PresentTarget {
         // scanout time" — filtered here so both present_time and missed detection below fall back
         // to the CPU clock rather than treating 0 as a timestamp.
         //
-        // Note: unlike the synchronous `flip()` path — which blocks on `wait_for_present` and can
-        // therefore sample the calibrated scanout clock at the frame's scanout — the buffered path
-        // is pipelined and never blocks per frame, so it can only use the driver's per-present
-        // feedback. Where that feedback is stubbed to 0 (Intel/ANV/Mesa 26.1), buffered
-        // `present_time` falls back to CPU time; it becomes scanout-native automatically on drivers
-        // that populate `IMAGE_FIRST_PIXEL_OUT`.
+        // Unlike the synchronous `flip()` path, which waits for presentation-engine completion
+        // and can then take a qualified present-stage clock sample, the buffered path is pipelined
+        // and never blocks per frame. It can only use the driver's per-present
+        // feedback. When that feedback is missing or zero, buffered `present_time` falls back to
+        // CPU time and the receipt reports CpuEstimate; it becomes scanout-native on frames with
+        // populated `IMAGE_FIRST_PIXEL_OUT`.
         let scanout_ns = scanout
             .and_then(|fb| fb.first_pixel_out_ns)
             .filter(|&ns| ns != 0);
 
-        // present_time is the hardware scanout time for this frame when available, else CPU fence
-        // time. `timing_source` (already ExtPresentTiming) plus a real scanout record is the domain
-        // guard; there is no separate field (see the B3 schema decision).
-        let confirmed_present = scanout_ns
-            .and_then(|ns| self.scanout_present_time(ns))
-            .unwrap_or_else(|| self.timing_provider.record_present_time(clock));
+        // present_time is the scanout time for this frame when available, else a CPU observation.
+        // resolved_present_timing_source below records the corresponding per-frame domain.
+        let scanout_present = scanout_ns.and_then(|ns| self.scanout_present_time(ns));
+        let confirmed_present =
+            scanout_present.unwrap_or_else(|| self.timing_provider.record_present_time(clock));
 
-        let cpu_frame_duration = self
-            .last_present_time
-            .map(|prev| confirmed_present.duration_since(prev));
+        let timing_source = resolved_present_timing_source(
+            self.timing_provider.source(),
+            scanout_present.is_some(),
+        );
+        let cpu_frame_duration =
+            comparable_frame_duration(self.last_present_time, confirmed_present, timing_source);
 
         let expected = self
             .expected_frame_duration
@@ -704,7 +709,7 @@ impl PresentTarget {
 
         let flip = FlipInfo {
             frame_number: estimated.frame_number,
-            timing_source: self.timing_provider.source(),
+            timing_source,
             submit_time: estimated.submit_time,
             present_time: confirmed_present,
             present_id: estimated.present_id,
@@ -715,7 +720,7 @@ impl PresentTarget {
             skipped: false,
         };
 
-        self.last_present_time = Some(confirmed_present);
+        self.last_present_time = Some((confirmed_present, timing_source));
 
         flip
     }

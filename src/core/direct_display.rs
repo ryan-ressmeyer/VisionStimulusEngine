@@ -1,7 +1,7 @@
 //! Direct display mode — VK_KHR_display surface acquisition.
 //!
 //! Creates a VkDisplaySurfaceKHR that bypasses the OS compositor, giving VSE
-//! exclusive access to the physical display and direct vblank control.
+//! exclusive access to the physical display without a compositor in VSE's swapchain path.
 //!
 //! # Acquisition Cascade
 //!

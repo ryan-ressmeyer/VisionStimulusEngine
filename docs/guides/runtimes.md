@@ -1,6 +1,6 @@
 # Choosing a Runtime
 
-VSE provides synchronous, buffered, and offscreen runtimes. Choose the smallest runtime that provides the timing and state coordination your experiment needs.
+VSE provides synchronous, buffered, and offscreen runtimes. Choose the smallest runtime that provides the timing and state coordination your experiment needs. [Timing conformance](../timing-conformance.md#runtime-semantics) defines the evidence each runtime can return.
 
 | Runtime | Presentation | State model | Use it for |
 |---|---|---|---|
@@ -12,7 +12,7 @@ VSE provides synchronous, buffered, and offscreen runtimes. Choose the smallest 
 
 ## `run()`
 
-`run()` presents one frame and waits for confirmation before the callback continues.
+`run()` submits one frame and waits for its best available timing receipt before the callback continues.
 
 ```rust,ignore
 let mut contrast = 1.0;
@@ -55,7 +55,7 @@ Setup does not change the synchronous timing model. It keeps pipeline compilatio
 
 ## `run_buffered()`
 
-`run_buffered()` separates frame construction from confirmation. The render callback returns one `BufferedFrame<T>`. VSE submits it after the callback returns. The confirmation callback later receives the same payload in a `ConfirmedFrame<T>`.
+`run_buffered()` separates frame construction from retirement. The render callback returns one `BufferedFrame<T>`. VSE submits it after the callback returns. The confirmation callback later receives the same payload in a `ConfirmedFrame<T>`. The type name means payload/submission correlation is complete; inspect `flip_info.timing_source` to determine whether its timestamp is scanout evidence or a CPU estimate.
 
 ```rust,ignore
 context.run_buffered(

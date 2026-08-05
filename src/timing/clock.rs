@@ -10,13 +10,10 @@ use std::time::{Duration, Instant};
 ///
 /// # Cross-clock calibration
 ///
-/// For `VK_EXT_present_timing` we must both *emit* scheduled target times and *interpret*
-/// hardware scanout timestamps in the driver's chosen time domain. When that domain is
-/// `VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR` (the common case on Linux), the clock captures an
-/// absolute `CLOCK_MONOTONIC` reading at its epoch so VSE `Timestamp`s convert directly to
-/// and from absolute monotonic nanoseconds — putting `submit_time`, hardware `present_time`,
-/// scheduled targets, and any `CLOCK_MONOTONIC`-based external recording hardware in one
-/// comparable domain. See [`Clock::to_monotonic_nanos`] / [`Clock::from_monotonic_nanos`].
+/// This clock anchors host-originated `Timestamp`s to absolute `CLOCK_MONOTONIC` for input and
+/// interoperability. Display scanout uses the separate present-stage-local clock and
+/// [`ScanoutTimestamp`]. The opt-in host-clock bridge relates the two; they are not directly
+/// comparable merely because both values use `Timestamp` storage in `FlipInfo`.
 pub struct Clock {
     epoch: Instant,
     /// Absolute `CLOCK_MONOTONIC` nanoseconds at `epoch`, if readable on this platform.
@@ -45,23 +42,21 @@ impl Clock {
 
     /// Whether this clock could be anchored to `CLOCK_MONOTONIC` (Linux).
     ///
-    /// When `false`, the `CLOCK_MONOTONIC` time domain cannot be used for present-timing
-    /// scheduling/readback and the caller must fall back to another domain.
+    /// When `false`, absolute host-clock interoperation is unavailable.
     pub fn has_monotonic_anchor(&self) -> bool {
         self.epoch_mono_ns.is_some()
     }
 
     /// Convert a VSE [`Timestamp`] to an absolute `CLOCK_MONOTONIC` value in nanoseconds.
     ///
-    /// Used to emit `VkPresentTimingInfoEXT::targetTime` for a scheduled present.
-    /// Returns `None` if the clock has no monotonic anchor (non-Linux).
+    /// Used for host-clock interoperation. EXT target requests are converted through the
+    /// session's separate scanout clock. Returns `None` if no monotonic anchor is available.
     pub fn to_monotonic_nanos(&self, ts: Timestamp) -> Option<u64> {
         self.epoch_mono_ns
             .map(|e| e.saturating_add(ts.as_micros().saturating_mul(1_000)))
     }
 
-    /// Convert an absolute `CLOCK_MONOTONIC` nanosecond value (e.g. a hardware scanout
-    /// timestamp reported by the driver) into a VSE [`Timestamp`].
+    /// Convert an absolute `CLOCK_MONOTONIC` nanosecond value into a host-clock VSE [`Timestamp`].
     ///
     /// Returns `None` if the clock has no monotonic anchor (non-Linux). Saturates to zero
     /// for times at or before the clock epoch.

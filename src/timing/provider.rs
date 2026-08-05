@@ -14,7 +14,8 @@ use crate::core::present_timing_ext as pt;
 
 /// Abstracts timing backends for different Vulkan extensions.
 pub trait TimingProvider {
-    /// Which timing source this provider uses.
+    /// Which session backend this provider represents. Individual frame receipts can report a
+    /// CPU fallback even when this returns `ExtPresentTiming`.
     fn source(&self) -> TimingSource;
 
     /// Get the display refresh cycle duration.
@@ -58,13 +59,13 @@ pub trait TimingProvider {
         None
     }
 
-    /// Block until the present `present_id` has begun scanout (`vkWaitForPresent2KHR`), returning
-    /// `true` on `VK_SUCCESS`. Default: `false` (no present-wait support); the caller then falls
-    /// back to fence-signal time. Lets the synchronous `flip()` read this frame's real scanout time
-    /// once its feedback record has landed.
+    /// Wait for the presentation engine to complete the request identified by `present_id`,
+    /// returning `true` on `VK_SUCCESS`. Vulkan defines no precise timing relationship between
+    /// wait completion and presentation to the user. Default: `false`; the caller then falls back
+    /// to fence-signal time.
     ///
     /// **Caller contract:** only legal on a swapchain created with the present-wait2 opt-in flag
-    /// (see [`SwapchainManager::present_wait2_enabled`](crate::core::swapchain::SwapchainManager::present_wait2_enabled)) —
+    /// (see [`SwapchainManager::present_wait2_enabled`](crate::core::SwapchainManager::present_wait2_enabled)) —
     /// calling it otherwise is undefined behavior (a driver crash).
     fn wait_for_present(&self, _present_id: u64, _timeout_ns: u64) -> bool {
         false
@@ -183,10 +184,10 @@ pub struct CalibrationSample {
 /// **not** rely on a native `CLOCK_MONOTONIC` swapchain domain, which most drivers — including
 /// Intel/ANV — do not expose). See `docs/clock-synchronization.md`.
 ///
-/// `FlipInfo.present_time` is the real scanout time on this backend, rebased to the session's
-/// scanout `t=0` by the context (via `wait_for_present` on the sync path + the present-id-keyed
-/// feedback map on the buffered path). This provider's own [`record_present_time`](Self::record_present_time)
-/// is only the CPU fallback the context uses when the driver reports no scanout time (windowed).
+/// The context constructs a scanout-domain `FlipInfo.present_time` when it obtains per-present
+/// feedback or the synchronous calibrated-clock fallback after a successful present wait. A frame
+/// without either uses this provider's host-clock [`record_present_time`](Self::record_present_time)
+/// and reports `TimingSource::CpuEstimate`.
 pub struct ExtPresentTimingProvider {
     fns: pt::PresentTimingFns,
     device: vk::Device,
@@ -216,7 +217,7 @@ impl ExtPresentTimingProvider {
     /// # Safety
     ///
     /// The device must have been created with `VK_EXT_present_timing` enabled (see
-    /// [`crate::core::present_timing_ext::create_device_with_present_timing`]).
+    /// `create_device_with_present_timing`).
     pub unsafe fn new(
         device: &Arc<vulkano::device::Device>,
         swapchain: &Arc<vulkano::swapchain::Swapchain>,
@@ -287,14 +288,13 @@ impl ExtPresentTimingProvider {
         self.present_wait2
     }
 
-    /// Block until the present identified by `present_id` has begun scanout, or `timeout_ns`
-    /// elapses, via `vkWaitForPresent2KHR`.
+    /// Wait for the presentation engine to complete the request identified by `present_id`, or
+    /// for `timeout_ns` to elapse, via `vkWaitForPresent2KHR`.
     ///
-    /// Returns `true` only on `VK_SUCCESS` (the present actually scanned out) — after which the
-    /// driver's `vkGetPastPresentationTimingEXT` record for that `present_id` is available, so the
-    /// synchronous `flip()` can read a real scanout `present_time`. Returns `false` if present-wait2
-    /// is unavailable, the wait timed out, or the swapchain went out of date (caller falls back to
-    /// fence time).
+    /// Returns `true` only on `VK_SUCCESS`. The request may have taken effect or been replaced, and
+    /// Vulkan does not define an exact relationship between the return and presentation to the
+    /// user. VSE queries per-present feedback after the wait; if none is usable, the synchronous
+    /// path samples the calibrated present-stage clock and records that qualified fallback.
     ///
     /// # Safety of the underlying call
     ///
@@ -393,14 +393,14 @@ impl ExtPresentTimingProvider {
     /// Returns one [`ScanoutFeedback`](pt::ScanoutFeedback) per record the driver has ready,
     /// each carrying the `IMAGE_FIRST_PIXEL_OUT` scanout time (in the record's own time domain,
     /// normally `PRESENT_STAGE_LOCAL`) and the correlating `present_id`. **Empty** unless the
-    /// matching present attached `VkPresentTimingsInfoEXT` (see [`PresentChain`]) — that is what
+    /// matching present attached `VkPresentTimingsInfoEXT` (see internal `PresentChain`) — that is what
     /// tells the driver to record timing at all.
     ///
     /// **Destructive:** each record is *dequeued* from the driver's ring on read, so this must be
     /// called **at most once per frame** and its result cached — a second call the same frame
     /// returns nothing. `flip()` drains it once into `VSEState::recent_scanouts`.
     ///
-    /// [`PresentChain`]: pt::PresentChain
+    /// `PresentChain` is the internal owner of that per-present chain.
     pub fn query_scanouts(&self) -> Vec<pt::ScanoutFeedback> {
         /// Fixed per-record stage-array capacity: only ~4 present stages are defined, so 8 always
         /// holds every reported stage in a single fill call (no nested two-call sizing needed).
@@ -513,10 +513,8 @@ impl TimingProvider for ExtPresentTimingProvider {
     }
 
     fn record_present_time(&self, clock: &Clock) -> Timestamp {
-        // This is only the context's **fallback** when the driver reports no real scanout time
-        // (windowed compositor). The scanout-native present_time is assembled by the context from
-        // `IMAGE_FIRST_PIXEL_OUT` feedback (see `VSEState::scanout_present_time`); on the direct-
-        // display path that path is taken and this is never used.
+        // Host-clock fallback used whenever this frame has no usable scanout-domain observation.
+        // The receipt must report TimingSource::CpuEstimate even though the selected provider is EXT.
         clock.now()
     }
 

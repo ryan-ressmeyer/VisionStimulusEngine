@@ -1,185 +1,95 @@
-# Display Backends and Direct Display Mode
+# Display backends and direct display
 
-This guide explains how VSE interacts with the display stack on Linux,
-what compositors are, and how to set up direct display mode for
-timing-critical experiments.
+VSE can present through a window system or acquire a physical display through `VK_KHR_display`. The normative distinction between these paths is defined in [Timing conformance](../timing-conformance.md#display-paths).
 
----
+## Compositor-mediated backends
 
-## What Is a Compositor?
+A normal Wayland or X11 application submits images to a presentation engine controlled by the window system. A compositor may combine the application image with other content before the display controller scans it out.
 
-A compositor is the OS process responsible for managing all on-screen windows
-and driving the physical display. When your application renders a frame, it
-does not write directly to the screen — it hands a GPU buffer to the
-compositor, which decides when and how to present it alongside other windows.
-
-The compositor sits between your application and the display hardware:
-
-```
-Your App → GPU buffer → Compositor → Display Controller → Monitor
+```text
+VSE → swapchain presentation → compositor/window system → display controller → panel
 ```
 
-This design is great for general-purpose desktops (smooth window management,
-effects, multi-app coordination) but introduces problems for timing-critical
-experiments because the compositor schedules scanout independently of your
-`flip()` call.
+`VK_EXT_present_timing` can still be available on a compositor-mediated surface. Its availability does not prove compositor bypass, target enforcement, or photon timing.
 
----
+VSE reports the active backend through `vse.display_backend()`:
 
-## Common Compositors by Environment
+- `DisplayBackend::Wayland` identifies a native Wayland window;
+- `DisplayBackend::X11` identifies an X11 or XWayland window;
+- `DisplayBackend::DirectDisplay` identifies the `VK_KHR_display` path.
 
-| Desktop Environment | Compositor | Notes |
-|---|---|---|
-| GNOME (Ubuntu default) | Mutter | Wayland-native; XWayland for X11 apps |
-| KDE Plasma | KWin | Wayland or X11 mode |
-| Ubuntu 22.04+ | Mutter + XWayland | Default session is Wayland |
-| Ubuntu 20.04 | Mutter (X11 mode) | X11 session with compositor |
-| Sway / Hyprland | sway / Hyprland | Tiling Wayland compositors |
-| Headless / TTY | None | No compositor — ideal for experiments |
+Do not assign a fixed jitter number to a backend name. Compositor version, fullscreen state, other windows, variable refresh, driver, and display configuration all affect measured behavior.
 
----
+## Direct display
 
-## VSE Display Backends
+`WindowMode::DirectDisplay` asks VSE to acquire and present to a physical display without a compositor in its swapchain path:
 
-VSE reports the active backend via `vse.display_backend()`:
+```text
+VSE → VK_KHR_display surface → display controller → panel
+```
 
-### `DisplayBackend::Wayland`
+This path removes compositor mediation. It does not guarantee driver scheduling enforcement, an awake panel, scanout feedback, panel latency, or sub-millisecond photon timing. Characterize the complete recording path and use a photodiode when light onset matters.
 
-Your app is a native Wayland client. The compositor (Mutter, KWin) mediates
-all frame presentation. `VK_EXT_present_timing` can still provide hardware-anchored
-feedback for the compositor-presented frame, but the compositor remains in the path.
-Typical jitter: 0.5–2 ms.
+Direct display is distinct from `WindowMode::ExclusiveFullscreen`. Exclusive fullscreen remains a window-system mode whose behavior is platform-dependent.
 
-### `DisplayBackend::X11`
+## Acquisition methods
 
-Your app is using the X11 protocol. On modern Ubuntu this means XWayland: an
-X11 compatibility server running inside the Wayland compositor, adding an extra
-hop. Timing jitter is higher than native Wayland.
+VSE tries configured acquisition methods in order:
 
-### `DisplayBackend::DirectDisplay`
+1. **No compositor.** A free display is acquired directly, commonly from a TTY.
+2. **DRM acquire.** `VK_EXT_acquire_drm_display` attempts acquisition through the GPU's DRM device.
+3. **Xlib acquire.** `VK_EXT_acquire_xlib_display` attempts acquisition through an X server.
 
-VSE has bypassed the compositor entirely via `VK_KHR_display`. Your GPU writes
-directly to the display controller's scanout buffer. The compositor has no
-involvement in frame delivery. Timing jitter is limited only by GPU and display
-hardware. This is the recommended mode for EEG/MEG and neural recording
-experiments.
+The successful method is recorded in runtime state. Availability and permissions differ across machines.
 
----
+## TTY workflow
 
-## Direct Display Mode
-
-### When to Use It
-
-- Neural recording experiments where stimulus onset timing must be accurate
-  to < 1 ms
-- Experiments where `FlipLogger` data shows excessive jitter in compositor mode
-- Labs with dedicated stimulus PCs separate from the experimenter's workstation
-
-### How It Works
-
-VSE uses the Vulkan `VK_KHR_display` extension to create a display surface
-that talks directly to the display controller, bypassing the compositor. Three
-acquisition methods are tried automatically:
-
-1. **No-compositor** — If no compositor is running (TTY session), the display
-   is unclaimed and VSE takes it directly. Simplest setup.
-
-2. **DRM acquire** (`VK_EXT_acquire_drm_display`) — VSE opens the GPU's DRM
-   device file and calls `vkAcquireDrmDisplayEXT`. Works in a Wayland session
-   if the user has permission.
-
-3. **Xlib acquire** (`VK_EXT_acquire_xlib_display`) — VSE connects to the
-   X server via `libX11.so` (loaded at runtime) and calls
-   `vkAcquireXlibDisplayEXT`. Works in X11/XWayland sessions.
-
----
-
-## Setup Instructions
-
-### Method 1: TTY Session (Simplest)
-
-Press **Ctrl+Alt+F2** to switch to a TTY before running your experiment.
-Log in, then run VSE. No compositor, no permissions required.
+Switch to a spare TTY, log in, and run the direct-display characterization example:
 
 ```bash
-# From TTY:
 cargo run --release --example 13_direct_display_scanout
 ```
 
-Switch back to your desktop with **Ctrl+Alt+F1** (or F7 on some systems).
+Return to the desktop with the appropriate virtual-terminal key for the machine. The example auto-terminates; avoid interrupting it in ways that bypass display restoration.
 
-### Method 2: DRM Acquire (Wayland / Desktop Session)
+## Permissions
 
-Add your user to the `video` group, then re-login:
+DRM acquisition may require access to `/dev/dri/card*`. Distribution policy commonly grants this through logind or the `video` group. Direct input uses `/dev/input/event*` and may require logind access or membership in the `input` group.
 
-```bash
-sudo usermod -aG video $USER
-# Log out and log back in
-```
-
-Verify group membership:
-
-```bash
-groups | grep video
-```
-
-Then run VSE normally from your desktop session. The DRM acquire probe will
-succeed automatically.
-
-### Method 3: Xlib Acquire (X11 / XWayland Session)
-
-If `DISPLAY` is set and you are in an X11 or XWayland session, VSE will
-attempt Xlib acquire automatically. No additional setup required, but
-it may require the video group permission as well depending on your compositor.
-
----
+If no input devices can be opened, VSE logs a warning and can continue for scripted experiments.
 
 ## Troubleshooting
 
-**Error: "No unclaimed display found — a compositor may be holding DRM master"**
-→ Try Method 1 (TTY) or Method 2 (video group + DRM acquire).
+**No unclaimed display found**
 
-**Error: "permission denied on /dev/dri/card0"**
-→ Run `sudo usermod -aG video $USER` and re-login.
+The compositor or another process may own the display. Use a spare TTY or verify DRM acquisition permissions.
 
-**Error: "libX11.so.6 not found"**
-→ Install X11: `sudo apt install libx11-6`
+**Permission denied on `/dev/dri/card*`**
 
-**Error: "XOpenDisplay returned NULL"**
-→ `DISPLAY` env var is not set. Either set it (`export DISPLAY=:0`) or use
-Method 1 or Method 2 instead.
+Check device ownership, active-session permissions, and local group policy. Re-login after changing groups.
 
-**Error: "VK_KHR_display not supported"**
-→ Your Vulkan driver does not support direct display. Update GPU drivers:
-  - NVIDIA: install latest proprietary driver
-  - AMD: update Mesa (`sudo apt upgrade`)
-  - Intel: update Mesa (`sudo apt upgrade`)
+**`libX11.so.6` not found**
 
----
+Install the runtime X11 library if the Xlib acquisition method is required.
 
-## Input in Direct Display Mode
+**`XOpenDisplay` returned `NULL`**
 
-Without a window manager, keyboard and mouse events are sourced directly from
-the Linux input subsystem (`/dev/input/event*`). VSE uses the `evdev` interface
-and maps events to the same `key_just_pressed()` / `mouse_position()` API as
-compositor modes.
+The Xlib method has no usable display connection. Use another acquisition method rather than inventing a `DISPLAY` value.
 
-**Permission requirement:** Your user must be in the `input` group:
+**`VK_KHR_display` unsupported**
 
-```bash
-sudo usermod -aG input $USER
-# Log out and log back in
-```
+The selected Vulkan driver does not expose the required direct-display extension. Use a supported driver or a characterized compositor-mediated path.
 
-If no input devices can be opened, VSE logs a warning but continues — useful
-for scripted experiments with no interactive input.
+## Required characterization
 
----
+Before collecting timing-critical data:
 
-## Further Reading
+1. disable screen blanking and power-saving behavior on the stimulus display;
+2. run examples 10–13 on the exact display path;
+3. capture `HostInfo` after warm-up;
+4. inspect advertised surface capabilities separately from observed feedback;
+5. characterize unpaced target enforcement if the experiment depends on driver scheduling;
+6. disable Vulkan validation layers for the recording run;
+7. validate panel output with a photodiode.
 
-- Vulkan specification: `VK_KHR_display` extension
-- Vulkan specification: `VK_EXT_acquire_drm_display`
-- Linux DRM/KMS documentation: https://www.kernel.org/doc/html/latest/gpu/drm-kms.html
-- Psychtoolbox priority mode (conceptual reference):
-  https://psychtoolbox.org/docs/Priority
+Repeat this process after changing the GPU, driver, kernel, compositor, cable path, monitor, refresh mode, or acquisition method.

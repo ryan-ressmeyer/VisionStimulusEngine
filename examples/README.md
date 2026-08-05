@@ -31,10 +31,10 @@ a fixed duration or frame count and print a summary.
 
 | # | Demo | What it shows |
 |---|------|---------------|
-| 06 | `timing_validation` | Frames land where they were scheduled |
-| 07 | `scheduled_onset` | Scheduling a flip at a target scanout time |
+| 06 | `timing_validation` | Inspect per-frame intervals, sources, and missed-frame diagnostics |
+| 07 | `scheduled_onset` | Request a target and inspect the resulting timing receipt |
 | 08 | `reproducibility_hash` | Seed → identical pixels across runs (hashed) |
-| 09 | `photodiode_sync` | Flashing patch + logged scanout onset times (DAQ alignment) |
+| 09 | `photodiode_sync` | Flashing patch + per-frame timing provenance for physical DAQ alignment |
 | 10 | `present_timing_internals` | `VK_EXT_present_timing` internals: `drift` / `feedback` / `buffered` modes |
 | 11 | `host_clock_bridge` | Scanout ↔ `CLOCK_MONOTONIC` calibration bridge |
 
@@ -43,7 +43,7 @@ a fixed duration or frame count and print a summary.
 | # | Demo | What it shows |
 |---|------|---------------|
 | 12 | `host_and_display_info` | Backend, monitors, video modes, `HostInfo` snapshot |
-| 13 | `direct_display_scanout` | Compositor-free direct display + B3 scanout timing (auth. test) |
+| 13 | `direct_display_scanout` | Direct-display B3 timing and target-path characterization |
 
 ## Interaction & experiments
 

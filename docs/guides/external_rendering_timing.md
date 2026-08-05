@@ -1,6 +1,6 @@
 # External Rendering Timing Policies
 
-External renderers such as `vse-3d` and Bevy produce pixels for VSE to present. VSE still owns the swapchain, scanout scheduling, and `FlipInfo`. The external renderer only fills imported images. Headless VSE consumes the same rings through its offscreen submission path and reads back the combined external frame and VSE overlays.
+External renderers such as `vse-3d` and Bevy produce pixels for VSE to present. VSE still owns the swapchain, timing requests, and `FlipInfo`. The external renderer only fills imported images. Headless VSE consumes compatible rings through its offscreen submission path and reads back the combined external frame and VSE overlays. [Timing conformance](../timing-conformance.md#external-frame-semantics) defines the boundary between content identity and presentation evidence.
 
 A display refresh imposes a hard deadline. If a frame is not ready before VSE submits the present, VSE must choose one of three outcomes:
 
@@ -161,7 +161,7 @@ For binary-per-slot and CPU-blocking producers, `frame.timeline_value` is `None`
 
 The async worker coalesces pending requests. If VSE asks for frames 10, 11, and 12 while Bevy is still rendering, the worker skips the stale requests and renders the newest pending frame. This keeps the external stream latency-oriented instead of building a backlog of obsolete scene states.
 
-With `LatestReadyHoldLast`, a missed producer deadline repeats the pinned frame rather than blocking the flip. VSE's scanout timing remains deterministic; the external content stream becomes opportunistic.
+With `LatestReadyHoldLast`, a missed producer deadline repeats the pinned frame rather than blocking on the producer. The external content stream becomes opportunistic. Inspect each `FlipInfo` to determine whether the resulting presentation met its target and whether its timestamp is scanout-domain.
 
 ### Runnable async verification example
 
@@ -193,7 +193,7 @@ Each confirmed frame prints the external-stream decision:
 - `stale_superseded > 0`: more than one ready Bevy frame was drained; older ready frames were safely consumed/released, but only the newest was displayed;
 - `producer`, `slot`, and `timeline` identify the displayed Bevy frame when available.
 
-A repeat is not a VSE timing failure. It means VSE preserved the flip deadline and held the previous external image instead of blocking on Bevy. Check `on_target` and `missed_count` separately for display-timing behavior.
+A repeat is not by itself a VSE timing failure. It means VSE held the previous external image instead of blocking on Bevy. Check `timing_source`, `on_target`, and `missed_count` separately for display-timing evidence; `on_target` is evidentiary only with a scanout-domain receipt.
 
 The example uses a 4-slot ring. That is the recommended starting point for `run_buffered(depth = 1)` plus `LatestReadyHoldLast`: one slot can be pinned for display, one can be in producer use, and the remaining slots cover the VSE submit/release pipeline. If the log shows long runs of repeated frames under a light scene, increase the ring length before treating it as a rendering-performance problem.
 

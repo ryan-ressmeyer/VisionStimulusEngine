@@ -4,9 +4,9 @@
 //! `DriftWaitDemo`: a panel of gratings that differ in spatial frequency,
 //! orientation, and waveform, all drifting by advancing phase each frame.
 //!
-//! Drift is driven by the *scanout* present time (not the frame index), so the
-//! temporal frequency is correct even if a frame is dropped — the
-//! `DriftWaitDemo` lesson. Press Escape to exit.
+//! Drift is driven by VSE's host monotonic clock rather than frame count, so
+//! phase advances with elapsed time even if a frame interval is missed. This
+//! is an animation policy, not a scanout-timing measurement. Press Escape to exit.
 //!
 //! # Running
 //!

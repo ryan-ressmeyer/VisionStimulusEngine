@@ -125,7 +125,10 @@ impl<'a> RenderContext<'a> {
         self.state.device_selector.device_name()
     }
 
-    /// Get the active timing source.
+    /// Get the selected session timing backend.
+    ///
+    /// An individual [`FlipInfo`](crate::timing::FlipInfo) can report `CpuEstimate` when this
+    /// returns `ExtPresentTiming` if that frame lacked usable scanout evidence.
     pub fn timing_source(&self) -> TimingSource {
         match &self.state.target {
             RenderTarget::Present(p) => p.timing_provider.source(),
@@ -133,7 +136,10 @@ impl<'a> RenderContext<'a> {
         }
     }
 
-    /// Get the timing clock (for correlating with external events).
+    /// Get VSE's host monotonic clock for host-originated events.
+    ///
+    /// Use the opt-in host-clock bridge before comparing these timestamps with scanout-domain
+    /// `FlipInfo` values.
     pub fn clock(&self) -> &Clock {
         &self.state.clock
     }

@@ -51,12 +51,13 @@ unchanged. An experiment's render closure can therefore run in both modes.
 `run_headless_with_setup(setup, sink, render)` mirrors `run_with_setup`. Build
 pipelines, attach external renderers, and load assets there rather than per frame.
 
-A headless context can import the same external image ring used by a displayed
-session. Its offscreen submission waits on the producer's GPU semaphore, blits
-the external image, draws VSE overlays, and copies the combined target to the
-readback buffer. This path remains offscreen and never calls displayed
-submission or presentation code. The `vse-3d` crate uses this path for 3D
-regeneration.
+A headless context can import a compatible external image ring used by a
+displayed session when the selected GPU supports the required external-memory
+and synchronization features. Its offscreen submission waits on the producer's
+GPU semaphore, blits the external image, draws VSE overlays, and copies the
+combined target to the readback buffer. This path remains offscreen and never
+calls displayed submission or presentation code. The `vse-3d` crate uses this
+path for 3D regeneration.
 
 ## What the sink receives
 
@@ -106,6 +107,9 @@ end and verifies the frames match.
 
 ## Timing is synthesized, never measured
 
+The normative interpretation of these fields is defined in
+[Timing conformance](../timing-conformance.md#headless-runtime).
+
 There is no display, so there is no scanout clock and no presentation to time.
 A headless `FlipInfo` carries:
 
@@ -130,8 +134,9 @@ against a wall clock would only make regeneration slower.
 - **No buffered mode.** `run_buffered` pipelines against vblank; there is no
   vblank. Headless flips are synchronous by nature: the readback is only valid
   once the GPU is done.
-- **No external-frame seam.** Attaching an external renderer's frame ring
-  requires the present-timing backend and returns an error headless.
+- **No display timing for external frames.** External rings can supply pixels,
+  but their headless consumption ends in offscreen readback and carries
+  `TimingSource::Offscreen` like every other headless frame.
 - **No monitors or window control.** `swapchain()` returns `None`,
   `available_monitors()` is empty, and `set_window_mode`/cursor calls are no-ops.
   Use `color_format()` — which answers in both modes — wherever you would have

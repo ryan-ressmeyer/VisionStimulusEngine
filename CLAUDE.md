@@ -98,53 +98,19 @@ The architecture should support multiple abstraction levels:
 
 ## Clock Model
 
-VSE is **intentionally agnostic about which clock an experiment ultimately synchronizes to**,
-and takes the same posture as Psychtoolbox. Three roles, and they must not be conflated:
+`docs/timing-conformance.md` is the normative timing contract. Do not introduce stronger guarantees in code comments, examples, or secondary guides.
 
-1. **The scanout clock is primary.** All display timing lives natively in the display/scanout
-   hardware clock (`VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT`, exposed by `VK_EXT_present_timing`).
-   Capture one scanout timestamp as `t=0` at session start; schedule every onset as `t0 + k·T`
-   and record actual scanout times in that same domain. **The host CPU clock does not enter the
-   core presentation loop** — there is zero cross-clock math on the critical path.
-   `FlipInfo.present_time` is a scanout-clock timestamp by default; a host-clock value is an
-   opt-in derived field, never the native one.
+Keep these distinctions explicit:
 
-2. **Alignment to acquisition hardware is physical, not software.** An ephys/DAQ box runs its
-   own clock, typically on a different machine. The canonical way to tie stimulus onset to that
-   clock is a **photodiode on a stimulus patch feeding the acquisition box's ADC** — one physical
-   event recorded in the acquisition clock. VSE never needs to know or estimate the acquisition
-   clock; its job is only to make onsets *deterministic and known in scanout time*, which the
-   photodiode then ties to acquisition time.
+- `RenderContext::timing_source()` reports the selected backend; `FlipInfo.timing_source` reports the source of that frame's timestamp.
+- A target is requested, while scanout feedback is observed. Neither is photon onset.
+- Synchronous EXT flips normally use software pacing plus a hardware target. Buffered targets use the pipelined driver queue without the synchronous pacing wait.
+- Present-wait completion is not a scanout timestamp. Prefer per-present `IMAGE_FIRST_PIXEL_OUT`; treat the synchronous calibrated-clock fallback according to the contract.
+- Advertised, enabled, observed, and actively characterized capabilities are separate facts and can vary by display path.
+- The host-clock bridge is opt-in and stays off the presentation hot path.
+- Photodiode measurement on the acquisition clock remains the authority for panel light output.
 
-3. **Host-clock synchronization is an opt-in tool.** Events that genuinely originate on the host
-   (key presses, network messages, anything the OS timestamps) arrive in CPU `CLOCK_MONOTONIC`
-   time and cannot be had in scanout time any other way. For those — and for host-only
-   behavioral experiments where the CPU clock *is* the response clock — VSE provides an opt-in
-   calibration bridge: a measured offset + drift-rate model between the scanout clock and
-   `CLOCK_MONOTONIC` (via `VK_KHR_calibrated_timestamps`). Measured on this hardware (Intel MTL /
-   ANV) the relative drift is a stable ~2 ppm, so the bridge is a lower-envelope sliding-window
-   linear fit, not a single offset. It is off the hot path and must be explicitly requested.
-
-**Driver conformance caveat.** `VK_EXT_present_timing` is new enough that a driver may *advertise*
-sub-features it has not *implemented*, so VSE verifies behaviorally, falls back correctly, and
-records what actually happened in `HostInfo.timing`. Never assume an advertised present-timing
-feature works — check `scanout_feedback_populated` / `absolute_scheduling_enforced`.
-
-**But check your own opt-ins first.** This project spent real time blaming Mesa/ANV for two
-present-timing "defects" — stubbed `IMAGE_FIRST_PIXEL_OUT` and unenforced `targetTime`. **Both were
-VSE's own bug:** the swapchain was created without `VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT`, so
-it had never opted into present timing. Fixed 2026-08-03 — feedback went 0/200 → 200/200, and
-`targetTime` went 14/14 ignored → 14/14 enforced on direct display. Vulkan validation had been
-reporting the exact VUIDs the whole time; they were dismissed as spec pedantry because it "worked
-anyway." Each Vulkan 1.4 present feature needs its own `VkSwapchainCreateInfoKHR` flag — see
-`pt::SwapchainOptIns`. **This driver now has no known present-timing conformance gap.**
-
-**Timing facts are per display path, not per driver.** The same machine enforces `targetTime` on
-direct display but only intermittently windowed, and advertises `presentAtRelativeTime` on direct
-display but not windowed. Characterize the path you actually record on.
-
-See `docs/clock-synchronization.md` for the full model, error budget, the drift measurement, and the
-driver-conformance table (§6).
+The corrected 2026-08-03 reference measurement found no known present-timing conformance gap after VSE enabled the required swapchain timing bit. Never revive the earlier ANV-defect claim without new evidence and validation-clean controls.
 
 ## Related Projects
 

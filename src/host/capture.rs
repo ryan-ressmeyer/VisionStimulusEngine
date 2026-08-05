@@ -331,7 +331,7 @@ pub fn capture_timing_capabilities(device: &Arc<Device>) -> TimingCapabilities {
 pub struct ObservedPresentTiming {
     /// Whether feedback records carried a non-zero `IMAGE_FIRST_PIXEL_OUT` (see field docs).
     pub scanout_feedback_populated: Option<bool>,
-    /// Whether absolute `targetTime` scheduling was observed to be enforced (see field docs).
+    /// Whether this display path was observed to hold absolute `targetTime` requests.
     pub absolute_scheduling_enforced: Option<bool>,
     /// What the surface advertised about present timing (see [`PresentTimingSurface`]).
     pub present_timing_surface:

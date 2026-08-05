@@ -79,10 +79,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// * **reported** — the driver put an `IMAGE_FIRST_PIXEL_OUT` entry in the record's stage array.
 /// * **populated** — that entry carries a *nonzero* timestamp.
 ///
-/// A driver that advertises `VK_EXT_present_timing` but stubs the stage clocks reports the stage
-/// with `time == 0`, so a plain `Option::is_some()` test says "true" on exactly the driver the
-/// check exists to catch. `VSEState::observe_feedback_conformance` uses the nonzero test; this
-/// mirrors it so the example and the library cannot disagree.
+/// A timing record can include the stage with `time == 0`, so a plain `Option::is_some()` test
+/// would mistake a non-timestamp for scanout evidence. `VSEState::observe_feedback_conformance`
+/// uses the nonzero test; this mirrors it so the example and the library cannot disagree. A zero
+/// result alone does not identify the cause; check swapchain opt-ins and display state first.
 #[derive(Default)]
 struct FirstPixelOut {
     /// Records whose stage array contained `IMAGE_FIRST_PIXEL_OUT` at all.
@@ -116,8 +116,8 @@ impl FirstPixelOut {
         match self.sample_ns {
             Some(ns) => println!("  first nonzero sample   : {ns} ns (present-stage-local)"),
             None if self.reported > 0 => println!(
-                "  → driver STUBS the stage clock (every reported time == 0): advertised, \
-                 not implemented"
+                "  → every reported stage time was 0; check swapchain opt-ins and display state \
+                 before investigating driver behavior"
             ),
             None => println!("  → driver never reported the stage at all"),
         }
@@ -143,7 +143,7 @@ fn mode_drift(secs: f64) -> Result<(), Box<dyn std::error::Error>> {
                 warned = true;
                 eprintln!(
                     "sample_present_calibration() returned None — present-stage calibration \
-                     unavailable on this path (source={:?}). Nothing to measure.",
+                     unavailable on this path (backend={:?}). Nothing to measure.",
                     ctx.timing_source()
                 );
             }
@@ -357,7 +357,7 @@ fn report_feedback(
     first_pixel_out: &FirstPixelOut,
 ) {
     println!("\n──────── Raw Present + Feedback (B1) ────────");
-    println!("timing source           : {source:?}");
+    println!("selected backend        : {source:?}");
     println!("flips                    : {}", present_ids.len());
     println!(
         "present_id range         : {}..={}",
@@ -491,7 +491,7 @@ struct Verify {
 
 fn report_buffered(s: &Verify, rendered: u32, depth: usize) {
     println!("\n──────── Buffered Present-Id (B2) ────────");
-    println!("timing source            : {:?}", s.source);
+    println!("selected backend         : {:?}", s.source);
     println!("depth                    : {depth}");
     println!("rendered / presented     : {rendered} / {}", s.presented);
     println!("present_id non-zero      : {}", !s.zero_present_id);

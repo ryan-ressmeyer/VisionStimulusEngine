@@ -100,7 +100,9 @@ context.run_with_setup(
 )?;
 ```
 
-`register_pipeline` runs your `build` immediately, and driver pipeline creation can cost tens of milliseconds when its shader cache is cold. `run_with_setup` invokes its setup closure once after the GPU exists but before frame 0, which keeps that cost off the presentation path. Registering before the run loop is not possible at all: choosing a presentation-capable Vulkan device requires a surface, and a surface requires a window.
+`register_pipeline` runs your `build` immediately, and driver pipeline creation can cost tens of milliseconds when its shader cache is cold. Call it from a setup or state-initialization closure. `run_with_setup` invokes setup once after the GPU exists but before frame 0, which keeps that cost off the presentation path. The API cannot prevent registration from a per-frame callback, so setup-time construction is an experiment obligation rather than an automatic timing guarantee. Registering before the run loop is not possible because choosing a presentation-capable Vulkan device requires a surface, and a surface requires a window.
+
+See [Timing conformance](../timing-conformance.md#stimuluspipeline-timing-obligations) for the boundary between VSE's pipeline invariants and user recording costs.
 
 The returned handle is `Copy`, and its type parameter ties it to your `Command`, so `draw_with` accepts only matching parameters. A handle is also tagged with the context that issued it; using one against a different `VSEContext` returns `PipelineError::ForeignHandle` instead of resolving to whatever pipeline holds that slot.
 

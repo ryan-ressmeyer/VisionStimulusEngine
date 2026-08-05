@@ -1,8 +1,8 @@
 # Buffered Flips
 
-`run_buffered()` pipelines CPU and GPU work across frames. It correlates each submitted payload with one confirmed presentation result and exposes the reaction delay to the experiment.
+`run_buffered()` pipelines CPU and GPU work across frames. It correlates each submitted payload with one retired submission and its best available timing receipt, then exposes the reaction delay to the experiment.
 
-See [Choosing a Runtime](runtimes.md) before selecting a buffered API.
+See [Choosing a Runtime](runtimes.md) before selecting a buffered API. [Timing conformance](../timing-conformance.md#buffered-displayed-runtime) defines how to interpret buffered timing evidence.
 
 ## Presentation pipeline
 
@@ -79,15 +79,15 @@ The initializer runs after the GPU and final buffered swapchain exist but before
 
 `BufferedFrame::new(payload)` presents at the next available vblank.
 
-`BufferedFrame::at(target_time, payload)` requests a specific scanout-clock target. On the EXT path, VSE places the target in the present-timing chain. Buffered presentation leaves pacing to the pipelined driver queue.
+`BufferedFrame::at(target_time, payload)` requests a specific scanout-clock target. On the EXT path, VSE places the target in the present-timing chain when the scanout epoch and time-domain identifier are available. Buffered presentation leaves pacing to the pipelined driver queue; it does not use the synchronous software-pacing wait. Characterize target enforcement on the display path used for collection.
 
 ## Confirmation and timing
 
 On the `ExtPresentTiming` path, VSE assigns a `VK_KHR_present_id2` identifier to every successful present. It drains EXT feedback once after each buffered submission and caches records by present identifier. Confirmation uses the matching feedback record when the driver supplies `IMAGE_FIRST_PIXEL_OUT`.
 
-If per-present scanout feedback is unavailable, buffered confirmation falls back to the timing provider's CPU observation. `FlipInfo::timing_source` and recorded host capabilities describe the active timing path.
+If per-present scanout feedback is unavailable, buffered confirmation falls back to a CPU observation and that frame reports `TimingSource::CpuEstimate`, even when the session selected the EXT backend. `RenderContext::timing_source()` reports the selected backend; each `FlipInfo::timing_source` reports the timestamp source for that frame.
 
-On the `CpuEstimate` path, confirmation follows the GPU fence. This confirms rendering completion rather than physical scanout.
+A `CpuEstimate` confirmation follows GPU-fence retirement. It confirms rendering completion rather than physical scanout.
 
 ## Buffer depth
 

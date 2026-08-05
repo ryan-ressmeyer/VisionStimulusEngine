@@ -25,13 +25,11 @@ The project currently includes:
 
 ## Timing model
 
-Precise visual stimulus timing is the core reason this project exists. For many neuroscience experiments, the important timestamp is not when the CPU submitted a frame or when the GPU finished rendering it. The important timestamp is when display scanout began, because that is the best available proxy for when photons from that frame could reach the eye.
+VSE records the strongest timing evidence available for each frame. The preferred displayed backend uses `VK_EXT_present_timing`; individual receipts distinguish scanout-domain timestamps from CPU estimates. Headless receipts use synthesized `Offscreen` timing.
 
-VSE keeps display timing in the scanout-clock domain. The preferred backend is `VK_EXT_present_timing` with `VK_KHR_present_id2` correlation and `VK_KHR_present_wait2` pacing. `VK_GOOGLE_display_timing` was the earlier Linux/Android path and has been removed from VSE. CPU timestamps remain as a fallback for development and for drivers that do not provide usable present-timing behavior.
+Presentation targets are requests rather than proof of execution. Synchronous and buffered runtimes also use different pacing strategies. Display path, observed feedback, and explicit hardware characterization must accompany timing data. Scanout begin remains distinct from photon onset, which requires physical measurement.
 
-Driver support is checked behaviorally, not trusted from extension strings alone. On the current Intel ANV/Mesa reference stack, present-id and present-wait work, but past-presentation scanout timestamps are zero and absolute scheduled presentation is not enforced. VSE records those facts in host/session metadata, warns when it falls back, samples the calibrated scanout clock after present-wait when hardware feedback is missing, and uses software pacing when target-time scheduling is not enforced.
-
-The project reports timing fallbacks explicitly. A run that only has CPU estimates should not look equivalent to a run with scanout-domain timing.
+Read the normative [timing-conformance contract](docs/timing-conformance.md) before interpreting `FlipInfo` or recorded timing columns.
 
 ## Design direction
 
@@ -59,6 +57,7 @@ Some examples depend on display configuration, fullscreen behavior, or Linux-spe
 
 ## Guides
 
+- [Timing conformance](docs/timing-conformance.md)
 - [API imports and Audit 8 migration](docs/guides/api-surface.md)
 - [Choosing a runtime](docs/guides/runtimes.md)
 - [Buffered flips](docs/guides/buffered_flips.md)

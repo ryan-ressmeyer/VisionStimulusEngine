@@ -13,8 +13,8 @@
 //! `VSE_BEVY_FORCE_TIMELINE=1 CARGO_INCREMENTAL=0 cargo run -p vse-bevy --profile demo --example 03_async_latest_ready_demo -- [frames]`
 //!
 //! Interpret the per-frame log as the external-stream behavior, not as a VSE
-//! timing failure: repeated/pinned external frames mean VSE chose to flip on
-//! time rather than wait for Bevy.
+//! timing failure: repeated/pinned external frames mean VSE chose not to wait
+//! for Bevy. Inspect `FlipInfo` separately to determine display timing.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -224,7 +224,7 @@ impl FrameLog {
 
 fn report(s: &DemoState, requested: u64, sync_kind: SyncKind, timeline_forced: bool) {
     println!("\n──── Async Bevy latest-ready hold-last ────");
-    println!("timing source          : {:?}", s.timing_source);
+    println!("selected backend       : {:?}", s.timing_source);
     println!("frame sync             : {sync_kind:?}");
     println!("VSE_BEVY_FORCE_TIMELINE: {timeline_forced}");
     println!("requested / presented  : {requested} / {}", s.presented);

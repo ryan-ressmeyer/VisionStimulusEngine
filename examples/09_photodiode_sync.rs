@@ -6,16 +6,15 @@
 //!
 //! The canonical way to align stimulus onset to an ephys/DAQ clock is *physical*:
 //! put a **photodiode on a screen patch** and feed its output into the
-//! acquisition box's ADC. VSE's job is only to make onsets deterministic and
-//! **known in the scanout clock**, which the photodiode then ties to acquisition
-//! time. This demo does exactly that:
+//! acquisition box's ADC. VSE records its best per-frame timing receipt, while
+//! the photodiode supplies the panel-onset observation in acquisition time:
 //!   * a high-contrast patch in a screen corner toggles black↔white on a fixed
 //!     schedule (put the photodiode here),
 //!   * a central stimulus changes in lock-step with the patch, and
-//!   * every onset's `present_time` (a scanout-clock timestamp) is logged to CSV.
+//!   * every onset's `present_time` and `timing_source` are logged to CSV.
 //!
-//! No host-clock math is on the critical path: the recorded onset time is the
-//! native scanout timestamp from `flip()`. Press Escape to exit.
+//! `present_time` is scanout-domain only when `timing_source` is
+//! `ExtPresentTiming`; CPU fallbacks remain explicit. Press Escape to exit.
 //!
 //! # Running
 //!
@@ -36,7 +35,7 @@ struct OnsetRecord {
     onset_index: u64,
     frame_number: u64,
     patch_white: bool,
-    /// Scanout-clock timestamp of this onset (microseconds).
+    /// Timestamp of this onset; interpret its domain through `timing_source`.
     present_time_us: u64,
     timing_source: String,
 }
@@ -45,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     println!("Photodiode sync demo. Place the photodiode over the flashing corner patch.");
-    println!("Onset scanout timestamps are logged to photodiode_sync/. Escape to exit.\n");
+    println!("Onset timing receipts are logged to photodiode_sync/. Escape to exit.\n");
 
     let session = ExperimentSession::builder()
         .with_writer(CsvDataWriter::new("photodiode_sync/"))
@@ -103,15 +102,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vse.clear()?;
         let info = vse.flip(None)?;
 
-        // Log exactly one row at each onset (state change), keyed to the scanout
-        // present time of the frame that first showed the new state.
+        // Log one row at each state change, keyed to that frame's timing receipt.
         if last_logged_state != Some(patch_white) {
             vse.record_frame(OnsetRecord {
                 onset_index,
                 frame_number: info.frame_number,
                 patch_white,
                 present_time_us: info.present_time.as_micros(),
-                timing_source: vse.timing_source().to_string(),
+                timing_source: info.timing_source.to_string(),
             })?;
             last_logged_state = Some(patch_white);
             onset_index += 1;

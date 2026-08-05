@@ -76,8 +76,8 @@ impl<'a> RenderContext<'a> {
     /// Detect the display backend (windowing system) used for this session.
     ///
     /// Derived from the raw window handle type. Use this to warn users when
-    /// running under X11/XWayland, which has higher timing jitter than native
-    /// Wayland or direct display mode.
+    /// running under X11/XWayland. Backend names describe the presentation path; characterize
+    /// timing on the active path rather than assigning a fixed jitter ranking here.
     ///
     /// # Example
     /// ```no_run

@@ -3,11 +3,11 @@
 //! A headless Bevy app renders a deterministic PBR scene (cube translating
 //! around a circle, point light revolving overhead) on **its own wgpu Vulkan
 //! device** into a 3-slot ring of exported images. VSE imports the ring,
-//! blits each frame under its own draw commands, and presents with the full
-//! EXT present-timing machinery — the renderer never touches the swapchain.
+//! blits each frame under its own draw commands, and presents through VSE's
+//! EXT backend — the renderer never touches the swapchain.
 //!
-//! Pass/fail criteria (windowed):
-//!   1. timing source is `ExtPresentTiming`,
+//! Diagnostic criteria for this windowed path:
+//!   1. selected backend is `ExtPresentTiming`,
 //!   2. all requested frames rendered + presented (minus the usual ≤3 startup
 //!      skips), animation driven purely by VSE's frame counter,
 //!   3. zero (or explicitly-reported) missed frames over the run,
@@ -19,8 +19,8 @@
 //! Measured 2026-07-12 (Intel MTL/ANV/Mesa 26.1, windowed Wayland 60 Hz, release profile,
 //! BinaryPerSlot sync via the raw_vulkan_init shim): 999/1000 presented (1 startup skip),
 //! 999/999 on_target, 222–256 missed per 999 — statistically identical to the same-session
-//! no-producer baseline (examples/12: 241/999), so the handoff adds no measurable timing
-//! cost. Forcing CpuBlocking (`VSE_BEVY_FORCE_CPU_BLOCKING=1`) measured 185–194 in the same
+//! no-producer baseline (examples/12: 241/999); that dated comparison detected no additional
+//! cost from the handoff. Forcing CpuBlocking (`VSE_BEVY_FORCE_CPU_BLOCKING=1`) measured 185–194 in the same
 //! session: the per-frame stall paces the windowed loop slightly better by keeping fewer
 //! presents in flight. Caution comparing across desktop sessions: an earlier same-day
 //! CpuBlocking measurement gave 3–15/999 — windowed miss counts swing >10× with compositor/
@@ -137,7 +137,7 @@ struct Verify {
 
 fn report(s: &Verify, requested: u64, sync_kind: vse_external_frame::SyncKind) {
     println!("\n──────── Bevy external-frame ring ────────");
-    println!("timing source        : {:?}", s.source);
+    println!("selected backend     : {:?}", s.source);
     println!("frame sync           : {sync_kind:?}");
     println!(
         "queue priority       : {}",

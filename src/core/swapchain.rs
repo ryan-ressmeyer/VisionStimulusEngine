@@ -51,7 +51,7 @@ pub enum SwapchainError {
 /// Presentation mode (affects timing behavior)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PresentMode {
-    /// VSync - wait for vertical blank (best for timing precision)
+    /// FIFO presentation synchronized to refresh; recommended for VSE timing workflows.
     ///
     /// This mode ensures frames are presented at the display's refresh rate,
     /// providing the most predictable timing for vision science experiments.
@@ -299,7 +299,7 @@ impl SwapchainManager {
     }
 
     /// Whether the current swapchain was created with
-    /// [`SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT`](pt::SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT),
+    /// `SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT`,
     /// i.e. whether the `VK_EXT_present_timing` entry points are legal on it. Calling them without
     /// it is invalid usage even where it happens not to crash.
     pub fn present_timing_enabled(&self) -> bool {

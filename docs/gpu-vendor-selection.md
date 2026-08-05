@@ -2,16 +2,13 @@
 
 **Date:** 2026-07-11
 **Status:** Reference / hardware-selection guidance
-**Scope:** Which GPU vendor to put in a timing-critical experiment rig, and why. Written after
-the 3D-rendering research pass (see `docs/3d-vr-rendering-landscape.md`, especially §5.4); the
-conclusions apply to VSE generally, not just to the 3D work.
+**Scope:** Historical hardware-selection analysis written after the 3D-rendering research pass. Driver and display-path capabilities change; this document does not establish timing conformance. Use [Timing conformance](timing-conformance.md) and characterize the candidate rig.
 
 ---
 
 ## TL;DR
 
-For VSE, "AMD vs. NVIDIA" is really **"Mesa open-source driver stack vs. proprietary driver
-stack"** — and almost every guarantee VSE makes lives in the driver, not the silicon.
+For VSE, GPU selection also selects a driver, display stack, external-memory implementation, and maintenance model. None of those choices supplies a timing guarantee without measurement.
 
 **Recommendation: a midrange AMD (RDNA-class) dGPU for experiment rigs.** AMD keeps every layer
 of VSE's verified-timing story — present timing, direct scanout, buffer sharing, queue
@@ -36,11 +33,7 @@ the external-memory seam (landscape doc §5.4) and let AMD drive the displays.
 
 ## 1. Auditability — the decisive axis
 
-VSE's posture is *verify, don't trust the driver*: it already caught Intel/ANV advertising
-present-timing features it stubs (zeroed scanout-stage timestamps, unenforced `targetTime`) and
-worked around them behaviorally (see `CLAUDE.md` "Driver conformance caveat" and
-`docs/clock-synchronization.md` §6). That diagnosis was possible partly because Mesa's source is
-readable.
+VSE records advertised and observed behavior separately. The 2026-08-03 investigation initially blamed ANV for zero scanout-stage timestamps and ignored targets, but validation showed that VSE had omitted the required swapchain timing opt-in. Corrected runs populated feedback and enforced the tested direct-display targets. The episode supports validation and controlled measurement; it is not evidence of an ANV conformance defect.
 
 - **AMD on Linux means RADV**, which lives in the same Mesa tree as Intel's ANV and shares the
   same WSI (window-system integration — the code that connects Vulkan to the display system) and
@@ -62,15 +55,11 @@ Credit where due: NVIDIA co-authored the extension
 ([Khronos: the journey to state-of-the-art frame pacing](https://www.khronos.org/blog/vk-ext-present-timing-the-journey-to-state-of-the-art-frame-pacing-in-vulkan),
 [Phoronix: merged after five years](https://www.phoronix.com/news/VK_EXT_present_timing-Merged))
 and recent NVIDIA Linux drivers ship it
-([NVIDIA Vulkan driver page](https://developer.nvidia.com/vulkan-driver)). Availability is not
-the concern; **unverifiable implementation quality** is (§1). The ANV episode shows that
-*advertising* the extension and *implementing* its sub-features are different things — and on
-NVIDIA there is no source to check which one you got.
+([NVIDIA Vulkan driver page](https://developer.nvidia.com/vulkan-driver)). Availability alone does not establish behavior. Record enabled features and surface capabilities, run validation-clean behavior probes, and characterize the exact display path regardless of driver source model.
 
 ## 3. Direct display — disqualifying on NVIDIA today
 
-VSE's deterministic path for real experiments is `VK_KHR_display` direct scanout with no
-compositor in the path, and (for the future haploscope/HMD work) DRM leases — the kernel
+VSE's preferred path for characterized experiments is `VK_KHR_display` direct display with no compositor in its swapchain path. This removes one source of mediation but does not guarantee scheduling or panel timing. For future haploscope/HMD work, DRM leases are the kernel
 mechanism that lets one process borrow exclusive control of a display connector. On NVIDIA
 proprietary this is a documented mess:
 
@@ -152,4 +141,4 @@ and the Linux VR stack (Monado, SteamVR direct mode) is developed and tested Mes
 - [SteamVR-for-Linux #107 — global priority / CAP_SYS_NICE](https://github.com/ValveSoftware/SteamVR-for-Linux/issues/107)
 - [Collabora — implementing DRM format modifiers in NVK](https://www.collabora.com/news-and-blog/news-and-events/implementing-drm-format-modifiers-in-nvk.html)
 - [Psychtoolbox — flip-timestamp FAQ](https://github.com/Psychtoolbox-3/Psychtoolbox-3/wiki/FAQ:-Explanation-of-Flip-Timestamps)
-- VSE internal: `docs/3d-vr-rendering-landscape.md` (§3.5, §5.4), `docs/clock-synchronization.md` (§6), `CLAUDE.md` (driver-conformance caveat)
+- VSE internal: `docs/timing-conformance.md`, `docs/3d-vr-rendering-landscape.md` (§3.5, §5.4), `docs/clock-synchronization.md`

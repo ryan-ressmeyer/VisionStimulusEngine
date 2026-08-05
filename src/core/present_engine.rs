@@ -43,8 +43,8 @@ struct FrameSync {
 
 /// Absolute scanout-domain scheduling target for a present, passed to
 /// [`PresentEngine::submit_and_present`]. Expresses *when* the frame's `IMAGE_FIRST_PIXEL_OUT`
-/// scanout should occur, in the swapchain's `PRESENT_STAGE_LOCAL` time domain — the driver then
-/// schedules the present in hardware (`VkPresentTimingInfoEXT.targetTime`), replacing the CPU spin.
+/// scanout is requested, in the swapchain's `PRESENT_STAGE_LOCAL` time domain. The value is sent
+/// as `VkPresentTimingInfoEXT.targetTime`; enforcement depends on the presentation path.
 #[derive(Clone, Copy)]
 pub struct ScheduledTarget {
     /// Absolute present-stage-local nanoseconds at which scanout should begin.
@@ -185,7 +185,7 @@ impl PresentEngine {
     /// The submit waits on the slot's acquire semaphore at `COLOR_ATTACHMENT_OUTPUT` and signals
     /// the render-finished semaphore + the slot fence. The present waits on render-finished and
     /// attaches the timing `pNext` chain: [`PresentChain::scheduled`] with `target`'s absolute
-    /// scanout time when `Some` (hardware scheduling), else [`PresentChain::unscheduled`]
+    /// scanout-domain target when `Some`, else [`PresentChain::unscheduled`]
     /// (present-id + scanout timing request only).
     #[allow(clippy::too_many_arguments)] // mirrors the submit's actual shape; bundling obscures it
     pub fn submit_and_present(

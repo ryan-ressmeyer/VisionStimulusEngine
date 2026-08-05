@@ -4,11 +4,11 @@
 //! the display with no compositor in the path and drives it end to end. (It
 //! supersedes the earlier minimal "acquire + moving bar" direct-display demo.)
 //!
-//! The authoritative B3 test. On the direct-display path VSE owns the display (no compositor), so
-//! the synchronous `flip()` blocks on `vkWaitForPresent2KHR` until the frame begins scanout and
-//! reads its real scanout time. This example verifies, end to end:
+//! The direct-display B3 characterization. VSE owns this swapchain path without a compositor.
+//! Synchronous `flip()` waits for presentation-engine completion, then reads per-present feedback
+//! or the qualified calibrated-clock fallback described in `docs/timing-conformance.md`. The run checks:
 //!
-//!   1. timing source is `ExtPresentTiming`,
+//!   1. selected backend is `ExtPresentTiming`,
 //!   2. `present_id` is non-zero and strictly monotonic,
 //!   3. `present_time` is a real **scanout-domain** timestamp: monotonic, warmup deltas at the
 //!      panel's refresh cadence, and tracking the calibrated scanout clock — median
@@ -18,18 +18,18 @@
 //!      clock-model way); normal scheduled frames hold steady refresh cadence with `on_target`
 //!      true, and periodic **deliberate multi-vblank gaps** actually land that many vblanks later
 //!      (measured). VSE software-paces scheduled flips against the scanout clock, so this passes
-//!      whether or not the driver enforces `targetTime`.
-//!   5. **whether the *hardware* honors `targetTime`** — a separate, appended phase that runs with
-//!      VSE's software pacing **disabled**, so the hardware target is the only thing that could
-//!      hold a present back. It requests deliberate multi-vblank gaps and measures where scanout
-//!      actually lands; a non-enforcing driver presents at the next vblank regardless. The verdict
+//!      regardless of whether the display path holds `targetTime` on its own.
+//!   5. **whether this display path holds `targetTime` requests** — a separate, appended phase
+//!      runs with VSE's software pacing disabled. It requests deliberate multi-vblank gaps and
+//!      measures where scanout lands. The verdict
 //!      is recorded into `HostInfo.timing.absolute_scheduling_enforced`. Phases 1–4 cannot answer
 //!      this: with pacing on, an on-target gap only proves VSE's own pacing loop works.
 //!
 //! Scanout source: `present_time` prefers the driver's per-present `IMAGE_FIRST_PIXEL_OUT` feedback
 //! and falls back to sampling the calibrated `PRESENT_STAGE_LOCAL` clock after `wait_for_present`
 //! when feedback is all-zero. If you see the fallback, check the swapchain present-timing opt-in and
-//! whether the display was blanked before blaming the driver — see docs/clock-synchronization.md §6.
+//! whether the display was blanked before attributing the result to a driver — see
+//! docs/timing-conformance.md#capability-and-conformance-evidence.
 //!
 //! It records every flip to `b3_direct_display/frames.csv` and prints a PASS/FAIL summary. It
 //! **auto-terminates** after `[frames]` plus the characterization phase — no SIGINT (which bricks
@@ -48,13 +48,13 @@ const GAP_EVERY: u64 = 50;
 /// A gap event schedules this many vblanks ahead (vs 1 for a normal scheduled frame).
 const GAP_VBLANKS: u64 = 3;
 
-/// Frames appended after the main run to characterize whether the *hardware* honors
-/// `VkPresentTimingInfoEXT.targetTime`, with VSE's software pacing disabled.
+/// Frames appended after the main run to characterize whether this display path holds
+/// `VkPresentTimingInfoEXT.targetTime` requests, with VSE's software pacing disabled.
 ///
 /// This must be its own phase: while VSE paces scheduled presents itself, a gap landing on target
-/// only proves VSE's pacing loop works — the driver could be ignoring `targetTime` entirely and the
-/// result would look identical. With pacing off, a non-enforcing driver presents at the next vblank
-/// regardless of how far ahead the target was, which is the discriminator.
+/// only proves VSE's pacing loop works; the presentation path could ignore `targetTime` and produce
+/// the same result. With pacing off, a path that does not hold a multi-vblank request presents at
+/// the next opportunity, which is the discriminator.
 const ENFORCE_FRAMES: u64 = 90;
 /// Within the characterization phase, every Nth frame requests a multi-vblank gap.
 const ENFORCE_GAP_EVERY: u64 = 6;
@@ -128,7 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if source.is_none() {
             source = Some(vse.timing_source());
             eprintln!("Backend: {}", vse.display_backend().description());
-            eprintln!("Timing source: {}", vse.timing_source());
+            eprintln!("Selected backend: {}", vse.timing_source());
             eprintln!("Press Escape to exit early; auto-exits after {total} frames.");
         }
         if vse.key_just_pressed(KeyCode::Escape) {
@@ -198,7 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
 
-        // Compute the hardware target for scheduled frames from the fixed anchor.
+        // Compute the EXT target request for scheduled frames from the fixed anchor.
         let target = if scheduled {
             let anchor = *anchor_us.get_or_insert_with(|| last_present_us.unwrap_or(0));
             is_gap = sched_seq > 0 && sched_seq % GAP_EVERY == 0;
@@ -296,10 +296,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Report the hardware `targetTime` enforcement characterization.
+/// Report the display-path `targetTime` characterization.
 ///
-/// This is the only measurement that can distinguish a driver honoring `targetTime` from VSE
-/// pacing the present itself, because it runs with VSE's pacing disabled.
+/// This measurement separates path behavior from VSE's synchronous pacing because it runs with
+/// software pacing disabled.
 fn report_enforcement(trials: &[SchedulingTrial], verdict: Option<bool>) {
     println!("\n──────── Absolute scheduling (targetTime) enforcement ────────");
     println!("software pacing            : DISABLED for this phase");
@@ -318,8 +318,7 @@ fn report_enforcement(trials: &[SchedulingTrial], verdict: Option<bool>) {
         observed.sort_unstable();
         println!("observed vblank gaps       : {observed:?}");
     }
-    // A driver that honors targetTime only *sometimes* is the worst case for an experiment: it
-    // looks like it works. Call that out separately from a clean yes/no.
+    // Intermittent path behavior can look reliable, so report it separately from a clean result.
     let unstable = !trials.is_empty() && {
         let hit = trials
             .iter()
@@ -330,11 +329,11 @@ fn report_enforcement(trials: &[SchedulingTrial], verdict: Option<bool>) {
 
     match verdict {
         Some(true) => println!(
-            "VERDICT: targetTime IS enforced by the driver — presents were held to their target."
+            "VERDICT: this path held targetTime requests in the completed trials."
         ),
         Some(false) => println!(
-            "VERDICT: targetTime NOT enforced — presents landed at the next vblank regardless.\n\
-             VSE's software pacing (re-enabled outside this phase) is what makes scheduling work."
+            "VERDICT: this path did not hold targetTime requests — presents landed at the next opportunity.\n\
+             Synchronous VSE pacing is re-enabled outside this phase."
         ),
         None => println!(
             "VERDICT: inconclusive — no multi-vblank trials completed; cannot discriminate."
@@ -342,9 +341,8 @@ fn report_enforcement(trials: &[SchedulingTrial], verdict: Option<bool>) {
     }
     if unstable {
         println!(
-            "WARNING: enforcement was INCONSISTENT across trials (see the gaps above). A driver \
-             that honors targetTime only sometimes is more dangerous than one that never does — \
-             it looks reliable. Treat hardware scheduling as unusable here and keep VSE's software \
+            "WARNING: enforcement was INCONSISTENT across trials (see the gaps above). Treat \
+             targetTime behavior as unusable on this path and keep VSE's synchronous software \
              pacing on; re-run to confirm before recording any conclusion."
         );
     }
@@ -399,7 +397,7 @@ fn report(s: Summary) {
     let on_target_ok = s.scheduled_frames > 0 && s.on_target_true == s.scheduled_frames;
 
     println!("\n──────── Direct-Display Scanout Timing (B3) ────────");
-    println!("timing source          : {:?}", s.source);
+    println!("selected backend       : {:?}", s.source);
     println!("flips                  : {}", s.present_ids.len());
     println!(
         "present_id range       : {}..={}",
@@ -448,7 +446,7 @@ fn report(s: Summary) {
     if !is_ext {
         println!("SKIP: backend is {:?}, not ExtPresentTiming.", s.source);
     } else if pass {
-        println!("PASS ✔  scanout-domain present_time at vblank cadence + scheduled flips land on target (software-paced)");
+        println!("PASS ✔  scanout-domain receipts tracked vblank cadence and software-paced requests landed at/after target");
     } else {
         println!("FAIL x  see fields above");
     }

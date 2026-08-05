@@ -3,11 +3,11 @@ use super::*;
 impl<'a> RenderContext<'a> {
     /// Record per-frame experimental data merged with the most recent flip's timing.
     ///
-    /// In synchronous `run()`: call after `flip()`. Uses the confirmed present time
-    /// from the blocking fence wait.
+    /// In synchronous `run()`, call after `flip()`. The receipt contains the best timestamp VSE
+    /// obtained after processing completion and presentation feedback.
     ///
-    /// In `run_buffered()`: call inside the confirmation callback. Uses the confirmed
-    /// timing delivered with that frame.
+    /// In `run_buffered()`, call inside the confirmation callback. Inspect the delivered
+    /// `FlipInfo::timing_source`; a retired buffered submission need not have scanout feedback.
     ///
     /// The data struct must implement `serde::Serialize`. Multiple calls per frame
     /// are allowed — each produces one row keyed to the same `frame_number`.

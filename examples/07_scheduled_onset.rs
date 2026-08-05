@@ -30,24 +30,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_session(session)
         .build()?;
 
-    let mut last_present = None;
+    let mut last_scanout_present = None;
 
     context.run(move |vse| {
         vse.clear()?;
 
         // After warmup, schedule each flip one refresh cycle after the last
-        let target = last_present.map(|prev: Timestamp| {
-            // Target: previous present time + ~16.667ms (60 Hz)
+        let target = last_scanout_present.map(|prev: Timestamp| {
+            // Request one nominal 60 Hz interval after the last scanout-domain receipt.
             Timestamp::from_micros(prev.as_micros() + 16_667)
         });
 
         let info = vse.flip(target)?;
 
         if info.frame_number == 0 {
-            println!("Timing source: {}", vse.timing_source());
+            println!("Selected backend: {}", vse.timing_source());
+            println!("First receipt source: {}", info.timing_source);
         }
 
-        last_present = Some(info.present_time);
+        // Never feed a CPU-domain fallback back into the scanout-domain target API.
+        last_scanout_present =
+            (info.timing_source == TimingSource::ExtPresentTiming).then_some(info.present_time);
 
         Ok(())
     })?;
