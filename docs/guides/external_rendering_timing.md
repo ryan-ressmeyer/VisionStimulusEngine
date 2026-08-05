@@ -1,6 +1,6 @@
 # External Rendering Timing Policies
 
-External renderers such as Bevy produce pixels for VSE to present. VSE still owns the swapchain, scanout scheduling, and `FlipInfo`. The external renderer only fills imported images.
+External renderers such as `vse-3d` and Bevy produce pixels for VSE to present. VSE still owns the swapchain, scanout scheduling, and `FlipInfo`. The external renderer only fills imported images. Headless VSE consumes the same rings through its offscreen submission path and reads back the combined external frame and VSE overlays.
 
 A display refresh imposes a hard deadline. If a frame is not ready before VSE submits the present, VSE must choose one of three outcomes:
 
@@ -62,7 +62,7 @@ Use this policy when frame identity matters:
 - stimuli whose state is defined as an exact function of VSE's frame counter;
 - experiments where dropping or repeating external frames would change the stimulus class.
 
-Tradeoff: a synchronous producer can hold up VSE. If Bevy rendering takes too long, the present may miss the intended refresh. VSE will still report this in `FlipInfo`.
+Tradeoff: a synchronous producer can hold up VSE. If 3D rendering takes too long, the present may miss the intended refresh. VSE will still report this in `FlipInfo`. The initial `vse-3d` API uses this policy exclusively.
 
 ---
 

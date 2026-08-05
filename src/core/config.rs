@@ -12,7 +12,7 @@ use super::{
 };
 use crate::data::ExperimentSession;
 use crate::drawing::renderer::RendererError;
-use crate::drawing::{ModelError, PipelineError};
+use crate::drawing::PipelineError;
 
 use super::context::VSEContext;
 
@@ -43,13 +43,13 @@ pub enum VSEError {
     #[error("Renderer error: {0}")]
     Renderer(#[from] RendererError),
 
-    /// Native 3D model or camera error
-    #[error("Model error: {0}")]
-    Model(#[from] ModelError),
-
     /// User-registered Tier 1 pipeline error (build or record).
     #[error("Pipeline error: {0}")]
     Pipeline(#[from] PipelineError),
+
+    /// Error reported by a separately versioned extension crate.
+    #[error("Extension error: {0}")]
+    Extension(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     /// Window creation error
     #[error("Window error: {0}")]
@@ -97,6 +97,14 @@ pub enum VSEError {
     /// `flip()` called inside a structured buffered render callback.
     #[error("flip() is managed by run_buffered() — return BufferedFrame from the render callback")]
     NotSupportedInBufferedMode,
+}
+
+impl VSEError {
+    /// Wrap an error from a separately versioned extension crate while
+    /// preserving its source chain.
+    pub fn extension(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Extension(Box::new(error))
+    }
 }
 
 /// Settings shared by displayed and offscreen rendering.

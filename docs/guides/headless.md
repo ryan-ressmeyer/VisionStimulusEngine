@@ -44,12 +44,19 @@ headless.run_headless(
 ```
 
 `HeadlessContext::builder()` selects the offscreen builder, and `run_headless()` replaces a displayed runtime.
-Everything between — every `draw_*` call, `load_image`, `register_pipeline`,
-`draw_with`, `draw_custom`, `record_frame` — is unchanged, so an experiment's
-render closure runs in both modes as written.
+Everything between, including `draw_*`, `load_image`, `register_pipeline`,
+`draw_with`, `draw_custom`, external-frame consumption, and `record_frame`, is
+unchanged. An experiment's render closure can therefore run in both modes.
 
-`run_headless_with_setup(setup, sink, render)` mirrors `run_with_setup`: build
-pipelines and load assets there, not per frame.
+`run_headless_with_setup(setup, sink, render)` mirrors `run_with_setup`. Build
+pipelines, attach external renderers, and load assets there rather than per frame.
+
+A headless context can import the same external image ring used by a displayed
+session. Its offscreen submission waits on the producer's GPU semaphore, blits
+the external image, draws VSE overlays, and copies the combined target to the
+readback buffer. This path remains offscreen and never calls displayed
+submission or presentation code. The `vse-3d` crate uses this path for 3D
+regeneration.
 
 ## What the sink receives
 
@@ -89,7 +96,7 @@ That takes the color format and extent from `HostInfo.swapchain`. Both affect th
 - **Extent** — a different size rasterizes different pixels, not the same
   picture scaled.
 
-An unrecognized format is refused rather than approximated. Every context now constructs all built-ins, so `HostInfo.pipeline.builtin_pipelines` is retained only for compatibility with older recordings and does not control regeneration.
+An unrecognized format is refused rather than approximated. Every context constructs all seven base 2D pipelines, so `HostInfo.pipeline.builtin_pipelines` is retained only for compatibility with older recordings and does not control regeneration. External renderers must be registered again by the experiment's regeneration code; their crate-owned metadata identifies their resources and configuration.
 
 The clear color and refresh rate are **not** applied automatically — set them
 yourself from `HostInfo.pipeline` if your stimulus depends on them.

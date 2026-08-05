@@ -1,17 +1,26 @@
 use std::path::{Path, PathBuf};
 
 use glam::{Mat4, Vec3};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use vulkano::buffer::BufferContents;
+use vulkano::pipeline::graphics::vertex_input::Vertex;
 
-use super::vertex::Vertex3D;
+#[derive(Clone, Copy, Debug, Default, BufferContents, Vertex)]
+#[repr(C)]
+pub(crate) struct Vertex3D {
+    #[format(R32G32B32_SFLOAT)]
+    pub(crate) position: [f32; 3],
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ModelHandle {
+    pub(crate) renderer_id: u64,
     pub(crate) id: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Bounds3D {
     pub min: Vec3,
     pub max: Vec3,
@@ -27,7 +36,7 @@ impl Bounds3D {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PerspectiveCamera {
     pub eye: Vec3,
     pub target: Vec3,
@@ -86,7 +95,7 @@ impl PerspectiveCamera {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub source_path: PathBuf,
     pub source_sha256: String,
@@ -120,6 +129,8 @@ pub enum ModelError {
     UnsupportedDeformation,
     #[error("camera field of view, planes, or vectors are invalid")]
     InvalidCamera,
+    #[error("model handle belongs to another vse-3d renderer")]
+    ForeignHandle,
     #[error("unknown model handle: id={0}")]
     UnknownHandle(u64),
 }

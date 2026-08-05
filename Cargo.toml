@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/vse-external-frame", "crates/vse-bevy"]
+members = [".", "crates/vse-external-frame", "crates/vse-bevy", "crates/vse-3d"]
 resolver = "2"
 
 [package]
@@ -17,11 +17,6 @@ vse-external-frame = { path = "crates/vse-external-frame" }
 
 # Vulkan abstraction - Core rendering
 vulkano = "0.35"
-
-# Native 3D mesh loading and transforms
-glam = "0.27"
-gltf = "1.4"
-sha2 = "0.10"
 
 # Windowing and event handling
 winit = "0.29"

@@ -1,12 +1,12 @@
 # Design: Flexible & User-Defined Rendering Pipelines
 
-**Status:** Historical design record. Tiers 0, 1, and 2 shipped with the call-order change in §4-5. Audit 7 later removed Tier 0 suite subselection; the standard built-ins are now unconditional. Sections 1 and 3-8 retain the original problem statement and design sequence. `docs/guides/pipelines.md` describes current behavior.
+**Status:** Historical design record. Tiers 1 and 2 shipped with the call-order change in §4-5. Audit 7 removed Tier 0 suite subselection and made the seven base 2D pipelines unconditional. Audit 7b moved controlled 3D into the separate `vse-3d` external-frame producer. Sections 1 and 3-8 retain the original problem statement and design sequence. `docs/guides/pipelines.md` describes current behavior.
 
 **Goal at the time:** Let users subselect built-ins, register their own pipelines, and record raw Vulkan draws inside VSE's frame while preserving timing determinism and teaching the pipeline model.
 
 ---
 
-## 1. Current architecture
+## 1. Original architecture
 
 VSE's renderer is a **closed, batched, type-ordered immediate-mode renderer**.
 
@@ -105,7 +105,7 @@ each is independently useful.
 
 ### Tier 0 — Suite subselection (historical design)
 
-> **Superseded by Audit 7.** Runtime subselection saved approximately 40 ms with a cold driver cache but introduced configurations where a valid `draw_*` call rendered nothing. VSE now constructs the standard built-ins unconditionally. A planned typed native-3D capability will provide the extension boundary for larger optional render systems.
+> **Superseded by Audits 7 and 7b.** Runtime subselection saved approximately 40 ms with a cold driver cache but introduced configurations where a valid `draw_*` call rendered nothing. VSE now constructs its seven base 2D pipelines unconditionally. Controlled 3D lives in `vse-3d` and supplies complete images through the external-frame boundary.
 
 The original proposal was to turn the eight hardcoded fields into a `PipelineSuite` assembled from built-in
 `PipelineModule`s, chosen at build time:
@@ -297,7 +297,7 @@ The `draw_*` public API on `RenderContext` must not break. Sequence:
 
 > **Resolved and later revised.** The work shipped in the order: keyed registry → `PipelineSuite`
 > → Tier 2 (`draw_custom`) → call-order → unified draw queue → Tier 1
-> (`StimulusPipeline`). Audit 7 later removed `PipelineSuite` after measurement and made the standard built-ins unconditional. A separate follow-up will extract native 3D behind a typed setup capability. The questions below remain as a record of the original design process.
+> (`StimulusPipeline`). Audit 7 later removed `PipelineSuite` after measurement and made the standard built-ins unconditional. Audit 7b extracted 3D into the `vse-3d` crate rather than adding an in-core capability. The questions below remain as a record of the original design process.
 
 - **First implementation milestone:** Tier 2 (raw hook) vs. the Tier 0 module
   refactor. Tier 2 unblocks users soonest; the module refactor is the structural
@@ -311,6 +311,6 @@ The `draw_*` public API on `RenderContext` must not break. Sequence:
   `VertexInputState` from the start?
 - **Push-constant safety for SPIR-V path:** how much layout validation VSE should
   do vs. trust the user's `#[repr(C)]` type.
-- **Does call-order interact with the native-3D depth pass?** 3D currently always
-  precedes 2D; confirm whether custom pipelines may opt into the depth
-  attachment or are 2D-overlay only.
+- **Resolved by Audit 7b:** `StimulusPipeline` remains 2D-overlay only. External
+  renderers own depth and complete their frames before VSE's 2D pass. A future
+  direct-underlay seam, if measurements justify it, will be a separate advanced API.

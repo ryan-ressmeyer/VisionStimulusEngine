@@ -361,17 +361,10 @@ fn update_refresh_auto_detection(
 }
 
 impl VSEState {
-    /// Recreate the swapchain and refresh the renderer's depth attachments.
-    ///
-    /// Lives on `VSEState` rather than `PresentTarget` because it spans both:
-    /// the swapchain is presentation state, the depth images are the renderer's.
+    /// Recreate the displayed swapchain and notify timing state.
     pub(super) fn recreate_swapchain(&mut self, win_size: [u32; 2]) -> Result<(), VSEError> {
         let present = self.target.present_expect_mut();
         present.swapchain.recreate_from_surface(win_size)?;
-        self.renderer.recreate_depth_attachments(
-            present.swapchain.images().len(),
-            present.swapchain.extent(),
-        )?;
         present
             .timing_provider
             .on_swapchain_recreated(present.swapchain.swapchain());

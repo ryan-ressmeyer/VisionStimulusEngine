@@ -47,8 +47,8 @@ impl VSEContext {
     ///
     /// `setup` executes immediately after the GPU state exists and **before
     /// frame 0**, so expensive one-time work — compiling a
-    /// [`StimulusPipeline`](crate::prelude::StimulusPipeline), loading textures
-    /// or models — happens off the presentation path instead of inflating the
+    /// [`StimulusPipeline`](crate::prelude::StimulusPipeline), attaching an
+    /// external renderer, or loading assets happens off the presentation path instead of inflating the
     /// first frame and registering as a missed deadline.
     ///
     /// Whatever `setup` returns (pipeline handles, texture handles, trial

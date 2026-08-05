@@ -1,0 +1,24 @@
+[package]
+name = "vse-3d"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Deterministic scientific 3D renderer for VisionStimulusEngine"
+license = "MIT"
+authors = ["Ryan A. Ressmeyer"]
+
+[dependencies]
+vision_stimulus_engine = { path = "../.." }
+vse-external-frame = { path = "../vse-external-frame" }
+vulkano = "0.35"
+vulkano-shaders = "0.35"
+glam = { version = "0.27", features = ["serde"] }
+gltf = "1.4"
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+tracing = "0.1"
+
+[dev-dependencies]
+serde_json = "1.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

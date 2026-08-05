@@ -516,12 +516,20 @@ impl DeviceSelector {
         // Enable calibrated timestamps when available so the timing-capabilities probe can
         // measure CPU<->GPU clock correlation even without present-timing.
         let supported = self.physical_device.supported_extensions();
-        let device_extensions = DeviceExtensions {
+        let mut device_extensions = DeviceExtensions {
             khr_swapchain: self.instance.enabled_extensions().khr_surface,
             khr_dynamic_rendering: true,
             ext_calibrated_timestamps: supported.ext_calibrated_timestamps,
             ..DeviceExtensions::empty()
         };
+        #[cfg(target_os = "linux")]
+        {
+            // External producers are optional, but enabling supported handle
+            // extensions here lets both displayed fallback and headless
+            // contexts import a source during setup without a second device.
+            device_extensions.khr_external_memory_fd = supported.khr_external_memory_fd;
+            device_extensions.khr_external_semaphore_fd = supported.khr_external_semaphore_fd;
+        }
 
         let features = DeviceFeatures {
             dynamic_rendering: true,

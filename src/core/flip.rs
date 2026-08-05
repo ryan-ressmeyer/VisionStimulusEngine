@@ -601,7 +601,10 @@ impl<'a> RenderContext<'a> {
     /// The returned [`FlipInfo`] carries [`TimingSource::Offscreen`] and a
     /// synthesized `present_time` of `frame_number × frame_interval`.
     fn flip_offscreen(&mut self, target_time: Option<Timestamp>) -> Result<FlipInfo, VSEError> {
-        use vulkano::sync::GpuFuture as _;
+        use std::sync::Arc;
+        use vulkano::command_buffer::{CommandBufferSubmitInfo, SemaphoreSubmitInfo, SubmitInfo};
+        use vulkano::sync::fence::Fence;
+        use vulkano::sync::{GpuFuture as _, PipelineStages};
 
         let clear_color = self.config.clear_color;
         let submit_time = self.state.clock.now();
@@ -616,21 +619,94 @@ impl<'a> RenderContext<'a> {
         let readback = offscreen.readback.clone();
         let frame_interval = offscreen.frame_interval;
 
-        let command_buffer =
-            self.state
-                .renderer
-                .render_to_offscreen(image, 0, clear_color, extent, &readback)?;
+        let external_frames = {
+            let source = self
+                .state
+                .target
+                .offscreen_mut()
+                .expect("flip_offscreen called on a presenting context")
+                .external_source
+                .as_mut();
+            source.and_then(|source| {
+                source.pump_releases();
+                source.take_frames()
+            })
+        };
+        let underlay =
+            external_frames
+                .as_ref()
+                .map(|frames| crate::drawing::renderer::ExternalUnderlay {
+                    image: frames.image.clone(),
+                    readback: None,
+                });
+        let command_buffer = self.state.renderer.render_with_underlay(
+            image,
+            0,
+            clear_color,
+            extent,
+            underlay.as_ref(),
+            Some(&readback),
+        )?;
 
-        let future = vulkano::sync::now(self.state.device.clone())
-            .then_execute(self.state.queue.clone(), command_buffer)
-            .map_err(|e: vulkano::command_buffer::CommandBufferExecError| {
-                FrameError::ExecutionFailed(e.to_string())
-            })?
-            .then_signal_fence_and_flush()
-            .map_err(|e| FrameError::ExecutionFailed(e.to_string()))?;
-        future
-            .wait(None)
-            .map_err(|e| FrameError::ExecutionFailed(e.to_string()))?;
+        if let Some(frames) = &external_frames {
+            let mut waits = Vec::with_capacity(frames.waits.len());
+            for (semaphore, value) in &frames.waits {
+                let mut wait = SemaphoreSubmitInfo::new(semaphore.clone());
+                wait.stages = PipelineStages::ALL_TRANSFER;
+                if let Some(value) = value {
+                    wait.value = *value;
+                }
+                waits.push(wait);
+            }
+            let submit = SubmitInfo {
+                wait_semaphores: waits,
+                command_buffers: vec![CommandBufferSubmitInfo::new(command_buffer)],
+                ..Default::default()
+            };
+            let fence = Arc::new(
+                Fence::new(self.state.device.clone(), Default::default())
+                    .map_err(|e| FrameError::ExecutionFailed(e.to_string()))?,
+            );
+            self.state
+                .queue
+                .with(|mut guard| unsafe { guard.submit(&[submit], Some(&fence)) })
+                .map_err(|e| FrameError::ExecutionFailed(e.to_string()))?;
+            if let Some(source) = self
+                .state
+                .target
+                .offscreen_mut()
+                .expect("flip_offscreen called on a presenting context")
+                .external_source
+                .as_mut()
+            {
+                source.on_submitted(frames);
+                source.on_consumed(&frames.slots, fence.clone());
+            }
+            fence
+                .wait(None)
+                .map_err(|e| FrameError::ExecutionFailed(e.to_string()))?;
+            if let Some(source) = self
+                .state
+                .target
+                .offscreen_mut()
+                .expect("flip_offscreen called on a presenting context")
+                .external_source
+                .as_mut()
+            {
+                source.pump_releases();
+            }
+        } else {
+            let future = vulkano::sync::now(self.state.device.clone())
+                .then_execute(self.state.queue.clone(), command_buffer)
+                .map_err(|e: vulkano::command_buffer::CommandBufferExecError| {
+                    FrameError::ExecutionFailed(e.to_string())
+                })?
+                .then_signal_fence_and_flush()
+                .map_err(|e| FrameError::ExecutionFailed(e.to_string()))?;
+            future
+                .wait(None)
+                .map_err(|e| FrameError::ExecutionFailed(e.to_string()))?;
+        }
 
         let bytes = readback
             .read()

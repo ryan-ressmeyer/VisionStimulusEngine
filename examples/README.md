@@ -61,19 +61,17 @@ a fixed duration or frame count and print a summary.
 |---|------|---------------|--------------------|
 | 19 | `text_and_instructions` | Built-in bitmap font: instructions, labels, feedback | DrawSomeTextDemo, DrawFormattedTextDemo, FontDemo |
 
-## 3D
+## 3D companion crates
 
-| # | Demo | What it shows |
-|---|------|---------------|
-| 20 | `mesh_normals_3d` | Native indexed glTF meshes, depth testing, face-normal colors, arcball input, and 2D overlays |
-
-Prepare the separately licensed models in [`../assets/3d/README.md`](../assets/3d/README.md), then run:
+The `vse-3d` crate provides controlled indexed glTF rendering, depth testing,
+face-normal colors, and VSE 2D overlays. Prepare the models in
+[`../assets/3d/README.md`](../assets/3d/README.md), then run:
 
 ```bash
-cargo run --release --example 20_mesh_normals_3d
+cargo run --release -p vse-3d --example mesh_normals
 ```
 
-Complex 3D and VR-ready scenes remain available through the `vse-bevy` crate, which feeds a headless Bevy renderer into VSE's external-frame ring:
+Naturalistic and VR-ready scenes remain available through `vse-bevy`, which feeds a headless Bevy renderer into VSE's external-frame ring:
 
 ```bash
 cargo run -p vse-bevy --release --example 01_bevy_ring_demo

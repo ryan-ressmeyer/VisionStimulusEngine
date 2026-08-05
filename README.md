@@ -21,7 +21,7 @@ The project currently includes:
 - example programs for clear colors, timing validation, calibration squares, Gabors, scheduled flips, image scaling, and fullscreen/direct-display work
 - host and session logging utilities
 - timing infrastructure built around scanout-clock presentation, with CPU estimates as a loud fallback
-- experimental Bevy/external-frame integration crates for 3D-rendered stimuli
+- `vse-3d` for controlled scientific 3D and `vse-bevy` for Bevy-rendered scenes, both connected through the external-frame seam
 
 ## Timing model
 

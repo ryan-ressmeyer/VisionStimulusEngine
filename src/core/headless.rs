@@ -141,6 +141,8 @@ pub(super) struct OffscreenTarget {
     pub(super) readback: Subbuffer<[u8]>,
     /// Nominal inter-frame interval used to synthesize flip timestamps.
     pub(super) frame_interval: Duration,
+    /// Imported external-renderer frame ring, when one was attached during setup.
+    pub(super) external_source: Option<Box<crate::core::external_frame::ExternalFrameRing>>,
     /// Frames captured since the sink last drained them, in flip order. A
     /// render callback that flips more than once produces more than one.
     pub(super) captured: Vec<CapturedFrame>,
@@ -194,7 +196,7 @@ impl HeadlessContext {
         let device_selector = DeviceSelector::new(config.render.gpu_preference)?;
         let (device, queue) = device_selector.create_standard_device()?;
 
-        let renderer = Renderer::new(device.clone(), queue.clone(), format, 1, extent)?;
+        let renderer = Renderer::new(device.clone(), queue.clone(), format)?;
 
         let memory_allocator = renderer.memory_allocator();
 
@@ -270,6 +272,7 @@ impl HeadlessContext {
                     extent,
                     readback,
                     frame_interval,
+                    external_source: None,
                     captured: Vec::new(),
                 }),
             },

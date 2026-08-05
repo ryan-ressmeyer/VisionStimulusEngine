@@ -259,13 +259,7 @@ impl VSEContext {
             .unwrap_or_default();
         let swapchain =
             SwapchainManager::new_with_opt_ins(device.clone(), surface, swapchain_config, opt_ins)?;
-        let renderer = Renderer::new(
-            device.clone(),
-            queue.clone(),
-            swapchain.format(),
-            swapchain.images().len(),
-            swapchain.extent(),
-        )?;
+        let renderer = Renderer::new(device.clone(), queue.clone(), swapchain.format())?;
 
         let clock = Clock::new();
         let timing_provider: Box<dyn TimingProvider> =

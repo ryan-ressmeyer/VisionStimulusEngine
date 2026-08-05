@@ -3,13 +3,14 @@
 //! Prepare the four models described in `assets/3d/README.md`, then run:
 //!
 //! ```bash
-//! cargo run --release --example 20_mesh_normals_3d
+//! cargo run --release -p vse-3d --example mesh_normals
 //! ```
 
 use std::path::Path;
 
 use glam::{Mat4, Quat, Vec2, Vec3};
 use vision_stimulus_engine::prelude::*;
+use vse_3d::{Bounds3D, ModelHandle, PerspectiveCamera, Vse3d, Vse3dConfig};
 
 const SPIN_PERIOD_FRAMES: f32 = 480.0;
 const MODEL_FILES: [(&str, &str); 4] = [
@@ -30,6 +31,11 @@ struct DemoModel {
     handle: ModelHandle,
     fit: Mat4,
     status: String,
+}
+
+struct Setup {
+    renderer: Vse3d,
+    models: Vec<DemoModel>,
 }
 
 fn arcball_point(position: (f64, f64), size: (u32, u32)) -> Vec3 {
@@ -62,28 +68,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_present_mode(PresentMode::Fifo)
         .build()?;
 
-    let mut models: Option<Vec<DemoModel>> = None;
     let mut selected = 0_usize;
     let mut drag = Quat::IDENTITY;
     let mut previous_arcball: Option<Vec3> = None;
     let mut printed_spin_duration = false;
     let camera = PerspectiveCamera::default();
 
-    context.run(move |vse| {
-        if models.is_none() {
+    context.run_with_setup(
+        |vse| {
             if let Some((_, missing)) = MODEL_FILES
                 .iter()
                 .find(|(_, file)| !Path::new(file).is_file())
             {
-                eprintln!("{}", missing_asset_message(missing));
-                vse.request_exit();
-                return Ok(());
+                return Err(VSEError::EventLoop(missing_asset_message(missing)));
             }
 
-            let mut loaded = Vec::with_capacity(MODEL_FILES.len());
+            let mut renderer = Vse3d::register(vse, Vse3dConfig::default())?;
+            let mut models = Vec::with_capacity(MODEL_FILES.len());
             for &(name, file) in &MODEL_FILES {
-                let handle = vse.load_model(file)?;
-                let info = vse.model_info(handle)?.clone();
+                let handle = renderer.load_model(file)?;
+                let info = renderer.model_info(handle)?.clone();
                 println!(
                     "{name}: {} triangles, {} primitives, {} instances, sha256 {}",
                     info.triangle_count,
@@ -91,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     info.instance_count,
                     info.source_sha256
                 );
-                loaded.push(DemoModel {
+                models.push(DemoModel {
                     name,
                     handle,
                     fit: fit_transform(info.bounds),
@@ -99,9 +103,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
             println!("Loaded all models. Switching uses resident handles only.");
-            models = Some(loaded);
-        }
-        let models = models.as_ref().expect("models initialized above");
+            Ok(Setup { renderer, models })
+        },
+        move |vse, setup| {
+        let models = &setup.models;
         if !printed_spin_duration {
             if let Some(refresh) = vse.refresh_interval() {
                 println!(
@@ -143,7 +148,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let model = &models[selected];
         let auto_yaw = -std::f32::consts::TAU * vse.frame_number() as f32 / SPIN_PERIOD_FRAMES;
         let transform = Mat4::from_quat(drag * Quat::from_rotation_y(auto_yaw)) * model.fit;
-        vse.draw_model_normals(model.handle, transform, &camera)?;
+        setup
+            .renderer
+            .draw_normals(model.handle, transform, &camera)?;
+        setup.renderer.render_frame(vse)?;
 
         vse.draw_text(&model.status, 16.0, 16.0, 2.0, Color::WHITE);
         vse.draw_text(
@@ -165,7 +173,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vse.clear()?;
         vse.flip(None)?;
         Ok(())
-    })?;
+    },
+    )?;
 
     Ok(())
 }

@@ -30,10 +30,9 @@ use vulkano::{
     pipeline::{
         graphics::{
             color_blend::{AttachmentBlend, ColorBlendAttachmentState, ColorBlendState},
-            depth_stencil::{DepthState, DepthStencilState},
             input_assembly::{InputAssemblyState, PrimitiveTopology},
             multisample::MultisampleState,
-            rasterization::{CullMode, FrontFace, RasterizationState},
+            rasterization::RasterizationState,
             subpass::PipelineRenderingCreateInfo,
             vertex_input::{
                 Vertex as VertexTrait, VertexDefinition, VertexInputAttributeDescription,
@@ -56,7 +55,7 @@ use super::pipeline::{
 };
 use super::primitives::{
     arc_vertices, circle_vertices, dot_unit_quad_vertices, line_vertices, rect_vertices,
-    textured_quad_vertices, CustomDrawFn, DrawCommand, DrawCommand3D,
+    textured_quad_vertices, CustomDrawFn, DrawCommand,
 };
 
 /// An external frame consumed as the background of one rendered frame
@@ -68,13 +67,10 @@ pub(crate) struct ExternalUnderlay {
     /// host-visible buffer (determinism-harness readback).
     pub readback: Option<Subbuffer<[u8]>>,
 }
-use super::model::{decode_model, DecodedInstance, ModelError, ModelHandle, ModelInfo};
 use super::noise::{NoiseKey, NoiseTextureCache};
 use super::stimuli::WaveType;
 use super::texture::TextureHandle;
-use super::vertex::{DotInstance, TexturedVertex, Vertex2D, Vertex3D};
-
-const MESH_FRONT_FACE: FrontFace = FrontFace::CounterClockwise;
+use super::vertex::{DotInstance, TexturedVertex, Vertex2D};
 
 /// How many distinct noise textures stay resident.
 ///
@@ -283,20 +279,6 @@ mod dot_fs {
     }
 }
 
-mod mesh_normals_vs {
-    vulkano_shaders::shader! {
-        ty: "vertex",
-        path: "src/shaders/mesh_normals.vert",
-    }
-}
-
-mod mesh_normals_fs {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        path: "src/shaders/mesh_normals.frag",
-    }
-}
-
 /// Internal key identifying one of VSE's always-available built-in pipelines.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum BuiltinPipeline {
@@ -307,7 +289,6 @@ pub(crate) enum BuiltinPipeline {
     AdditiveGabor,
     SubtractiveGabor,
     Dot,
-    MeshNormals,
 }
 
 impl BuiltinPipeline {
@@ -321,7 +302,6 @@ impl BuiltinPipeline {
             Self::AdditiveGabor => "AdditiveGabor",
             Self::SubtractiveGabor => "SubtractiveGabor",
             Self::Dot => "Dot",
-            Self::MeshNormals => "MeshNormals",
         }
     }
 }
@@ -336,11 +316,9 @@ pub(crate) fn builtin_pipeline_names() -> Vec<&'static str> {
     names
 }
 
-/// Builds a single built-in pipeline. The uniform `(device, swapchain_format,
-/// depth_format)` signature lets every built-in — including the depth-using
-/// mesh-normals pipeline — be constructed from one descriptor list.
+/// Builds one unconditional base 2D pipeline.
 type BuiltinPipelineBuilder =
-    fn(&Arc<Device>, Format, Format) -> Result<Arc<GraphicsPipeline>, RendererError>;
+    fn(&Arc<Device>, Format) -> Result<Arc<GraphicsPipeline>, RendererError>;
 
 /// A built-in pipeline's key paired with the code that builds it.
 struct BuiltinPipelineDescriptor {
@@ -349,45 +327,41 @@ struct BuiltinPipelineDescriptor {
 }
 
 /// The complete list of built-in pipelines constructed for every context.
-fn builtin_pipeline_descriptors() -> [BuiltinPipelineDescriptor; 8] {
+fn builtin_pipeline_descriptors() -> [BuiltinPipelineDescriptor; 7] {
     [
         BuiltinPipelineDescriptor {
             key: BuiltinPipeline::FlatColor,
-            build: |device, fmt, _depth| Renderer::create_flat_color_pipeline(device, fmt),
+            build: Renderer::create_flat_color_pipeline,
         },
         BuiltinPipelineDescriptor {
             key: BuiltinPipeline::Textured,
-            build: |device, fmt, _depth| Renderer::create_textured_pipeline(device, fmt),
+            build: Renderer::create_textured_pipeline,
         },
         BuiltinPipelineDescriptor {
             key: BuiltinPipeline::Grating,
-            build: |device, fmt, _depth| Renderer::create_grating_pipeline(device, fmt),
+            build: Renderer::create_grating_pipeline,
         },
         BuiltinPipelineDescriptor {
             key: BuiltinPipeline::Gabor,
-            build: |device, fmt, _depth| {
+            build: |device, fmt| {
                 Renderer::create_gabor_pipeline(device, fmt, AttachmentBlend::alpha())
             },
         },
         BuiltinPipelineDescriptor {
             key: BuiltinPipeline::AdditiveGabor,
-            build: |device, fmt, _depth| {
+            build: |device, fmt| {
                 Renderer::create_gabor_pipeline(device, fmt, additive_gabor_blend())
             },
         },
         BuiltinPipelineDescriptor {
             key: BuiltinPipeline::SubtractiveGabor,
-            build: |device, fmt, _depth| {
+            build: |device, fmt| {
                 Renderer::create_gabor_pipeline(device, fmt, subtractive_gabor_blend())
             },
         },
         BuiltinPipelineDescriptor {
             key: BuiltinPipeline::Dot,
-            build: |device, fmt, _depth| Renderer::create_dot_pipeline(device, fmt),
-        },
-        BuiltinPipelineDescriptor {
-            key: BuiltinPipeline::MeshNormals,
-            build: |device, fmt, depth| Renderer::create_mesh_normals_pipeline(device, fmt, depth),
+            build: Renderer::create_dot_pipeline,
         },
     ]
 }
@@ -421,14 +395,10 @@ pub(crate) struct Pipelines {
 }
 
 impl Pipelines {
-    fn new(
-        device: &Arc<Device>,
-        swapchain_format: Format,
-        depth_format: Format,
-    ) -> Result<Self, RendererError> {
+    fn new(device: &Arc<Device>, swapchain_format: Format) -> Result<Self, RendererError> {
         let mut pipelines = HashMap::new();
         for descriptor in builtin_pipeline_descriptors() {
-            let pipeline = (descriptor.build)(device, swapchain_format, depth_format)?;
+            let pipeline = (descriptor.build)(device, swapchain_format)?;
             pipelines.insert(descriptor.key, pipeline);
         }
         Ok(Self { pipelines })
@@ -468,24 +438,8 @@ pub enum RendererError {
     #[error("Failed to create descriptor set: {0}")]
     DescriptorSetFailed(String),
 
-    #[error(transparent)]
-    Model(#[from] ModelError),
-
-    #[error("Failed to create depth attachments: {0}")]
+    #[error("No supported depth format: {0}")]
     DepthCreationFailed(String),
-}
-
-/// GPU resources for a loaded texture.
-struct MeshPrimitiveResources {
-    vertex_buffer: Subbuffer<[Vertex3D]>,
-    index_buffer: Subbuffer<[u32]>,
-    index_count: u32,
-}
-
-struct ModelResources {
-    primitives: Vec<MeshPrimitiveResources>,
-    instances: Vec<DecodedInstance>,
-    info: ModelInfo,
 }
 
 struct TextureResources {
@@ -542,12 +496,10 @@ pub(crate) struct Renderer {
     /// reuse is already gated on frame completion, with no manual
     /// frames-in-flight bookkeeping.
     ///
-    /// Streaming only. Data that outlives a frame (the dot unit quad, mesh
-    /// vertex/index buffers) stays in its own device-local `Buffer`.
+    /// Streaming only. Data that outlives a frame stays in its own GPU resource.
     vertex_allocator: SubbufferAllocator,
     dot_quad_buffer: Subbuffer<[DotInstance]>,
     depth_format: Format,
-    depth_views: Vec<Arc<ImageView>>,
 
     textures: HashMap<u64, TextureResources>,
     /// Noise textures keyed by the parameters that generated them, so a
@@ -559,12 +511,9 @@ pub(crate) struct Renderer {
     /// command buffer is built. Freeing them earlier could drop a texture that
     /// an already-queued `DrawCommand::Noise` still needs to record.
     pending_noise_unloads: Vec<u64>,
-    models: HashMap<u64, ModelResources>,
-    next_model_id: u64,
     next_texture_id: u64,
 
     draw_commands: Vec<DrawCommand>,
-    draw_commands_3d: Vec<DrawCommand3D>,
     flat_vertex_scratch: Vec<Vertex2D>,
     dot_instance_scratch: Vec<DotInstance>,
     /// Reusable per-frame recording buffers. Held on `self` so their
@@ -592,13 +541,11 @@ pub(crate) struct Renderer {
 }
 
 impl Renderer {
-    /// Create a renderer with the complete built-in pipeline set.
+    /// Create a renderer with the complete base 2D pipeline set.
     pub fn new(
         device: Arc<Device>,
         queue: Arc<Queue>,
         swapchain_format: Format,
-        image_count: usize,
-        extent: [u32; 2],
     ) -> Result<Self, RendererError> {
         let command_buffer_allocator: Arc<dyn CommandBufferAllocator> = Arc::new(
             StandardCommandBufferAllocator::new(device.clone(), Default::default()),
@@ -620,9 +567,7 @@ impl Renderer {
 
         let dot_quad_buffer = Self::create_dot_quad_buffer(memory_allocator.clone())?;
         let depth_format = Self::select_depth_format(&device)?;
-        let pipelines = Pipelines::new(&device, swapchain_format, depth_format)?;
-        let depth_views =
-            Self::create_depth_views(memory_allocator.clone(), depth_format, image_count, extent)?;
+        let pipelines = Pipelines::new(&device, swapchain_format)?;
 
         Ok(Self {
             device,
@@ -634,15 +579,11 @@ impl Renderer {
             vertex_allocator,
             dot_quad_buffer,
             depth_format,
-            depth_views,
             textures: HashMap::new(),
             noise_cache: NoiseTextureCache::new(NOISE_CACHE_CAPACITY),
             pending_noise_unloads: Vec::new(),
-            models: HashMap::new(),
-            next_model_id: 0,
             next_texture_id: 0,
             draw_commands: Vec::new(),
-            draw_commands_3d: Vec::with_capacity(16),
             flat_vertex_scratch: Vec::new(),
             dot_instance_scratch: Vec::new(),
             command_scratch: Vec::new(),
@@ -744,92 +685,11 @@ impl Renderer {
         self.draw_commands.push(command);
     }
 
-    pub fn push_3d(&mut self, command: DrawCommand3D) {
-        self.draw_commands_3d.push(command);
-    }
-
     /// Queue a user-supplied raw record hook (Tier 2). Recorded on its own in
     /// call order via [`DrawCommand::Custom`], so it composites interleaved with
     /// the built-in draws queued around it rather than always running last.
     pub fn push_custom(&mut self, record: CustomDrawFn) {
         self.draw_commands.push(DrawCommand::Custom(record));
-    }
-
-    pub fn load_model(&mut self, path: impl AsRef<Path>) -> Result<ModelHandle, RendererError> {
-        let decoded = decode_model(path.as_ref())?;
-        let mut primitives = Vec::with_capacity(decoded.primitives.len());
-        for primitive in decoded.primitives {
-            let vertex_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                primitive.vertices,
-            )
-            .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
-            let index_count = primitive.indices.len() as u32;
-            let index_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::INDEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                primitive.indices,
-            )
-            .map_err(|e| RendererError::BufferAllocationFailed(e.to_string()))?;
-            primitives.push(MeshPrimitiveResources {
-                vertex_buffer,
-                index_buffer,
-                index_count,
-            });
-        }
-        let id = self.next_model_id;
-        self.next_model_id = self.next_model_id.wrapping_add(1);
-        self.models.insert(
-            id,
-            ModelResources {
-                primitives,
-                instances: decoded.instances,
-                info: decoded.info,
-            },
-        );
-        Ok(ModelHandle { id })
-    }
-
-    pub fn model_info(&self, handle: ModelHandle) -> Result<&ModelInfo, ModelError> {
-        self.models
-            .get(&handle.id)
-            .map(|model| &model.info)
-            .ok_or(ModelError::UnknownHandle(handle.id))
-    }
-
-    pub fn unload_model(&mut self, handle: ModelHandle) {
-        self.models.remove(&handle.id);
-    }
-
-    pub fn recreate_depth_attachments(
-        &mut self,
-        image_count: usize,
-        extent: [u32; 2],
-    ) -> Result<(), RendererError> {
-        self.depth_views = Self::create_depth_views(
-            self.memory_allocator.clone(),
-            self.depth_format,
-            image_count,
-            extent,
-        )?;
-        Ok(())
     }
 
     /// Suballocate a per-frame vertex/instance buffer from the arena and fill
@@ -879,31 +739,6 @@ impl Renderer {
         )
     }
 
-    /// Like [`render`](Self::render), but appends a copy of the finished image
-    /// into `readback` — the headless (offscreen) path.
-    ///
-    /// The copy is recorded *after* every draw, in the same command buffer, so
-    /// it cannot perturb what was rendered: the drawing commands recorded here
-    /// are the same ones a windowed session records. That identity is the whole
-    /// point of reusing this function rather than writing a parallel one.
-    pub fn render_to_offscreen(
-        &mut self,
-        target_image: Arc<Image>,
-        image_index: usize,
-        clear_color: [f32; 4],
-        viewport_extent: [u32; 2],
-        readback: &Subbuffer<[u8]>,
-    ) -> Result<Arc<PrimaryAutoCommandBuffer>, RendererError> {
-        self.render_with_underlay(
-            target_image,
-            image_index,
-            clear_color,
-            viewport_extent,
-            None,
-            Some(readback),
-        )
-    }
-
     /// Like [`render`](Self::render), but optionally consumes an external frame
     /// as an *underlay*: the external image is blitted into the target before
     /// VSE's queued draw commands, which then composite on top (fixation marks,
@@ -919,7 +754,7 @@ impl Renderer {
     pub fn render_with_underlay(
         &mut self,
         target_image: Arc<Image>,
-        image_index: usize,
+        _image_index: usize,
         clear_color: [f32; 4],
         viewport_extent: [u32; 2],
         underlay: Option<&ExternalUnderlay>,
@@ -956,92 +791,7 @@ impl Renderer {
             }
         }
 
-        let viewport = Viewport {
-            offset: [0.0, 0.0],
-            extent: [viewport_extent[0] as f32, viewport_extent[1] as f32],
-            depth_range: 0.0..=1.0,
-        };
-
-        let mesh_normals_pipeline = self.pipelines.get(BuiltinPipeline::MeshNormals).clone();
-        if !self.draw_commands_3d.is_empty() {
-            let depth_view = self.depth_views.get(image_index).cloned().ok_or_else(|| {
-                RendererError::DepthCreationFailed(format!(
-                    "no depth attachment for swapchain image {image_index}"
-                ))
-            })?;
-            let (load_op, clear_value) = if underlay.is_some() {
-                (AttachmentLoadOp::Load, None)
-            } else {
-                (
-                    AttachmentLoadOp::Clear,
-                    Some(ClearValue::Float(clear_color)),
-                )
-            };
-            builder
-                .begin_rendering(RenderingInfo {
-                    color_attachments: vec![Some(RenderingAttachmentInfo {
-                        load_op,
-                        store_op: AttachmentStoreOp::Store,
-                        clear_value,
-                        ..RenderingAttachmentInfo::image_view(image_view.clone())
-                    })],
-                    depth_attachment: Some(RenderingAttachmentInfo {
-                        load_op: AttachmentLoadOp::Clear,
-                        store_op: AttachmentStoreOp::DontCare,
-                        clear_value: Some(ClearValue::Depth(1.0)),
-                        ..RenderingAttachmentInfo::image_view(depth_view)
-                    }),
-                    ..Default::default()
-                })
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
-            builder
-                .set_viewport(0, [viewport.clone()].into_iter().collect())
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
-
-            for command in &self.draw_commands_3d {
-                let DrawCommand3D::ModelNormals {
-                    model_id,
-                    model_transform,
-                    view_projection,
-                } = command;
-                let model = self
-                    .models
-                    .get(model_id)
-                    .ok_or(ModelError::UnknownHandle(*model_id))?;
-                for instance in &model.instances {
-                    let primitive = &model.primitives[instance.primitive_index];
-                    let world = *model_transform * instance.local_transform;
-                    builder
-                        .bind_pipeline_graphics(mesh_normals_pipeline.clone())
-                        .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                        .push_constants(
-                            mesh_normals_pipeline.layout().clone(),
-                            0,
-                            mesh_normals_vs::PushConstants {
-                                model: world.to_cols_array_2d(),
-                                view_projection: view_projection.to_cols_array_2d(),
-                            },
-                        )
-                        .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                        .bind_vertex_buffers(0, primitive.vertex_buffer.clone())
-                        .map_err(|e| RendererError::RecordingFailed(e.to_string()))?
-                        .bind_index_buffer(primitive.index_buffer.clone())
-                        .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
-                    unsafe {
-                        builder
-                            .draw_indexed(primitive.index_count, 1, 0, 0, 0)
-                            .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
-                    }
-                }
-            }
-            builder
-                .end_rendering()
-                .map_err(|e| RendererError::RecordingFailed(e.to_string()))?;
-        }
-
-        // Existing 2D commands always load over native 3D. With no 3D, retain
-        // the original clear/underlay behavior.
-        let (load_op, clear_value) = if underlay.is_some() || !self.draw_commands_3d.is_empty() {
+        let (load_op, clear_value) = if underlay.is_some() {
             (AttachmentLoadOp::Load, None)
         } else {
             (
@@ -1482,7 +1232,6 @@ impl Renderer {
         }
 
         // `self.draw_commands` was drained into the scratch above.
-        self.draw_commands_3d.clear();
 
         Ok(command_buffer)
     }
@@ -1966,103 +1715,6 @@ impl Renderer {
             })
     }
 
-    fn create_depth_views(
-        memory_allocator: Arc<StandardMemoryAllocator>,
-        format: Format,
-        image_count: usize,
-        extent: [u32; 2],
-    ) -> Result<Vec<Arc<ImageView>>, RendererError> {
-        (0..image_count)
-            .map(|_| {
-                let image = Image::new(
-                    memory_allocator.clone(),
-                    ImageCreateInfo {
-                        image_type: ImageType::Dim2d,
-                        format,
-                        extent: [extent[0], extent[1], 1],
-                        usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                        ..Default::default()
-                    },
-                )
-                .map_err(|e| RendererError::DepthCreationFailed(e.to_string()))?;
-                ImageView::new_default(image)
-                    .map_err(|e| RendererError::DepthCreationFailed(e.to_string()))
-            })
-            .collect()
-    }
-
-    fn create_mesh_normals_pipeline(
-        device: &Arc<Device>,
-        swapchain_format: Format,
-        depth_format: Format,
-    ) -> Result<Arc<GraphicsPipeline>, RendererError> {
-        let vs = mesh_normals_vs::load(device.clone())
-            .map_err(|e| RendererError::ShaderLoadFailed(e.to_string()))?;
-        let fs = mesh_normals_fs::load(device.clone())
-            .map_err(|e| RendererError::ShaderLoadFailed(e.to_string()))?;
-        let vs_entry = vs.entry_point("main").unwrap();
-        let fs_entry = fs.entry_point("main").unwrap();
-        let vertex_input_state = Vertex3D::per_vertex()
-            .definition(&vs_entry)
-            .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
-        let stages = [
-            PipelineShaderStageCreateInfo::new(vs_entry),
-            PipelineShaderStageCreateInfo::new(fs_entry),
-        ];
-        let layout = PipelineLayout::new(
-            device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(device.clone())
-                .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?,
-        )
-        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))?;
-        GraphicsPipeline::new(
-            device.clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                stages: stages.into_iter().collect(),
-                vertex_input_state: Some(vertex_input_state),
-                input_assembly_state: Some(InputAssemblyState {
-                    topology: PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                }),
-                viewport_state: Some(ViewportState::default()),
-                rasterization_state: Some(RasterizationState {
-                    cull_mode: CullMode::Back,
-                    front_face: MESH_FRONT_FACE,
-                    ..Default::default()
-                }),
-                multisample_state: Some(MultisampleState::default()),
-                depth_stencil_state: Some(DepthStencilState {
-                    depth: Some(DepthState::simple()),
-                    ..Default::default()
-                }),
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    1,
-                    ColorBlendAttachmentState {
-                        blend: None,
-                        ..Default::default()
-                    },
-                )),
-                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-                subpass: Some(
-                    PipelineRenderingCreateInfo {
-                        color_attachment_formats: vec![Some(swapchain_format)],
-                        depth_attachment_format: Some(depth_format),
-                        ..Default::default()
-                    }
-                    .into(),
-                ),
-                ..GraphicsPipelineCreateInfo::layout(layout)
-            },
-        )
-        .map_err(|e| RendererError::PipelineCreationFailed(e.to_string()))
-    }
-
     fn create_dot_pipeline(
         device: &Arc<Device>,
         swapchain_format: Format,
@@ -2133,12 +1785,7 @@ mod tests {
     use vulkano::pipeline::graphics::color_blend::{BlendFactor, BlendOp};
 
     #[test]
-    fn gltf_counter_clockwise_faces_are_front_facing() {
-        assert_eq!(MESH_FRONT_FACE, FrontFace::CounterClockwise);
-    }
-
-    #[test]
-    fn builtin_descriptors_cover_exactly_the_eight_builtin_pipelines() {
+    fn builtin_descriptors_cover_exactly_the_seven_base_2d_pipelines() {
         use std::collections::HashSet;
 
         let keys: HashSet<BuiltinPipeline> = builtin_pipeline_descriptors()
@@ -2154,13 +1801,11 @@ mod tests {
             BuiltinPipeline::AdditiveGabor,
             BuiltinPipeline::SubtractiveGabor,
             BuiltinPipeline::Dot,
-            BuiltinPipeline::MeshNormals,
         ]
         .into_iter()
         .collect();
 
-        // Exactly the eight built-ins, no duplicates (array len already asserts 8).
-        assert_eq!(keys.len(), 8, "descriptor keys must be unique");
+        assert_eq!(keys.len(), 7, "descriptor keys must be unique");
         assert_eq!(keys, expected);
     }
 

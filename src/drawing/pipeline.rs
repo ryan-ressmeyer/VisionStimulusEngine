@@ -104,8 +104,8 @@ impl RegistryId {
 ///
 /// Fields are private and reached through accessor methods so the set can grow
 /// without breaking existing `build` implementations. Holds the device, the
-/// swapchain color format and depth format VSE renders into, and the shared
-/// memory allocator for any immutable buffers the pipeline uploads at build.
+/// target color format, a supported depth format for advanced resource setup,
+/// and the shared memory allocator for immutable buffers uploaded at build.
 pub struct PipelineBuildCtx<'a> {
     pub(crate) device: &'a Arc<Device>,
     pub(crate) color_format: Format,
@@ -146,9 +146,9 @@ impl<'a> PipelineBuildCtx<'a> {
         self.color_format
     }
 
-    /// The depth-attachment format VSE uses for its native-3D pass. VSE's 2D
-    /// pass has no depth attachment; this is exposed for pipelines that opt
-    /// into a depth format.
+    /// A depth-attachment format supported by the selected device. VSE's 2D
+    /// pass has no depth attachment; this value is retained for compatibility
+    /// and for advanced callers that prepare their own offscreen resources.
     pub fn depth_format(&self) -> Format {
         self.depth_format
     }

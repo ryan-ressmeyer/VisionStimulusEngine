@@ -213,8 +213,9 @@ pub struct PipelineConfig {
     pub expected_refresh_rate: Option<f64>,
     /// Legacy list of built-in pipelines, retained for serialized compatibility.
     ///
-    /// All built-ins are now constructed for every context, so regeneration
-    /// ignores this field. New recordings contain the complete built-in set.
+    /// All seven base 2D pipelines are constructed for every context, so
+    /// regeneration ignores this field. Older lists may also name pipelines
+    /// that later moved to extension crates.
     #[serde(default)]
     pub builtin_pipelines: Vec<String>,
 }

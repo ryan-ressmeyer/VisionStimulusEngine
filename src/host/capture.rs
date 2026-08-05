@@ -441,7 +441,7 @@ mod tests {
     // pipelines could be subselected.
 
     #[test]
-    fn pipeline_config_records_the_full_suite_by_default() {
+    fn pipeline_config_records_all_base_2d_pipelines() {
         let captured = capture_pipeline_config(&RenderConfig::default(), (800, 600), "Fifo".into());
 
         assert_eq!(
@@ -452,7 +452,6 @@ mod tests {
                 "FlatColor",
                 "Gabor",
                 "Grating",
-                "MeshNormals",
                 "SubtractiveGabor",
                 "Textured",
             ]

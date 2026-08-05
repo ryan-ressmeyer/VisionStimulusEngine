@@ -5,7 +5,7 @@ VSE provides synchronous, buffered, and offscreen runtimes. Choose the smallest 
 | Runtime | Presentation | State model | Use it for |
 |---|---|---|---|
 | `run()` | Synchronous | One render closure | Tutorials, diagnostics, and experiments that need the result of each flip before building the next frame |
-| `run_with_setup()` | Synchronous | GPU-initialized setup value | Synchronous experiments with pipelines, textures, models, or device buffers |
+| `run_with_setup()` | Synchronous | GPU-initialized setup value | Synchronous experiments with pipelines, textures, external renderers, or device buffers |
 | `run_buffered()` | Pipelined | Independent render and confirmation closures | Open-loop sequences whose confirmed results are recorded but do not affect rendering |
 | `run_buffered_with_state()` | Pipelined | GPU-initialized state shared by both phases | Adaptive and closed-loop experiments |
 | `run_headless()` | Offscreen | Render closure plus pixel sink | Regeneration, pixel tests, and record-path benchmarks |
@@ -51,7 +51,7 @@ context.run_with_setup(
 )?;
 ```
 
-Setup does not change the synchronous timing model. It keeps pipeline compilation and asset loading outside the presentation path.
+Setup does not change the synchronous timing model. It keeps pipeline compilation, external-renderer registration, and asset loading outside the presentation path.
 
 ## `run_buffered()`
 

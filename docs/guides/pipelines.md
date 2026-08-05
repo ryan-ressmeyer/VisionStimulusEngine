@@ -9,20 +9,20 @@ A GPU pipeline is a compiled recipe that turns vertex data into pixels. It consi
 - **Vertex format**: the layout of per-vertex data (position, color, UV coordinates).
 - **Push constants**: a small block of parameters sent per draw call (viewport size, stimulus parameters).
 
-**Cost model:** creating Vulkan pipelines has a measurable startup cost when the driver shader cache is cold. On the reference Intel/Mesa system, constructing all eight current built-ins added approximately 40 ms with the cache disabled and no measurable cost above initialization noise with a warm cache. Binding an existing pipeline during a frame is inexpensive. VSE constructs the built-ins once before frame 0.
+**Cost model:** creating Vulkan pipelines has a measurable startup cost when the driver shader cache is cold. Base VSE constructs its seven 2D pipelines once before frame 0. Optional renderers compile their own pipelines only when registered during setup. Binding an existing pipeline during a frame is inexpensive.
 
 ## How VSE renders a frame
 
 1. Your code calls `draw_*()` methods on `RenderContext` (`draw_rect()`, `draw_grating()`, `draw_dots()`, ...). Each pushes a command onto a per-frame queue.
 2. `flip()` records the queued commands into one Vulkan command buffer and submits it.
-3. Native 3D draws (`draw_model_normals`) record first, in a depth pass. The 2D draws then record **in the order you called them** (see [Draw order and batching](#draw-order-and-batching)).
-4. Runs of adjacent draws that share a pipeline coalesce (see below); everything else records on its own.
+3. If an external renderer supplied a frame, VSE places it below the 2D pass.
+4. The 2D draws record **in the order you called them** (see [Draw order and batching](#draw-order-and-batching)). Runs of adjacent draws that share a pipeline may coalesce.
 
 Per-frame vertex data is suballocated from a pooled arena rather than a fresh Vulkan buffer per draw, so a steady-state frame creates no buffers at all. Arenas return to the pool once the GPU finishes with them.
 
 ## Built-in pipelines
 
-VSE ships eight built-in pipeline objects:
+Base VSE ships seven built-in pipeline objects:
 
 | Pipeline | Draws | Shaders |
 |---|---|---|
@@ -32,15 +32,14 @@ VSE ships eight built-in pipeline objects:
 | `Gabor` | Gaussian-windowed gratings | `parametric.vert`, `gabor.frag` |
 | `AdditiveGabor` / `SubtractiveGabor` | The two-pass additive-Gabor accumulation (`draw_gabor_additive`) | `parametric.vert`, `gabor.frag` |
 | `Dot` | Instanced circular dots (RDK) | `dot.vert/.frag` |
-| `MeshNormals` | Native 3D geometric-normal meshes | `mesh_normals.vert/.frag` |
 
 ## Standard built-ins
 
-Every context constructs all eight current built-ins before frame 0. Psychtoolbox-like calls such as `draw_rect`, `draw_texture`, `draw_gabor`, and `draw_dots` therefore require no pipeline configuration and cannot silently lose their stimulus because a pipeline was omitted.
+Every context constructs all seven base pipelines before frame 0. Psychtoolbox-like calls such as `draw_rect`, `draw_texture`, `draw_gabor`, and `draw_dots` therefore require no pipeline configuration and cannot silently lose their stimulus because a pipeline was omitted.
 
 `AdditiveGabor` and `SubtractiveGabor` are internal passes of one stimulus. A normalized swapchain format cannot carry signed modulation through one additive blend, so `draw_gabor_additive` records separate positive-add and negative-subtract passes. Users select the stimulus through `draw_gabor_additive`, not its implementation passes.
 
-Native mesh-normal rendering is also constructed for now. A follow-up will move native 3D behind a typed capability registered during setup. This will keep the standard 2D interface unconditional while avoiding 3D pipeline and depth-image allocation for experiments that do not use native 3D.
+Controlled mesh rendering lives in the separate `vse-3d` crate. It produces complete offscreen frames through VSE's external-frame seam and owns its depth attachments and 3D pipelines. See [Controlled 3D rendering](../basic-3d-rendering.md).
 
 ## Extending VSE with your own rendering
 
@@ -136,7 +135,7 @@ Everything else records on its own. Two consecutive `draw_texture` calls do *not
 
 Interleaving splits runs. A rectangle, then a texture, then another rectangle records two flat batches instead of one. Grouping draws that share a pipeline is faster; interleaving them is how you control layering. When the two conflict, layering wins — the planner never reorders your draws to improve batching.
 
-Native 3D (`draw_model_normals`) always renders before all 2D draws, in its own depth pass.
+External renderer frames always land below the base-VSE 2D pass. Their internal draw order is owned by the producing renderer.
 
 ## Push constants
 
