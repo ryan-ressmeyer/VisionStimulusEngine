@@ -82,20 +82,14 @@ let mut regenerated = HeadlessContext::builder_from_host_info(&recovered)?
     .build()?;
 ```
 
-That takes the color format, extent, and pipeline suite from
-`HostInfo.swapchain` and `HostInfo.pipeline.builtin_pipelines`. All three change
-the pixels:
+That takes the color format and extent from `HostInfo.swapchain`. Both affect the pixels:
 
 - **Format** — rendering `R8G8B8A8_UNORM` what was displayed as `B8G8R8A8_SRGB`
   gives different bytes for the same stimulus.
 - **Extent** — a different size rasterizes different pixels, not the same
   picture scaled.
-- **Pipeline suite** — a draw whose pipeline is absent renders *nothing*, with
-  only a one-time warning. Check `skipped_draw_count()` at the end of a run.
 
-Both failure modes are refused rather than approximated: an unrecognized format
-name and an unknown pipeline name each return an error, because a regeneration
-that silently substitutes either is worse than one that stops.
+An unrecognized format is refused rather than approximated. Every context now constructs all built-ins, so `HostInfo.pipeline.builtin_pipelines` is retained only for compatibility with older recordings and does not control regeneration.
 
 The clear color and refresh rate are **not** applied automatically — set them
 yourself from `HostInfo.pipeline` if your stimulus depends on them.

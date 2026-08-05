@@ -389,26 +389,10 @@ impl<'a> RenderContext<'a> {
         self.state.frame_number
     }
 
-    /// Total draws this session that rendered nothing because their pipeline
-    /// was absent from the active [`PipelineSuite`] (or, for a Tier 1 draw, was
-    /// never registered). `0` for a healthy session.
-    ///
-    /// Absent pipelines are logged once per kind to keep a 60 Hz loop from
-    /// flooding the log, so the log alone understates the problem. Check this
-    /// at the end of a session — a non-zero count means frames were presented
-    /// without a stimulus the experiment asked for, and the affected data
-    /// should not be trusted.
-    ///
-    /// [`PipelineSuite`]: crate::drawing::PipelineSuite
+    /// Total Tier 1 draws skipped because their registered pipeline had been
+    /// removed before the frame was recorded. `0` for a healthy session.
     pub fn skipped_draw_count(&self) -> u64 {
         self.state.renderer.skipped_draw_total()
-    }
-
-    /// Per-kind breakdown of skipped built-in draws, sorted by pipeline name
-    /// so the report is identical across runs. Empty when
-    /// [`skipped_draw_count`](Self::skipped_draw_count) is `0`.
-    pub fn skipped_draws(&self) -> Vec<(crate::drawing::BuiltinPipeline, u64)> {
-        self.state.renderer.skipped_builtin_counts()
     }
 
     /// Display refresh interval reported by the timing backend or detected from flips.

@@ -21,7 +21,7 @@ pub use model::{Bounds3D, ModelError, ModelHandle, ModelInfo, PerspectiveCamera}
 pub use pipeline::{
     PipelineBuildCtx, PipelineError, RecordCtx, RegisteredPipeline, StimulusPipeline,
 };
-pub use renderer::{BuiltinPipeline, FrameRecorder, PipelineSuite, SuiteError};
+pub use renderer::FrameRecorder;
 pub use stimuli::{GratingParams, NoiseParams, NoiseType, WaveType};
 pub use texture::TextureHandle;
 

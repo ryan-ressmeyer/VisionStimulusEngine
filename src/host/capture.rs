@@ -203,9 +203,7 @@ pub(crate) fn capture_pipeline_config(
         gpu_preference: format!("{:?}", config.gpu_preference),
         present_mode,
         expected_refresh_rate: config.expected_refresh_rate,
-        builtin_pipelines: config
-            .pipeline_suite
-            .key_names()
+        builtin_pipelines: crate::drawing::renderer::builtin_pipeline_names()
             .into_iter()
             .map(str::to_string)
             .collect(),
@@ -439,23 +437,8 @@ mod tests {
         );
     }
 
-    // The built pipeline set is part of the recorded metadata that post-hoc
-    // stimulus regeneration reads back: reproducing a session's pixels needs
-    // the same pipelines, not just the same swapchain format and extent.
-
-    #[test]
-    fn pipeline_config_records_the_selected_builtin_pipelines() {
-        use crate::drawing::{BuiltinPipeline, PipelineSuite};
-
-        let config = RenderConfig {
-            pipeline_suite: PipelineSuite::minimal().with(BuiltinPipeline::Dot),
-            ..Default::default()
-        };
-
-        let captured = capture_pipeline_config(&config, (800, 600), "Fifo".into());
-
-        assert_eq!(captured.builtin_pipelines, vec!["Dot", "FlatColor"]);
-    }
+    // Retained for serialized compatibility with recordings made when built-in
+    // pipelines could be subselected.
 
     #[test]
     fn pipeline_config_records_the_full_suite_by_default() {

@@ -37,9 +37,8 @@ use vision_stimulus_engine::prelude::*;
 /// the frame area, and it is the draw-count slope we want to see.
 const EXTENT: u32 = 64;
 
-fn headless(suite: PipelineSuite) -> HeadlessContext {
+fn headless() -> HeadlessContext {
     HeadlessContext::builder(EXTENT, EXTENT)
-        .with_pipelines(suite)
         .build()
         .expect("benchmarks need a Vulkan device (no display required)")
 }
@@ -49,7 +48,7 @@ fn headless(suite: PipelineSuite) -> HeadlessContext {
 /// Consecutive flats coalesce into a single vertex upload, so this measures the
 /// cost of filling the arena rather than of many separate allocations.
 fn bench_flat_rects(c: &mut Criterion) {
-    let mut ctx = headless(PipelineSuite::minimal());
+    let mut ctx = headless();
     let mut group = c.benchmark_group("record/flat_rects");
 
     for count in [1usize, 64, 512, 2048] {
@@ -81,7 +80,7 @@ fn bench_flat_rects(c: &mut Criterion) {
 /// The dot path uploads an instance buffer from the same arena, so this is its
 /// second consumer.
 fn bench_dot_instances(c: &mut Criterion) {
-    let mut ctx = headless(PipelineSuite::minimal().with(BuiltinPipeline::Dot));
+    let mut ctx = headless();
     let mut group = c.benchmark_group("record/dot_instances");
 
     for count in [16usize, 256, 4096] {
@@ -114,7 +113,7 @@ fn bench_dot_instances(c: &mut Criterion) {
 /// The floor: a flip with nothing queued. Subtract it from the others to
 /// separate the fixed submit/readback cost from the record cost.
 fn bench_empty_flip(c: &mut Criterion) {
-    let mut ctx = headless(PipelineSuite::minimal());
+    let mut ctx = headless();
     c.bench_function("record/empty_flip", |b| {
         b.iter(|| {
             ctx.run_headless(

@@ -11,8 +11,7 @@
 //! Frames regenerate identically on the **same machine and driver** as the
 //! recording. Rasterization is not bit-guaranteed across GPU vendors or driver
 //! versions, so a regeneration run on different hardware may differ in the low
-//! bits. Match the recorded color format, extent, and
-//! [`PipelineSuite`](crate::drawing::PipelineSuite) — rendering to
+//! bits. Match the recorded color format and extent. Rendering to
 //! `R8G8B8A8_UNORM` what was displayed as `B8G8R8A8_SRGB` gives different
 //! bytes even on identical hardware.
 //!
@@ -195,14 +194,7 @@ impl HeadlessContext {
         let device_selector = DeviceSelector::new(config.render.gpu_preference)?;
         let (device, queue) = device_selector.create_standard_device()?;
 
-        let renderer = Renderer::new(
-            device.clone(),
-            queue.clone(),
-            format,
-            1,
-            extent,
-            &config.render.pipeline_suite,
-        )?;
+        let renderer = Renderer::new(device.clone(), queue.clone(), format, 1, extent)?;
 
         let memory_allocator = renderer.memory_allocator();
 

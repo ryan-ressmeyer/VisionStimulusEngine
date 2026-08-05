@@ -9,7 +9,7 @@ A GPU pipeline is a compiled recipe that turns vertex data into pixels. It consi
 - **Vertex format**: the layout of per-vertex data (position, color, UV coordinates).
 - **Push constants**: a small block of parameters sent per draw call (viewport size, stimulus parameters).
 
-**Cost model**: creating a pipeline is expensive (~10-50 ms, involves shader compilation). Binding a pipeline per frame is nearly free (~nanoseconds). VSE builds the pipelines you select once at startup, in `Renderer::new()` — see [Choosing which built-ins to build](#choosing-which-builtins-to-build).
+**Cost model:** creating Vulkan pipelines has a measurable startup cost when the driver shader cache is cold. On the reference Intel/Mesa system, constructing all eight current built-ins added approximately 40 ms with the cache disabled and no measurable cost above initialization noise with a warm cache. Binding an existing pipeline during a frame is inexpensive. VSE constructs the built-ins once before frame 0.
 
 ## How VSE renders a frame
 
@@ -22,9 +22,9 @@ Per-frame vertex data is suballocated from a pooled arena rather than a fresh Vu
 
 ## Built-in pipelines
 
-VSE ships eight built-in pipelines, identified by the `BuiltinPipeline` enum:
+VSE ships eight built-in pipeline objects:
 
-| `BuiltinPipeline` key | Draws | Shaders |
+| Pipeline | Draws | Shaders |
 |---|---|---|
 | `FlatColor` | Rectangles, circles, lines, arcs, text | `flat_color.vert/.frag` |
 | `Textured` | Image and noise textures | `textured.vert/.frag` |
@@ -34,41 +34,13 @@ VSE ships eight built-in pipelines, identified by the `BuiltinPipeline` enum:
 | `Dot` | Instanced circular dots (RDK) | `dot.vert/.frag` |
 | `MeshNormals` | Native 3D geometric-normal meshes | `mesh_normals.vert/.frag` |
 
-## Choosing which built-ins to build
+## Standard built-ins
 
-By default VSE builds all eight. To build only the ones an experiment uses, pass a `PipelineSuite` to the builder:
+Every context constructs all eight current built-ins before frame 0. Psychtoolbox-like calls such as `draw_rect`, `draw_texture`, `draw_gabor`, and `draw_dots` therefore require no pipeline configuration and cannot silently lose their stimulus because a pipeline was omitted.
 
-```rust
-use vision_stimulus_engine::prelude::*;
+`AdditiveGabor` and `SubtractiveGabor` are internal passes of one stimulus. A normalized swapchain format cannot carry signed modulation through one additive blend, so `draw_gabor_additive` records separate positive-add and negative-subtract passes. Users select the stimulus through `draw_gabor_additive`, not its implementation passes.
 
-// Only flat shapes plus dots — skips compiling the grating/Gabor/texture pipelines.
-let context = VSEContext::builder()
-    .with_pipelines(PipelineSuite::minimal().with(BuiltinPipeline::Dot))
-    .build()?;
-```
-
-`PipelineSuite::default()` selects all eight, `minimal()` selects `FlatColor` alone, and `empty()` selects none. Add or remove keys with `.with(key)` / `.without(key)`, and query with `.contains(key)`.
-
-`AdditiveGabor` and `SubtractiveGabor` must be selected together or not at all. They are the positive-add and negative-subtract passes of one draw, because a normalized swapchain format cannot carry signed modulation through a single pass. Selecting one alone would render half the signed modulation, so `build()` rejects it with `SuiteError::UnpairedGaborPass` before a session can start.
-
-### What happens when a pipeline is missing
-
-Two different failures, because they are knowable at two different times:
-
-- **Setup-time calls fail loudly.** `load_image()`, `load_texture_rgba()`, and `draw_noise()` all create a texture, which needs the `Textured` pipeline's descriptor layout. Without it they return an error.
-- **Draw-time calls are skipped and counted.** A queued `draw_*()` whose pipeline was not built renders nothing. VSE logs this at ERROR the first time it sees each kind, then stays quiet so a 60 Hz loop cannot flood the log.
-
-Because the log goes quiet, check the count rather than the log:
-
-```rust
-if vse.skipped_draw_count() > 0 {
-    for (pipeline, count) in vse.skipped_draws() {
-        eprintln!("{pipeline:?}: {count} draws rendered nothing");
-    }
-}
-```
-
-A non-zero count means frames were presented without a stimulus the experiment asked for. Treat the affected data as suspect. The selected pipeline set is also recorded in `HostInfo.pipeline.builtin_pipelines`, so a session's configuration is recoverable from its metadata after the fact.
+Native mesh-normal rendering is also constructed for now. A follow-up will move native 3D behind a typed capability registered during setup. This will keep the standard 2D interface unconditional while avoiding 3D pipeline and depth-image allocation for experiments that do not use native 3D.
 
 ## Extending VSE with your own rendering
 
@@ -126,7 +98,7 @@ context.run_with_setup(
 )?;
 ```
 
-`register_pipeline` runs your `build` immediately, and compiling a pipeline costs tens of milliseconds. `run_with_setup` invokes its setup closure once after the GPU exists but before frame 0, which keeps that cost off the presentation path. Registering before the run loop is not possible at all: choosing a presentation-capable Vulkan device requires a surface, and a surface requires a window.
+`register_pipeline` runs your `build` immediately, and driver pipeline creation can cost tens of milliseconds when its shader cache is cold. `run_with_setup` invokes its setup closure once after the GPU exists but before frame 0, which keeps that cost off the presentation path. Registering before the run loop is not possible at all: choosing a presentation-capable Vulkan device requires a surface, and a surface requires a window.
 
 The returned handle is `Copy`, and its type parameter ties it to your `Command`, so `draw_with` accepts only matching parameters. A handle is also tagged with the context that issued it; using one against a different `VSEContext` returns `PipelineError::ForeignHandle` instead of resolving to whatever pipeline holds that slot.
 

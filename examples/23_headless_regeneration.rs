@@ -12,9 +12,9 @@
 //!    `HostInfo` to `host_info.json`. In a real experiment this is the metadata
 //!    a *displayed* session recorded alongside its data.
 //! 2. **Regenerate.** Rebuild the render target from that JSON with
-//!    [`HeadlessContext::builder_from_host_info`] — color format,
-//!    extent, and pipeline suite all come from the recording, not from
-//!    hand-passed arguments — replay the same closure, and write each frame to
+//!    [`HeadlessContext::builder_from_host_info`] — color format and extent
+//!    come from the recording, not from hand-passed arguments — replay the
+//!    same closure, and write each frame to
 //!    a PNG plus a hash.
 //!
 //! Run it twice: the frame hashes are identical, because every stimulus is a

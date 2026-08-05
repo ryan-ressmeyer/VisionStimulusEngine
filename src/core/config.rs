@@ -12,7 +12,7 @@ use super::{
 };
 use crate::data::ExperimentSession;
 use crate::drawing::renderer::RendererError;
-use crate::drawing::{ModelError, PipelineError, PipelineSuite};
+use crate::drawing::{ModelError, PipelineError};
 
 use super::context::VSEContext;
 
@@ -105,7 +105,6 @@ pub(crate) struct RenderConfig {
     pub(crate) gpu_preference: GPUPreference,
     pub(crate) clear_color: [f32; 4],
     pub(crate) expected_refresh_rate: Option<f64>,
-    pub(crate) pipeline_suite: PipelineSuite,
 }
 
 impl Default for RenderConfig {
@@ -114,7 +113,6 @@ impl Default for RenderConfig {
             gpu_preference: GPUPreference::Discrete,
             clear_color: [0.0, 0.0, 0.0, 1.0],
             expected_refresh_rate: None,
-            pipeline_suite: PipelineSuite::default(),
         }
     }
 }
@@ -267,11 +265,6 @@ impl VSEContextBuilder {
         self
     }
 
-    pub fn with_pipelines(mut self, suite: PipelineSuite) -> Self {
-        self.config.render.pipeline_suite = suite;
-        self
-    }
-
     pub fn with_session(mut self, session: ExperimentSession) -> Self {
         self.session = Some(session);
         self
@@ -282,12 +275,6 @@ impl VSEContextBuilder {
     /// This creates the event loop but defers window and Vulkan initialization
     /// until a displayed runtime starts.
     pub fn build(self) -> Result<VSEContext, VSEError> {
-        self.config
-            .render
-            .pipeline_suite
-            .validate()
-            .map_err(RendererError::from)?;
-
         let event_loop = if self.config.window_mode == WindowMode::DirectDisplay {
             None
         } else {
@@ -351,15 +338,9 @@ impl HeadlessContextBuilder {
                 info.swapchain.image_format
             ))
         })?;
-        let suite = PipelineSuite::from_key_names(&info.pipeline.builtin_pipelines)
-            .map_err(RendererError::from)?;
-
         Ok(Self {
             config: HeadlessConfig {
-                render: RenderConfig {
-                    pipeline_suite: suite,
-                    ..RenderConfig::default()
-                },
+                render: RenderConfig::default(),
                 extent: info.swapchain.extent,
                 format,
             },
@@ -388,11 +369,6 @@ impl HeadlessContextBuilder {
         self
     }
 
-    pub fn with_pipelines(mut self, suite: PipelineSuite) -> Self {
-        self.config.render.pipeline_suite = suite;
-        self
-    }
-
     pub fn with_session(mut self, session: ExperimentSession) -> Self {
         self.session = Some(session);
         self
@@ -400,12 +376,6 @@ impl HeadlessContextBuilder {
 
     /// Eagerly build the GPU and offscreen target.
     pub fn build(self) -> Result<crate::core::HeadlessContext, VSEError> {
-        self.config
-            .render
-            .pipeline_suite
-            .validate()
-            .map_err(RendererError::from)?;
-
         info!(
             "Headless VSE context: {}x{}, {:?}",
             self.config.extent[0], self.config.extent[1], self.config.format
@@ -427,51 +397,4 @@ fn parse_recorded_format(name: &str) -> Option<Format> {
         "R16G16B16A16_SFLOAT" => Format::R16G16B16A16_SFLOAT,
         _ => return None,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::drawing::{BuiltinPipeline, SuiteError};
-
-    #[test]
-    fn displayed_builder_rejects_a_half_configured_additive_gabor_suite() {
-        let result = VSEContext::builder()
-            .with_window_mode(WindowMode::DirectDisplay)
-            .with_pipelines(PipelineSuite::default().without(BuiltinPipeline::SubtractiveGabor))
-            .build();
-
-        let Err(err) = result else {
-            panic!("an unpaired additive-Gabor pass must not reach a running session");
-        };
-        assert!(matches!(
-            err,
-            VSEError::Renderer(RendererError::Suite(SuiteError::UnpairedGaborPass))
-        ));
-    }
-
-    #[test]
-    fn displayed_builder_accepts_a_valid_suite() {
-        let result = VSEContext::builder()
-            .with_window_mode(WindowMode::DirectDisplay)
-            .with_pipelines(PipelineSuite::minimal().with(BuiltinPipeline::Dot))
-            .build();
-
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn headless_builder_rejects_a_half_configured_additive_gabor_suite_before_gpu_init() {
-        let result = HeadlessContextBuilder::new(16, 16)
-            .with_pipelines(PipelineSuite::default().without(BuiltinPipeline::SubtractiveGabor))
-            .build();
-
-        let Err(err) = result else {
-            panic!("an unpaired additive-Gabor pass must not reach GPU initialization");
-        };
-        assert!(matches!(
-            err,
-            VSEError::Renderer(RendererError::Suite(SuiteError::UnpairedGaborPass))
-        ));
-    }
 }

@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
@@ -297,18 +297,9 @@ mod mesh_normals_fs {
     }
 }
 
-/// Key identifying one of VSE's built-in graphics pipelines.
-///
-/// The full suite is always constructed today; this key lets `render()` fetch
-/// each pipeline by identity rather than by a named `Renderer` field, which is
-/// the prerequisite for later suite-subselection and user-registered pipelines
-/// (see `docs/design/pipeline-flexibility.md`).
-///
-/// Marked `#[non_exhaustive]`: VSE may ship further built-ins, and adding one
-/// must not break user code that matches on this enum.
+/// Internal key identifying one of VSE's always-available built-in pipelines.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-#[non_exhaustive]
-pub enum BuiltinPipeline {
+pub(crate) enum BuiltinPipeline {
     FlatColor,
     Textured,
     Grating,
@@ -320,13 +311,8 @@ pub enum BuiltinPipeline {
 }
 
 impl BuiltinPipeline {
-    /// Stable name for this key, used for logging and for the pipeline set
-    /// recorded into [`HostInfo`](crate::host::HostInfo).
-    ///
-    /// These strings are part of the recorded experiment metadata that
-    /// post-hoc stimulus regeneration reads back, so they must stay stable
-    /// across VSE versions even if the enum variants are renamed.
-    pub fn name(self) -> &'static str {
+    /// Stable legacy metadata name for this built-in.
+    fn name(self) -> &'static str {
         match self {
             Self::FlatColor => "FlatColor",
             Self::Textured => "Textured",
@@ -338,186 +324,16 @@ impl BuiltinPipeline {
             Self::MeshNormals => "MeshNormals",
         }
     }
-
-    /// Recover a key from the stable name [`name`](Self::name) produces.
-    ///
-    /// The inverse direction, used when rebuilding a session's
-    /// [`PipelineSuite`] from recorded metadata. `None` for a name this VSE
-    /// version does not know — which, for a regeneration, means the recording
-    /// came from a version that shipped a built-in this one lacks, and the
-    /// caller must say so rather than silently rendering without it.
-    pub fn from_name(name: &str) -> Option<Self> {
-        let all = [
-            Self::FlatColor,
-            Self::Textured,
-            Self::Grating,
-            Self::Gabor,
-            Self::AdditiveGabor,
-            Self::SubtractiveGabor,
-            Self::Dot,
-            Self::MeshNormals,
-        ];
-        all.into_iter().find(|key| key.name() == name)
-    }
 }
 
-/// A [`PipelineSuite`] that cannot render correctly as configured.
-///
-/// Surfaced at context construction, before any stimulus is presented — a
-/// misconfigured suite must never reach the point of recording data.
-#[derive(Error, Debug, PartialEq, Eq)]
-pub enum SuiteError {
-    /// [`BuiltinPipeline::AdditiveGabor`] and
-    /// [`BuiltinPipeline::SubtractiveGabor`] are the two halves of one
-    /// stimulus and must be selected together.
-    #[error(
-        "PipelineSuite selects only one half of the additive-Gabor stimulus: \
-         AdditiveGabor and SubtractiveGabor are the positive-add and \
-         negative-subtract passes of a single draw, and building one without \
-         the other renders half the signed modulation. Select both, or neither"
-    )]
-    UnpairedGaborPass,
-
-    /// A recorded pipeline name this VSE version does not know — see
-    /// [`PipelineSuite::from_key_names`].
-    #[error(
-        "unknown built-in pipeline {0:?} in the recorded pipeline set; the recording \
-         was probably made by a VSE version shipping a built-in this one lacks, so its \
-         stimuli cannot be faithfully regenerated here"
-    )]
-    UnknownPipeline(String),
-}
-
-/// The set of built-in pipelines to build for a session.
-///
-/// Chosen on the builder via [`VSEContextBuilder::with_pipelines`]. Only the
-/// selected pipelines are compiled at startup; a draw whose pipeline is absent
-/// is skipped at render time (with a one-time warning) rather than panicking.
-///
-/// The default is the full suite (all eight built-ins), so existing code that
-/// never calls `with_pipelines` is unaffected.
-///
-/// [`VSEContextBuilder::with_pipelines`]: crate::prelude::VSEContextBuilder::with_pipelines
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PipelineSuite {
-    enabled: HashSet<BuiltinPipeline>,
-}
-
-impl PipelineSuite {
-    /// A suite containing no built-in pipelines.
-    pub fn empty() -> Self {
-        Self {
-            enabled: HashSet::new(),
-        }
-    }
-
-    /// A minimal suite: [`BuiltinPipeline::FlatColor`] only.
-    pub fn minimal() -> Self {
-        Self::empty().with(BuiltinPipeline::FlatColor)
-    }
-
-    /// Add a built-in pipeline to the suite (chainable).
-    pub fn with(mut self, pipeline: BuiltinPipeline) -> Self {
-        self.enabled.insert(pipeline);
-        self
-    }
-
-    /// Remove a built-in pipeline from the suite (chainable).
-    pub fn without(mut self, pipeline: BuiltinPipeline) -> Self {
-        self.enabled.remove(&pipeline);
-        self
-    }
-
-    /// Whether the suite contains the given built-in pipeline.
-    pub fn contains(&self, pipeline: BuiltinPipeline) -> bool {
-        self.enabled.contains(&pipeline)
-    }
-
-    /// Number of built-in pipelines in the suite.
-    pub fn len(&self) -> usize {
-        self.enabled.len()
-    }
-
-    /// Whether the suite is empty.
-    pub fn is_empty(&self) -> bool {
-        self.enabled.is_empty()
-    }
-
-    /// Check that the suite can render every stimulus it claims to support.
-    ///
-    /// Called during context construction, so a misconfigured suite fails
-    /// before the first frame rather than degrading a stimulus mid-session.
-    ///
-    /// # Errors
-    ///
-    /// [`SuiteError::UnpairedGaborPass`] if exactly one of
-    /// [`BuiltinPipeline::AdditiveGabor`] / [`BuiltinPipeline::SubtractiveGabor`]
-    /// is selected. Signed modulation cannot survive a normalized swapchain
-    /// format in one pass, so `draw_gabor_additive` splits into a positive-add
-    /// and a negative-magnitude-subtract pass. With only one of them built, the
-    /// stimulus renders at half its signed modulation — wrong, but plausible
-    /// enough to go unnoticed.
-    pub fn validate(&self) -> Result<(), SuiteError> {
-        if self.contains(BuiltinPipeline::AdditiveGabor)
-            != self.contains(BuiltinPipeline::SubtractiveGabor)
-        {
-            return Err(SuiteError::UnpairedGaborPass);
-        }
-        Ok(())
-    }
-
-    /// Whether this suite needs depth attachments.
-    ///
-    /// Only [`BuiltinPipeline::MeshNormals`] renders with depth. Without it,
-    /// the renderer skips selecting a depth format and allocating one
-    /// full-resolution depth image per swapchain image.
-    pub fn needs_depth(&self) -> bool {
-        self.contains(BuiltinPipeline::MeshNormals)
-    }
-
-    /// The suite's keys as stable, sorted names.
-    ///
-    /// Sorted because the backing [`HashSet`] iterates in a nondeterministic
-    /// order, and this list is recorded into
-    /// [`HostInfo`](crate::host::HostInfo) as part of the metadata that
-    /// post-hoc stimulus regeneration reads back. It must be identical across
-    /// runs of the same configuration.
-    pub fn key_names(&self) -> Vec<&'static str> {
-        let mut names: Vec<&'static str> = self.enabled.iter().map(|key| key.name()).collect();
-        names.sort_unstable();
-        names
-    }
-
-    /// Rebuild a suite from the names [`key_names`](Self::key_names) recorded.
-    ///
-    /// # Errors
-    ///
-    /// [`SuiteError::UnknownPipeline`] if a name is not one this VSE version
-    /// knows. Regeneration must fail loudly here: silently dropping a pipeline
-    /// the recording used would produce a frame missing a stimulus, which is
-    /// exactly the failure that must never pass for a faithful reproduction.
-    pub fn from_key_names<S: AsRef<str>>(names: &[S]) -> Result<Self, SuiteError> {
-        let mut enabled = HashSet::new();
-        for name in names {
-            let name = name.as_ref();
-            let key = BuiltinPipeline::from_name(name)
-                .ok_or_else(|| SuiteError::UnknownPipeline(name.to_string()))?;
-            enabled.insert(key);
-        }
-        Ok(Self { enabled })
-    }
-}
-
-impl Default for PipelineSuite {
-    /// The full built-in suite (all eight pipelines) — today's default behavior.
-    fn default() -> Self {
-        Self {
-            enabled: builtin_pipeline_descriptors()
-                .into_iter()
-                .map(|descriptor| descriptor.key)
-                .collect(),
-        }
-    }
+/// Stable, sorted names retained in `HostInfo` for serialized compatibility.
+pub(crate) fn builtin_pipeline_names() -> Vec<&'static str> {
+    let mut names: Vec<_> = builtin_pipeline_descriptors()
+        .into_iter()
+        .map(|descriptor| descriptor.key.name())
+        .collect();
+    names.sort_unstable();
+    names
 }
 
 /// Builds a single built-in pipeline. The uniform `(device, swapchain_format,
@@ -532,10 +348,7 @@ struct BuiltinPipelineDescriptor {
     build: BuiltinPipelineBuilder,
 }
 
-/// The list of built-in pipeline descriptors that make up the default suite.
-///
-/// This is device-free: it only names the pipelines and their builders, so the
-/// registry's key set can be asserted without a Vulkan device.
+/// The complete list of built-in pipelines constructed for every context.
 fn builtin_pipeline_descriptors() -> [BuiltinPipelineDescriptor; 8] {
     [
         BuiltinPipelineDescriptor {
@@ -579,28 +392,13 @@ fn builtin_pipeline_descriptors() -> [BuiltinPipelineDescriptor; 8] {
     ]
 }
 
-/// Tally of draws that rendered nothing because their pipeline was absent.
-///
-/// Two jobs in one place. It decides when to log — the first skip of a kind
-/// warns, later ones stay quiet so a 60 Hz loop cannot flood the log — and it
-/// keeps counting after it stops warning, so an experimenter can ask after the
-/// session whether any frame was missing a stimulus. Silence in the log must
-/// not be mistaken for nothing having gone wrong.
+/// Tally of Tier 1 draws whose registered pipeline is no longer present.
 #[derive(Default, Debug)]
 pub(crate) struct SkippedDraws {
-    builtin: HashMap<BuiltinPipeline, u64>,
     registered: HashMap<u64, u64>,
 }
 
 impl SkippedDraws {
-    /// Tally a skipped built-in draw. Returns `true` only on the first skip of
-    /// this kind, which the caller uses to warn once.
-    fn record_builtin(&mut self, key: BuiltinPipeline) -> bool {
-        let count = self.builtin.entry(key).or_insert(0);
-        *count += 1;
-        *count == 1
-    }
-
     /// Tally a skipped Tier 1 registered draw. Returns `true` only on the first
     /// skip for this pipeline id.
     fn record_registered(&mut self, id: u64) -> bool {
@@ -609,18 +407,8 @@ impl SkippedDraws {
         *count == 1
     }
 
-    /// Total draws skipped this session, built-in and registered.
     pub(crate) fn total(&self) -> u64 {
-        self.builtin.values().chain(self.registered.values()).sum()
-    }
-
-    /// Per-kind built-in skip counts, sorted by key name so the report is
-    /// reproducible across runs (the backing map iterates nondeterministically).
-    pub(crate) fn builtin_counts(&self) -> Vec<(BuiltinPipeline, u64)> {
-        let mut counts: Vec<(BuiltinPipeline, u64)> =
-            self.builtin.iter().map(|(k, v)| (*k, *v)).collect();
-        counts.sort_unstable_by_key(|(key, _)| key.name());
-        counts
+        self.registered.values().sum()
     }
 }
 
@@ -633,31 +421,23 @@ pub(crate) struct Pipelines {
 }
 
 impl Pipelines {
-    /// Build only the pipelines selected by `suite` from
-    /// [`builtin_pipeline_descriptors`]. Descriptors whose key is not in the
-    /// suite are skipped, so their shaders are never compiled.
     fn new(
         device: &Arc<Device>,
         swapchain_format: Format,
         depth_format: Format,
-        suite: &PipelineSuite,
     ) -> Result<Self, RendererError> {
         let mut pipelines = HashMap::new();
         for descriptor in builtin_pipeline_descriptors() {
-            if !suite.contains(descriptor.key) {
-                continue;
-            }
             let pipeline = (descriptor.build)(device, swapchain_format, depth_format)?;
             pipelines.insert(descriptor.key, pipeline);
         }
         Ok(Self { pipelines })
     }
 
-    /// Fetch a built-in pipeline by key, or `None` if it is not in the active
-    /// suite. The render path uses this to skip (and warn about) absent
-    /// pipelines rather than panicking.
-    fn get_opt(&self, key: BuiltinPipeline) -> Option<&Arc<GraphicsPipeline>> {
-        self.pipelines.get(&key)
+    fn get(&self, key: BuiltinPipeline) -> &Arc<GraphicsPipeline> {
+        self.pipelines
+            .get(&key)
+            .expect("every built-in pipeline is constructed at initialization")
     }
 }
 
@@ -693,9 +473,6 @@ pub enum RendererError {
 
     #[error("Failed to create depth attachments: {0}")]
     DepthCreationFailed(String),
-
-    #[error(transparent)]
-    Suite(#[from] SuiteError),
 }
 
 /// GPU resources for a loaded texture.
@@ -770,10 +547,6 @@ pub(crate) struct Renderer {
     vertex_allocator: SubbufferAllocator,
     dot_quad_buffer: Subbuffer<[DotInstance]>,
     depth_format: Format,
-    /// Whether the active suite includes a depth-using pipeline. When false,
-    /// `depth_views` stays empty and no depth images are allocated (one
-    /// full-resolution image per swapchain image is not free).
-    needs_depth: bool,
     depth_views: Vec<Arc<ImageView>>,
 
     textures: HashMap<u64, TextureResources>,
@@ -801,10 +574,7 @@ pub(crate) struct Renderer {
     command_scratch: Vec<Option<DrawCommand>>,
     kind_scratch: Vec<DrawKind>,
 
-    /// Draws that rendered nothing because their pipeline was absent. Warns
-    /// once per kind and keeps counting thereafter, so a quiet log is not
-    /// mistaken for a clean session. Interior-mutable because the render loops
-    /// reach it while holding `self` immutably.
+    /// Registered draws whose pipeline was removed before recording.
     skipped_draws: RefCell<SkippedDraws>,
 
     /// User-registered Tier 1 pipelines, keyed by the id handed back in a
@@ -822,14 +592,13 @@ pub(crate) struct Renderer {
 }
 
 impl Renderer {
-    /// Create a new Renderer, compiling only the pipelines in `suite`.
+    /// Create a renderer with the complete built-in pipeline set.
     pub fn new(
         device: Arc<Device>,
         queue: Arc<Queue>,
         swapchain_format: Format,
         image_count: usize,
         extent: [u32; 2],
-        suite: &PipelineSuite,
     ) -> Result<Self, RendererError> {
         let command_buffer_allocator: Arc<dyn CommandBufferAllocator> = Arc::new(
             StandardCommandBufferAllocator::new(device.clone(), Default::default()),
@@ -838,11 +607,6 @@ impl Renderer {
         let descriptor_set_allocator: Arc<dyn DescriptorSetAllocator> = Arc::new(
             StandardDescriptorSetAllocator::new(device.clone(), Default::default()),
         );
-
-        // Reject a suite that cannot render a stimulus correctly BEFORE any
-        // GPU resources are built, so a misconfiguration fails at startup
-        // rather than degrading a stimulus once data collection is underway.
-        suite.validate()?;
 
         let vertex_allocator = SubbufferAllocator::new(
             memory_allocator.clone(),
@@ -855,18 +619,10 @@ impl Renderer {
         );
 
         let dot_quad_buffer = Self::create_dot_quad_buffer(memory_allocator.clone())?;
-        // The format query is a cheap `format_properties` call with no
-        // allocation, so it stays unconditional — `PipelineBuildCtx` exposes it
-        // to user pipelines that opt into a depth attachment of their own. Only
-        // the depth *images* are gated on the suite.
         let depth_format = Self::select_depth_format(&device)?;
-        let pipelines = Pipelines::new(&device, swapchain_format, depth_format, suite)?;
-        let needs_depth = suite.needs_depth();
-        let depth_views = if needs_depth {
-            Self::create_depth_views(memory_allocator.clone(), depth_format, image_count, extent)?
-        } else {
-            Vec::new()
-        };
+        let pipelines = Pipelines::new(&device, swapchain_format, depth_format)?;
+        let depth_views =
+            Self::create_depth_views(memory_allocator.clone(), depth_format, image_count, extent)?;
 
         Ok(Self {
             device,
@@ -878,7 +634,6 @@ impl Renderer {
             vertex_allocator,
             dot_quad_buffer,
             depth_format,
-            needs_depth,
             depth_views,
             textures: HashMap::new(),
             noise_cache: NoiseTextureCache::new(NOISE_CACHE_CAPACITY),
@@ -974,37 +729,12 @@ impl Renderer {
             tracing::error!(
                 "skipping registered draw: no pipeline registered under id {id} \
                  (was register_pipeline called on this VSE context?). \
-                 This and any further skips are counted in skipped_draws()"
+                 This and any further skips are counted by skipped_draw_count()"
             );
         }
     }
 
-    /// Tally a draw skipped because its built-in pipeline is not in the active
-    /// [`PipelineSuite`], logging on the first occurrence per kind.
-    ///
-    /// Logged at ERROR, not WARN: the frame presented without a stimulus the
-    /// experiment asked for. Subsequent skips are silent but still counted —
-    /// see [`skipped_draws`](Self::skipped_draws).
-    fn warn_absent_pipeline(&self, key: BuiltinPipeline) {
-        if self.skipped_draws.borrow_mut().record_builtin(key) {
-            tracing::error!(
-                "skipping draw: built-in pipeline {key:?} is not in the active PipelineSuite, \
-                 so this stimulus rendered NOTHING; add it with \
-                 `.with_pipelines(PipelineSuite::default())` or \
-                 `PipelineSuite::...with(BuiltinPipeline::{key:?})`. \
-                 Further skips of this kind are silent but counted in skipped_draws()"
-            );
-        }
-    }
-
-    /// Per-kind counts of draws that rendered nothing because their built-in
-    /// pipeline was absent, sorted by key name. Empty when every queued draw
-    /// found its pipeline.
-    pub(crate) fn skipped_builtin_counts(&self) -> Vec<(BuiltinPipeline, u64)> {
-        self.skipped_draws.borrow().builtin_counts()
-    }
-
-    /// Total draws skipped this session, built-in and registered.
+    /// Total registered draws skipped this session.
     pub(crate) fn skipped_draw_total(&self) -> u64 {
         self.skipped_draws.borrow().total()
     }
@@ -1093,9 +823,6 @@ impl Renderer {
         image_count: usize,
         extent: [u32; 2],
     ) -> Result<(), RendererError> {
-        if !self.needs_depth {
-            return Ok(());
-        }
         self.depth_views = Self::create_depth_views(
             self.memory_allocator.clone(),
             self.depth_format,
@@ -1235,21 +962,8 @@ impl Renderer {
             depth_range: 0.0..=1.0,
         };
 
-        // Resolve the mesh pipeline ONCE, before opening the 3D pass. Checking
-        // it per instance (as this used to) both re-warned on every mesh and
-        // forced the depth attachment to exist even when the pipeline was
-        // absent from the suite. Cloned out of `self.pipelines` so the borrow
-        // ends before the `&mut builder` recording below.
-        let mesh_normals_pipeline = self
-            .pipelines
-            .get_opt(BuiltinPipeline::MeshNormals)
-            .cloned();
-        if !self.draw_commands_3d.is_empty() && mesh_normals_pipeline.is_none() {
-            self.warn_absent_pipeline(BuiltinPipeline::MeshNormals);
-        }
-        if let (false, Some(mesh_normals_pipeline)) =
-            (self.draw_commands_3d.is_empty(), mesh_normals_pipeline)
-        {
+        let mesh_normals_pipeline = self.pipelines.get(BuiltinPipeline::MeshNormals).clone();
+        if !self.draw_commands_3d.is_empty() {
             let depth_view = self.depth_views.get(image_index).cloned().ok_or_else(|| {
                 RendererError::DepthCreationFailed(format!(
                     "no depth attachment for swapchain image {image_index}"
@@ -1366,8 +1080,7 @@ impl Renderer {
         // preserving the flat-color batch for each run of consecutive flats
         // (docs/design/pipeline-flexibility.md §4-5). The per-command recording
         // — buffers, push constants, blend/two-pass selection, descriptor sets,
-        // dot instancing, degenerate-input guards, and warn-once absent-pipeline
-        // gating — is byte-for-byte unchanged; only the order and the
+        // dot instancing, and degenerate-input guards — is unchanged; only the order and the
         // flat-coalescing scope differ.
         //
         // Ownership: a `Custom` command holds a `FnOnce` that must be MOVED to be
@@ -1405,12 +1118,7 @@ impl Renderer {
                     if self.flat_vertex_scratch.is_empty() {
                         continue;
                     }
-                    let Some(flat_color_pipeline) =
-                        self.pipelines.get_opt(BuiltinPipeline::FlatColor)
-                    else {
-                        self.warn_absent_pipeline(BuiltinPipeline::FlatColor);
-                        continue;
-                    };
+                    let flat_color_pipeline = self.pipelines.get(BuiltinPipeline::FlatColor);
                     let vertex_buffer = self.upload_vertices(&self.flat_vertex_scratch)?;
 
                     let vertex_count = vertex_buffer.len() as u32;
@@ -1498,12 +1206,8 @@ impl Renderer {
                                 let (texture_id, left, top, right, bottom) =
                                     (*texture_id, *left, *top, *right, *bottom);
 
-                                let Some(textured_pipeline) =
-                                    self.pipelines.get_opt(BuiltinPipeline::Textured)
-                                else {
-                                    self.warn_absent_pipeline(BuiltinPipeline::Textured);
-                                    continue;
-                                };
+                                let textured_pipeline =
+                                    self.pipelines.get(BuiltinPipeline::Textured);
 
                                 let resources = self
                                     .textures
@@ -1615,48 +1319,18 @@ impl Renderer {
                                 let vertex_buffer = self.upload_vertices(&quad)?;
 
                                 let first_pass = if is_grating {
-                                    let Some(pipeline) =
-                                        self.pipelines.get_opt(BuiltinPipeline::Grating)
-                                    else {
-                                        self.warn_absent_pipeline(BuiltinPipeline::Grating);
-                                        continue;
-                                    };
-                                    (pipeline, 0u32)
+                                    (self.pipelines.get(BuiltinPipeline::Grating), 0u32)
                                 } else if additive {
-                                    let Some(pipeline) =
-                                        self.pipelines.get_opt(BuiltinPipeline::AdditiveGabor)
-                                    else {
-                                        self.warn_absent_pipeline(BuiltinPipeline::AdditiveGabor);
-                                        continue;
-                                    };
-                                    (pipeline, 1u32)
+                                    (self.pipelines.get(BuiltinPipeline::AdditiveGabor), 1u32)
                                 } else {
-                                    let Some(pipeline) =
-                                        self.pipelines.get_opt(BuiltinPipeline::Gabor)
-                                    else {
-                                        self.warn_absent_pipeline(BuiltinPipeline::Gabor);
-                                        continue;
-                                    };
-                                    (pipeline, 0u32)
+                                    (self.pipelines.get(BuiltinPipeline::Gabor), 0u32)
                                 };
                                 // Normalized swapchain formats cannot reliably carry a negative
                                 // fragment source into ONE+ONE blending. Split signed modulation
-                                // into positive-add and negative-magnitude subtract passes. If the
-                                // subtractive pipeline is absent, skip just the second pass.
-                                let second_pass = if additive {
-                                    match self.pipelines.get_opt(BuiltinPipeline::SubtractiveGabor)
-                                    {
-                                        Some(pipeline) => Some((pipeline, 2u32)),
-                                        None => {
-                                            self.warn_absent_pipeline(
-                                                BuiltinPipeline::SubtractiveGabor,
-                                            );
-                                            None
-                                        }
-                                    }
-                                } else {
-                                    None
-                                };
+                                // into positive-add and negative-magnitude subtract passes.
+                                let second_pass = additive.then(|| {
+                                    (self.pipelines.get(BuiltinPipeline::SubtractiveGabor), 2u32)
+                                });
 
                                 for (pipeline, composite_mode) in
                                     std::iter::once(first_pass).chain(second_pass)
@@ -1720,12 +1394,7 @@ impl Renderer {
                                 let instance_buffer =
                                     self.upload_vertices(&self.dot_instance_scratch)?;
 
-                                let Some(dot_pipeline) =
-                                    self.pipelines.get_opt(BuiltinPipeline::Dot)
-                                else {
-                                    self.warn_absent_pipeline(BuiltinPipeline::Dot);
-                                    continue;
-                                };
+                                let dot_pipeline = self.pipelines.get(BuiltinPipeline::Dot);
 
                                 let c = color.to_array();
                                 builder
@@ -1913,18 +1582,10 @@ impl Renderer {
         )
         .map_err(|e| RendererError::TextureCreationFailed(e.to_string()))?;
 
-        // Create descriptor set. The layout comes from the textured pipeline, so
-        // loading a texture requires it to be in the active suite.
+        // Create a descriptor set using the always-available textured pipeline.
         let layout = self
             .pipelines
-            .get_opt(BuiltinPipeline::Textured)
-            .ok_or_else(|| {
-                RendererError::DescriptorSetFailed(
-                    "textured pipeline not in active PipelineSuite — add BuiltinPipeline::Textured \
-                     to load textures"
-                        .to_string(),
-                )
-            })?
+            .get(BuiltinPipeline::Textured)
             .layout()
             .set_layouts()
             .first()
@@ -2503,126 +2164,6 @@ mod tests {
         assert_eq!(keys, expected);
     }
 
-    #[test]
-    fn pipeline_suite_default_contains_all_eight_builtins() {
-        // Spelled out rather than derived from `builtin_pipeline_descriptors()`.
-        // Deriving the expectation from the code under test would let a
-        // pipeline silently disappear from BOTH the descriptor list and the
-        // default suite without failing anything.
-        let suite = PipelineSuite::default();
-        for key in [
-            BuiltinPipeline::FlatColor,
-            BuiltinPipeline::Textured,
-            BuiltinPipeline::Grating,
-            BuiltinPipeline::Gabor,
-            BuiltinPipeline::AdditiveGabor,
-            BuiltinPipeline::SubtractiveGabor,
-            BuiltinPipeline::Dot,
-            BuiltinPipeline::MeshNormals,
-        ] {
-            assert!(suite.contains(key), "default suite must contain {key:?}");
-        }
-        assert_eq!(suite.len(), 8, "and nothing beyond the eight built-ins");
-    }
-
-    #[test]
-    fn pipeline_suite_minimal_contains_only_flat_color() {
-        let suite = PipelineSuite::minimal();
-        assert!(suite.contains(BuiltinPipeline::FlatColor));
-        assert_eq!(suite.len(), 1);
-        assert!(!suite.contains(BuiltinPipeline::Textured));
-    }
-
-    #[test]
-    fn pipeline_suite_empty_contains_none() {
-        let suite = PipelineSuite::empty();
-        assert_eq!(suite.len(), 0);
-        for descriptor in builtin_pipeline_descriptors() {
-            assert!(!suite.contains(descriptor.key));
-        }
-    }
-
-    #[test]
-    fn pipeline_suite_with_and_without_add_and_remove_keys() {
-        let suite = PipelineSuite::empty().with(BuiltinPipeline::Dot);
-        assert!(suite.contains(BuiltinPipeline::Dot));
-        assert!(!suite.contains(BuiltinPipeline::Gabor));
-
-        let suite = suite.with(BuiltinPipeline::Gabor);
-        assert!(suite.contains(BuiltinPipeline::Gabor));
-
-        let suite = suite.without(BuiltinPipeline::Dot);
-        assert!(!suite.contains(BuiltinPipeline::Dot));
-        assert!(suite.contains(BuiltinPipeline::Gabor));
-    }
-
-    // --- Suite validation ---
-    //
-    // The additive-Gabor stimulus is TWO passes: a positive-add pass
-    // (`AdditiveGabor`) and a negative-magnitude subtract pass
-    // (`SubtractiveGabor`). Building one without the other renders half the
-    // signed modulation — a plausible-looking but scientifically WRONG
-    // stimulus. That must fail at construction, not warn at render time.
-
-    #[test]
-    fn suite_with_additive_gabor_but_no_subtractive_is_rejected() {
-        let suite = PipelineSuite::default().without(BuiltinPipeline::SubtractiveGabor);
-        let err = suite
-            .validate()
-            .expect_err("additive without subtractive renders half the modulation");
-        assert!(matches!(err, SuiteError::UnpairedGaborPass));
-    }
-
-    #[test]
-    fn suite_with_subtractive_gabor_but_no_additive_is_rejected() {
-        // The orphaned direction is not wrong on screen, but the two keys are a
-        // unit; rejecting it tells the user they belong together rather than
-        // silently compiling a pipeline nothing can reach.
-        let suite = PipelineSuite::default().without(BuiltinPipeline::AdditiveGabor);
-        let err = suite
-            .validate()
-            .expect_err("the two additive-Gabor passes are a unit");
-        assert!(matches!(err, SuiteError::UnpairedGaborPass));
-    }
-
-    #[test]
-    fn suite_validates_when_both_or_neither_gabor_pass_is_present() {
-        PipelineSuite::default()
-            .validate()
-            .expect("the full suite has both passes");
-
-        PipelineSuite::default()
-            .without(BuiltinPipeline::AdditiveGabor)
-            .without(BuiltinPipeline::SubtractiveGabor)
-            .validate()
-            .expect("neither pass is a valid suite — draw_gabor_additive is simply unavailable");
-
-        PipelineSuite::minimal()
-            .validate()
-            .expect("minimal has neither pass");
-
-        PipelineSuite::empty()
-            .validate()
-            .expect("an empty suite builds nothing and is valid");
-    }
-
-    // --- Depth attachments follow the suite ---
-
-    #[test]
-    fn depth_attachments_are_needed_only_for_the_mesh_normals_pipeline() {
-        // MeshNormals is the only built-in with a depth attachment. Without it
-        // in the suite, allocating one full-resolution depth image per
-        // swapchain image is pure waste.
-        assert!(PipelineSuite::default().needs_depth());
-        assert!(PipelineSuite::empty()
-            .with(BuiltinPipeline::MeshNormals)
-            .needs_depth());
-        assert!(!PipelineSuite::minimal().needs_depth());
-        assert!(!PipelineSuite::default()
-            .without(BuiltinPipeline::MeshNormals)
-            .needs_depth());
-    }
-
     // --- Degenerate flat-color inputs ---
     //
     // A stimulus parameter can legitimately sweep to zero (a contracting
@@ -2798,62 +2339,15 @@ mod tests {
         }
     }
 
-    // --- Skipped-draw accounting ---
-    //
-    // A draw whose pipeline is absent renders nothing. Warning once per kind
-    // keeps the log readable, but "once" must not mean the remaining
-    // occurrences vanish: an experimenter needs to know after the fact that
-    // frames were missing stimuli, and how many.
-
     #[test]
-    fn skipped_draws_signals_warn_only_on_the_first_occurrence_of_a_kind() {
-        let mut skipped = SkippedDraws::default();
-
-        assert!(
-            skipped.record_builtin(BuiltinPipeline::Textured),
-            "first skip of a kind warns"
-        );
-        assert!(
-            !skipped.record_builtin(BuiltinPipeline::Textured),
-            "later skips of the same kind stay quiet"
-        );
-        assert!(
-            skipped.record_builtin(BuiltinPipeline::Dot),
-            "a different kind warns on its own first occurrence"
-        );
-    }
-
-    #[test]
-    fn skipped_draws_keeps_counting_after_it_stops_warning() {
-        let mut skipped = SkippedDraws::default();
-        for _ in 0..2000 {
-            skipped.record_builtin(BuiltinPipeline::Grating);
-        }
-        skipped.record_builtin(BuiltinPipeline::Dot);
-
-        assert_eq!(skipped.total(), 2001);
-        assert_eq!(
-            skipped.builtin_counts(),
-            vec![(BuiltinPipeline::Dot, 1), (BuiltinPipeline::Grating, 2000)],
-            "counts report sorted by key name, so the report is reproducible"
-        );
-    }
-
-    #[test]
-    fn skipped_draws_tracks_registered_pipelines_separately_from_builtins() {
+    fn skipped_draws_counts_registered_pipelines_after_the_warning() {
         let mut skipped = SkippedDraws::default();
 
         assert!(skipped.record_registered(7));
         assert!(!skipped.record_registered(7));
         assert!(skipped.record_registered(9));
-        skipped.record_builtin(BuiltinPipeline::Dot);
 
-        assert_eq!(skipped.total(), 4);
-        assert_eq!(
-            skipped.builtin_counts(),
-            vec![(BuiltinPipeline::Dot, 1)],
-            "registered-pipeline skips do not masquerade as built-in skips"
-        );
+        assert_eq!(skipped.total(), 3);
     }
 
     #[test]
@@ -2862,28 +2356,6 @@ mod tests {
         // checks to confirm no frame was presented missing a stimulus.
         let skipped = SkippedDraws::default();
         assert_eq!(skipped.total(), 0);
-        assert!(skipped.builtin_counts().is_empty());
-    }
-
-    // --- Deterministic reporting (feeds HostInfo, and headless regeneration) ---
-
-    #[test]
-    fn suite_key_names_are_sorted_so_host_info_is_reproducible() {
-        // `PipelineSuite` is backed by a HashSet, whose iteration order varies
-        // run to run. The recorded key list is an input to byte-identical
-        // stimulus regeneration, so it must be stable across runs.
-        let suite = PipelineSuite::empty()
-            .with(BuiltinPipeline::MeshNormals)
-            .with(BuiltinPipeline::Dot)
-            .with(BuiltinPipeline::FlatColor);
-
-        assert_eq!(suite.key_names(), vec!["Dot", "FlatColor", "MeshNormals"]);
-        // Same set built in a different order reports identically.
-        let reordered = PipelineSuite::empty()
-            .with(BuiltinPipeline::FlatColor)
-            .with(BuiltinPipeline::MeshNormals)
-            .with(BuiltinPipeline::Dot);
-        assert_eq!(suite.key_names(), reordered.key_names());
     }
 
     #[test]

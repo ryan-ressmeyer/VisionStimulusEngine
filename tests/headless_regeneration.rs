@@ -37,12 +37,9 @@ fn render_scene(ctx: &mut vision_stimulus_engine::core::HeadlessContext) -> Vec<
 }
 
 #[test]
-fn a_session_rebuilt_from_its_recorded_host_info_regenerates_the_same_pixels() {
-    let suite = PipelineSuite::minimal().with(BuiltinPipeline::Dot);
-
+fn legacy_pipeline_subselection_does_not_suppress_builtins_during_regeneration() {
     // --- The "recorded" session ---
     let mut original = HeadlessContext::builder(48, 32)
-        .with_pipelines(suite.clone())
         .with_clear_color(0.25, 0.25, 0.25, 1.0)
         .build()
         .expect("headless context");
@@ -52,7 +49,8 @@ fn a_session_rebuilt_from_its_recorded_host_info_regenerates_the_same_pixels() {
     // Round-trip the metadata through JSON exactly as a real regeneration
     // would: the recording on disk is all a later analysis has.
     let json = serde_json::to_string(&recorded_info).expect("serialize host info");
-    let recovered: HostInfo = serde_json::from_str(&json).expect("deserialize host info");
+    let mut recovered: HostInfo = serde_json::from_str(&json).expect("deserialize host info");
+    recovered.pipeline.builtin_pipelines = vec!["FlatColor".into()];
 
     // --- The regeneration ---
     let mut regenerated = HeadlessContext::builder_from_host_info(&recovered)
@@ -83,6 +81,41 @@ fn a_session_rebuilt_from_its_recorded_host_info_regenerates_the_same_pixels() {
     assert_eq!(
         regenerated_pixels, original_pixels,
         "a session rebuilt from its own recorded metadata must reproduce its pixels"
+    );
+}
+
+#[test]
+fn recordings_without_legacy_pipeline_metadata_still_deserialize() {
+    let original = HeadlessContext::builder(16, 16)
+        .build()
+        .expect("headless context");
+    let mut json = serde_json::to_value(original.capture_host_info()).expect("serialize host info");
+    json["pipeline"]
+        .as_object_mut()
+        .expect("pipeline metadata object")
+        .remove("builtin_pipelines");
+
+    let recovered: Result<HostInfo, _> = serde_json::from_value(json);
+    assert!(
+        recovered.is_ok(),
+        "recordings predating builtin_pipelines must remain readable"
+    );
+}
+
+#[test]
+fn unknown_legacy_pipeline_names_do_not_block_regeneration() {
+    let original = HeadlessContext::builder(16, 16)
+        .build()
+        .expect("headless context");
+    let mut recorded_info = original.capture_host_info();
+    recorded_info
+        .pipeline
+        .builtin_pipelines
+        .push("FuturePipeline".into());
+
+    assert!(
+        HeadlessContext::builder_from_host_info(&recorded_info).is_ok(),
+        "pipeline names are legacy metadata and must not control reconstruction"
     );
 }
 

@@ -211,13 +211,11 @@ pub struct PipelineConfig {
     pub gpu_preference: String,
     pub present_mode: String,
     pub expected_refresh_rate: Option<f64>,
-    /// Names of the built-in graphics pipelines compiled for this session
-    /// (see [`PipelineSuite`](crate::drawing::PipelineSuite)), sorted.
+    /// Legacy list of built-in pipelines, retained for serialized compatibility.
     ///
-    /// Recorded because reproducing a session's pixels post hoc needs the same
-    /// pipeline set, not only the same swapchain format and extent — a draw
-    /// whose pipeline was absent produced nothing on screen, and that has to be
-    /// recoverable from the session metadata alone.
+    /// All built-ins are now constructed for every context, so regeneration
+    /// ignores this field. New recordings contain the complete built-in set.
+    #[serde(default)]
     pub builtin_pipelines: Vec<String>,
 }
 

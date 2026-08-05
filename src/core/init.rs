@@ -265,7 +265,6 @@ impl VSEContext {
             swapchain.format(),
             swapchain.images().len(),
             swapchain.extent(),
-            &config.render.pipeline_suite,
         )?;
 
         let clock = Clock::new();
