@@ -42,7 +42,7 @@ fn main() -> Result<()> {
                 let frame = *rendered_in_callback.borrow();
                 vse.set_clear_color(frame as f32 / FRAME_COUNT as f32, 0.0, 0.0, 1.0);
                 if frame == FRAME_COUNT {
-                    vse.close();
+                    vse.request_exit();
                 }
                 Ok(BufferedFrame::new(()))
             },

@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn test_writer_message_variants() {
         // Just verify enum variants compile and can be pattern matched
-        let msgs = vec![
+        let msgs = [
             WriterMessage::Frame(FrameMessage {
                 flip: make_flip(0),
                 payload: None,

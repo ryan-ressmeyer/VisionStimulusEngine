@@ -205,6 +205,8 @@ context.run(move |vse| {
 For experiments requiring exact input timing (reaction time measurement), use the event queue instead of polling. Each event carries a `Timestamp` from the VSE `Clock`, making it directly comparable to `FlipInfo` timestamps.
 
 ```rust
+use vision_stimulus_engine::core::InputEvent;
+
 // Show stimulus
 vse.draw_rect(350.0, 250.0, 450.0, 350.0, Color::WHITE);
 vse.clear()?;

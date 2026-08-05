@@ -23,6 +23,7 @@
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use vision_stimulus_engine::core::InputEvent;
 use vision_stimulus_engine::prelude::*;
 
 #[derive(Clone, Copy, PartialEq)]

@@ -19,6 +19,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use vision_stimulus_engine::core::ExternalFramePolicy;
 use vision_stimulus_engine::prelude::*;
 use vse_bevy::{
     scene::build_demo_scene, AsyncBevyProducer, ProducerConfig, ProducerError, ReadyFrame,
@@ -88,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .plan_frame_log(vse_frame, &ready)
                 .describe();
             if vse_frame + 1 >= frames {
-                vse.close();
+                vse.request_exit();
             }
             Ok(BufferedFrame::new(payload))
         },

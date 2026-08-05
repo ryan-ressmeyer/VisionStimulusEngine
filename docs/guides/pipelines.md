@@ -50,6 +50,9 @@ Two entry points let you render with pipelines VSE does not ship, at different l
 Implement `StimulusPipeline` to teach VSE a new stimulus. `build` creates your `GraphicsPipeline` once and returns it as the pipeline's `Resources`; `record` draws with it:
 
 ```rust
+use vision_stimulus_engine::drawing::{
+    FrameRecorder, PipelineBuildCtx, PipelineError, RecordCtx, StimulusPipeline,
+};
 use vision_stimulus_engine::prelude::*;
 
 struct CheckerParams { size: f32 }

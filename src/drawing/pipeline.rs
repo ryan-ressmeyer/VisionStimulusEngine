@@ -68,7 +68,7 @@ impl PipelineError {
     /// Wrap a build-time failure, keeping `cause` reachable as the error source.
     ///
     /// ```
-    /// # use vision_stimulus_engine::prelude::PipelineError;
+    /// # use vision_stimulus_engine::drawing::PipelineError;
     /// # fn load_shader() -> Result<(), std::io::Error> { Ok(()) }
     /// load_shader().map_err(PipelineError::build).unwrap();
     /// ```

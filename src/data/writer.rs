@@ -64,8 +64,6 @@ pub trait DataWriter: Send + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::messages::{AnnotationMessage, EventMessage, FrameMessage};
-    use crate::timing::{FlipInfo, Timestamp, TimingSource};
 
     struct NullWriter;
     impl DataWriter for NullWriter {
@@ -94,7 +92,7 @@ mod tests {
     fn test_data_error_display() {
         let e = DataError::ChannelDisconnected;
         assert!(e.to_string().contains("disconnected"));
-        let io_err = DataError::Io(std::io::Error::new(std::io::ErrorKind::Other, "test"));
+        let io_err = DataError::Io(std::io::Error::other("test"));
         assert!(io_err.to_string().contains("IO"));
     }
 }

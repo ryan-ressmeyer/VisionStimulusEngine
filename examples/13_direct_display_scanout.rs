@@ -40,6 +40,7 @@
 //! ./target/debug/examples/13_direct_display_scanout [frames] > /tmp/b3.txt 2>&1
 //! ```
 
+use vision_stimulus_engine::core::{absolute_scheduling_verdict, SchedulingTrial};
 use vision_stimulus_engine::prelude::*;
 
 /// Every Nth scheduled frame is a deliberate gap event.

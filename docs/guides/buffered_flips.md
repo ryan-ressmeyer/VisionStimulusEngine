@@ -130,9 +130,9 @@ This behavior also applies while draining the final submissions during clean shu
 
 ## Shutdown
 
-Calling `vse.close()` from the render callback still submits the `BufferedFrame` returned by that invocation. VSE then waits for every queued submission and invokes confirmation in FIFO order before `run_buffered()` returns.
+Calling `vse.request_exit()` from the render callback still submits the `BufferedFrame` returned by that invocation. VSE then waits for every queued submission and invokes confirmation in FIFO order before `run_buffered()` returns.
 
-Calling `close()` from a confirmation callback prevents another render invocation and drains submissions already in flight.
+Calling `request_exit()` from a confirmation callback prevents another render invocation and drains submissions already in flight.
 
 If a confirmation callback returns an error during draining, VSE continues retiring the queue and returns the first error afterward. A panic unwinds the event loop and does not guarantee delivery of remaining confirmation callbacks.
 

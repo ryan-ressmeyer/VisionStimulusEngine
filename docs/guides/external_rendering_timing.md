@@ -27,7 +27,7 @@ External rendering has two independent timing choices.
 The external-frame policy controls what VSE does when the external producer has, or has not, queued a new image for the next flip.
 
 ```rust
-use vision_stimulus_engine::prelude::*;
+use vision_stimulus_engine::core::ExternalFramePolicy;
 
 vse.attach_external_frame_source_with_policy(
     producer.export_ring()?,

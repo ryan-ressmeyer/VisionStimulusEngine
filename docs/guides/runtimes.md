@@ -65,7 +65,7 @@ context.run_buffered(
         draw_stimulus(vse, &frame)?;
 
         if frame.is_final {
-            vse.close();
+            vse.request_exit();
         }
         Ok(BufferedFrame::new(frame))
     },
@@ -116,7 +116,7 @@ context.run_buffered_with_state(
         experiment.trial += 1;
 
         if experiment.trial == 300 {
-            vse.close();
+            vse.request_exit();
         }
         Ok(BufferedFrame::new(payload))
     },

@@ -5,8 +5,7 @@
 
 use winit::event_loop::EventLoop;
 
-pub use super::config::{VSEContextBuilder, VSEError};
-pub use super::render_context::RenderContext;
+use super::config::{VSEContextBuilder, VSEError};
 
 /// Main VisionStimulusEngine context
 ///

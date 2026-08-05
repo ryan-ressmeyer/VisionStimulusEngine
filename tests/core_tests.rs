@@ -3,6 +3,7 @@
 //! Note: These tests require a working Vulkan installation.
 //! Tests that require a display will be skipped in headless CI environments.
 
+use vision_stimulus_engine::core::SwapchainConfig;
 use vision_stimulus_engine::prelude::*;
 
 /// Test that GPUPreference has sensible defaults

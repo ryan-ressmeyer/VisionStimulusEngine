@@ -95,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pend_render.borrow_mut().insert(n, buffer);
             }
             if n + 1 >= FRAMES {
-                vse.close();
+                vse.request_exit();
             }
             Ok(BufferedFrame::new(n))
         },

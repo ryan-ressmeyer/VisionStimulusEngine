@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let slot = producer.render_frame(n).map_err(box_err)?;
             vse.queue_external_frame(slot)?;
             if n + 1 >= frames {
-                vse.close();
+                vse.request_exit();
             }
             Ok(BufferedFrame::new(n))
         },

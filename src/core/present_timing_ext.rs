@@ -471,6 +471,9 @@ impl PresentTimingFns {
     /// # Safety
     ///
     /// The device must have been created with `VK_EXT_present_timing` enabled.
+    // The destination aliases spell each Vulkan ABI signature explicitly; retaining the
+    // generic source type keeps this loader aligned with `get_device_proc_addr`.
+    #[allow(clippy::missing_transmute_annotations)]
     pub unsafe fn load(device: &Arc<vulkano::device::Device>, present_wait2: bool) -> Option<Self> {
         use vulkano::VulkanObject;
 
@@ -819,8 +822,14 @@ impl SwapchainOptIns {
 /// The physical device must advertise `VK_EXT_present_timing` and `VK_KHR_present_id2`
 /// (see [`probe_support`]). The returned vulkano `Device` owns the handle.
 // The feature-struct flags are read by the driver through the raw `pNext` pointer chain,
-// which the borrow checker's dataflow cannot see — it reports the writes as dead.
-#[allow(unused_assignments)]
+// which the borrow checker's dataflow cannot see — it reports the writes as dead. Keep the
+// pointer wiring and ownership handoff in their audited order rather than applying generic
+// initialization and Drop suggestions to this raw FFI path.
+#[allow(
+    unused_assignments,
+    clippy::field_reassign_with_default,
+    clippy::forget_non_drop
+)]
 pub unsafe fn create_device_with_present_timing(
     physical_device: &Arc<vulkano::device::physical::PhysicalDevice>,
     graphics_queue_family_index: u32,

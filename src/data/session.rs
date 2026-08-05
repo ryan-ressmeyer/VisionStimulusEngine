@@ -176,7 +176,6 @@ impl ExperimentSessionBuilder {
 mod tests {
     use super::*;
     use crate::data::csv_writer::CsvDataWriter;
-    use crate::data::messages::*;
     use crate::timing::{FlipInfo, Timestamp, TimingSource};
 
     fn make_flip(frame: u64) -> FlipInfo {

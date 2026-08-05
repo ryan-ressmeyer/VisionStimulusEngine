@@ -59,6 +59,7 @@ Some examples depend on display configuration, fullscreen behavior, or Linux-spe
 
 ## Guides
 
+- [API imports and Audit 8 migration](docs/guides/api-surface.md)
 - [Choosing a runtime](docs/guides/runtimes.md)
 - [Buffered flips](docs/guides/buffered_flips.md)
 - [Headless rendering](docs/guides/headless.md)

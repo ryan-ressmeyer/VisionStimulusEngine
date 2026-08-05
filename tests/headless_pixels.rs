@@ -7,6 +7,9 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
+use vision_stimulus_engine::drawing::{
+    FrameRecorder, PipelineBuildCtx, PipelineError, RecordCtx, StimulusPipeline,
+};
 use vision_stimulus_engine::prelude::*;
 use vulkano::pipeline::{
     graphics::{

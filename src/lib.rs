@@ -29,26 +29,46 @@ pub mod timing;
 /// `core::external_frame` for the VSE-side seam.
 pub use vse_external_frame as external_frame;
 
-// Re-export commonly used types
+/// Common types for writing experiments.
+///
+/// Advanced APIs remain available from their domain modules rather than this
+/// curated namespace. For example:
+///
+/// ```
+/// use vision_stimulus_engine::drawing::StimulusPipeline;
+/// # fn accepts_pipeline<P: StimulusPipeline>() {}
+/// ```
+///
+/// Old convenience aliases are intentionally unavailable:
+///
+/// ```compile_fail
+/// use vision_stimulus_engine::prelude::RenderContext;
+/// fn stop(ctx: &mut RenderContext<'_>) {
+///     ctx.close();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vision_stimulus_engine::prelude::{Color, RenderContext};
+/// fn set_background(ctx: &mut RenderContext<'_>) {
+///     ctx.set_clear(Color::BLACK);
+/// }
+/// ```
+///
+/// Advanced APIs must use their canonical module paths:
+///
+/// ```compile_fail
+/// use vision_stimulus_engine::prelude::StimulusPipeline;
+/// ```
 pub mod prelude {
     pub use crate::core::{
-        absolute_scheduling_verdict, AcquisitionMethod, BufferedConfig, BufferedFrame,
-        ConfirmedFrame, DeviceSelector, DisplayBackend, ExternalFramePolicy, GPUPreference,
-        HeadlessContext, HeadlessContextBuilder, InputEvent, KeyCode, MonitorInfo,
-        MonitorSelection, MouseButton, NamedKey, PresentMode, RenderContext, ScanoutFeedback,
-        SchedulingTrial, SwapchainConfig, SwapchainManager, VSEContext, VSEContextBuilder,
-        VSEError, VideoModeInfo, WindowMode,
+        BufferedConfig, BufferedFrame, GPUPreference, HeadlessContext, KeyCode, MonitorSelection,
+        MouseButton, PresentMode, RenderContext, VSEContext, VSEError, WindowMode,
     };
-    pub use crate::data::{
-        CsvDataWriter, DataError, DataWriter, ExperimentSession, ExperimentSessionBuilder,
-        OverflowBehavior, ParquetDataWriter,
-    };
+    pub use crate::data::{CsvDataWriter, ExperimentSession, OverflowBehavior, ParquetDataWriter};
     pub use crate::drawing::{
-        Color, FrameRecorder, GaborParams, GratingParams, NoiseParams, NoiseType, PipelineBuildCtx,
-        PipelineError, RecordCtx, RegisteredPipeline, StimulusPipeline, TextureHandle, WaveType,
+        Color, GaborParams, GratingParams, NoiseParams, NoiseType, TextureHandle, WaveType,
     };
     pub use crate::host::HostInfo;
-    pub use crate::timing::{
-        CalibrationSample, FlipInfo, ScanoutTimestamp, Timestamp, TimingSource,
-    };
+    pub use crate::timing::{FlipInfo, ScanoutTimestamp, Timestamp, TimingSource};
 }

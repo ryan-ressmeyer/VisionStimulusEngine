@@ -529,7 +529,7 @@ pub(crate) fn acquire_display(
     target_name: Option<&str>,
     video_mode_override: Option<(u32, u32, f64)>,
     acquisition_order: &[AcquisitionMethod],
-) -> Result<DirectDisplaySurface, crate::core::context::VSEError> {
+) -> Result<DirectDisplaySurface, super::config::VSEError> {
     let display_label = target_name.unwrap_or("primary display");
     info!("Attempting direct display mode on {}...", display_label);
 
@@ -570,9 +570,7 @@ pub(crate) fn acquire_display(
     }
 
     let msg = format_unavailable_message(display_label, &failures);
-    Err(crate::core::context::VSEError::DirectDisplayUnavailable(
-        msg,
-    ))
+    Err(super::config::VSEError::DirectDisplayUnavailable(msg))
 }
 
 /// Default probe order.

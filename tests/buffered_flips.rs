@@ -26,7 +26,7 @@ fn run_buffered_fires_render_events() {
                 let n = *rc.borrow();
                 vse.clear()?;
                 if n >= 5 {
-                    vse.close();
+                    vse.request_exit();
                 }
                 Ok(BufferedFrame::new(n))
             },
@@ -66,7 +66,7 @@ fn run_buffered_payload_fifo_order() {
                 let n = *fr.borrow();
                 vse.clear()?;
                 if n >= 10 {
-                    vse.close();
+                    vse.request_exit();
                 }
                 Ok(BufferedFrame::new(n))
             },
@@ -122,7 +122,7 @@ fn run_buffered_with_state_initializes_before_the_first_frame() {
                 let n = *frames.borrow();
                 vse.clear()?;
                 if n >= 3 {
-                    vse.close();
+                    vse.request_exit();
                 }
                 Ok(BufferedFrame::new(n))
             },
@@ -161,7 +161,7 @@ fn run_buffered_accepts_local_unserialized_payload() {
             |_vse| Ok(BufferedFrame::new(LocalPayload(Rc::new(())))),
             |confirmed, vse| {
                 assert_eq!(Rc::strong_count(&confirmed.payload.0), 1);
-                vse.close();
+                vse.request_exit();
                 Ok(())
             },
         )

@@ -44,13 +44,13 @@ impl EvdevReader {
         for (_path, device) in evdev::enumerate() {
             let has_keys = device
                 .supported_keys()
-                .map_or(false, |k| k.iter().next().is_some());
+                .is_some_and(|k| k.iter().next().is_some());
             let has_rel = device
                 .supported_relative_axes()
-                .map_or(false, |a| a.iter().next().is_some());
+                .is_some_and(|a| a.iter().next().is_some());
             let has_abs = device
                 .supported_absolute_axes()
-                .map_or(false, |a| a.iter().next().is_some());
+                .is_some_and(|a| a.iter().next().is_some());
 
             if has_keys {
                 info!("evdev: keyboard device: {:?}", device.name());

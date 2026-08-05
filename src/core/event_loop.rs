@@ -9,8 +9,9 @@ use winit::event_loop::ControlFlow;
 
 use super::buffered::BufferedConfig;
 use super::config::{DisplayedConfig, VSEError};
-use super::context::{RenderContext, VSEContext};
+use super::context::VSEContext;
 use super::input::WindowMode;
+use super::render_context::RenderContext;
 use super::state::{RecordingState, VSEState};
 use super::swapchain::SwapchainError;
 
@@ -47,7 +48,7 @@ impl VSEContext {
     ///
     /// `setup` executes immediately after the GPU state exists and **before
     /// frame 0**, so expensive one-time work — compiling a
-    /// [`StimulusPipeline`](crate::prelude::StimulusPipeline), attaching an
+    /// [`StimulusPipeline`](crate::drawing::StimulusPipeline), attaching an
     /// external renderer, or loading assets happens off the presentation path instead of inflating the
     /// first frame and registering as a missed deadline.
     ///

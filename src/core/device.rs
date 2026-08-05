@@ -50,6 +50,12 @@ pub enum DeviceError {
     ValidatedVulkanError(#[from] vulkano::Validated<vulkano::VulkanError>),
 }
 
+type CreatedDevice = (
+    Arc<Device>,
+    Arc<Queue>,
+    Option<crate::core::present_timing_ext::EnabledPresentTimingFeatures>,
+);
+
 /// Preference for GPU selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GPUPreference {
@@ -454,16 +460,7 @@ impl DeviceSelector {
     /// # Errors
     ///
     /// Returns `DeviceError` if even the standard device creation fails.
-    pub fn create_device(
-        &self,
-    ) -> Result<
-        (
-            Arc<Device>,
-            Arc<Queue>,
-            Option<crate::core::present_timing_ext::EnabledPresentTimingFeatures>,
-        ),
-        DeviceError,
-    > {
+    pub fn create_device(&self) -> Result<CreatedDevice, DeviceError> {
         // Prefer VK_EXT_present_timing when the device advertises the required family.
         let support = crate::core::present_timing_ext::probe_support(&self.physical_device);
         if support.is_usable() {

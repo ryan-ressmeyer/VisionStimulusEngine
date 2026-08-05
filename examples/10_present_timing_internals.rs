@@ -29,6 +29,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Instant;
 use vision_stimulus_engine::prelude::*;
+use vision_stimulus_engine::timing::CalibrationSample;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -413,10 +414,7 @@ fn mode_buffered(frames: u32, depth: usize) -> Result<(), Box<dyn std::error::Er
     let state = Rc::new(RefCell::new(Verify::default()));
     let render_n = Rc::new(RefCell::new(0u32));
 
-    let cfg = BufferedConfig {
-        depth,
-        ..BufferedConfig::default()
-    };
+    let cfg = BufferedConfig { depth };
     let st_render = state.clone();
     let st_confirm = state.clone();
     let rn = render_n.clone();
@@ -434,7 +432,7 @@ fn mode_buffered(frames: u32, depth: usize) -> Result<(), Box<dyn std::error::Er
             vse.set_clear_color(c, c, c, 1.0);
             vse.clear()?;
             if *n >= frames {
-                vse.close();
+                vse.request_exit();
             }
             Ok(BufferedFrame::new(*n))
         },

@@ -5,8 +5,9 @@
 use tracing::{info, warn};
 
 use super::config::VSEError;
-use super::context::{RenderContext, VSEContext};
+use super::context::VSEContext;
 use super::input::AcquisitionMethod;
+use super::render_context::RenderContext;
 use super::state::{InputSource, RecordingState, VSEState};
 
 impl VSEContext {
